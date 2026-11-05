@@ -207,9 +207,9 @@ def test_dashboard_metric_cards_click_navigation(qtbot, test_db):
     qtbot.mouseClick(view.card_threat, Qt.MouseButton.LeftButton)
     assert signals_received[-1] == 4
 
-    # Click Attack Surface Card -> Projects & Scope (index 1)
+    # Click Attack Surface Card -> Asset Inventory (index 9)
     qtbot.mouseClick(view.metric_assets, Qt.MouseButton.LeftButton)
-    assert signals_received[-1] == 1
+    assert signals_received[-1] == 9
 
     # Click Open Risks Card -> Findings (index 4)
     qtbot.mouseClick(view.metric_findings, Qt.MouseButton.LeftButton)
@@ -234,7 +234,7 @@ def test_dashboard_metric_card_supports_keyboard_activation(qtbot, test_db):
 
     view.metric_assets.setFocus()
     qtbot.keyClick(view.metric_assets, Qt.Key.Key_Space)
-    assert received_indices == [1]
+    assert received_indices == [9]
 
 
 def test_dashboard_does_not_claim_hardened_without_security_assessment(qtbot, test_db):
@@ -328,3 +328,73 @@ def test_dashboard_asset_nodes_inclusion_and_unique_counting(qtbot, test_db):
     assert view.metric_assets.value_label.text() == "2"
     assert "1 FQDNs" in view.metric_assets.hint_label.text()
     assert "1 IPs" in view.metric_assets.hint_label.text()
+
+
+def test_dashboard_navigation_routes_to_correct_workspace_subtabs():
+    """Regression: dashboard shortcut indices must match the actual workspace tab order."""
+    from desktop.main_window import MainWindow
+
+    class NavigationRecorder:
+        def __init__(self):
+            self.destination = None
+            self.ai_focused = False
+
+        def _navigate_to_workspace_subtab(self, workspace_index, tab_index):
+            self.destination = (workspace_index, tab_index)
+
+        def _focus_ai_panel(self):
+            self.ai_focused = True
+
+    expected = {
+        0: (0, 1),  # Dashboard
+        1: (0, 0),  # Projects / Scope
+        2: (1, 0),  # Network Discovery
+        3: (1, 1),  # Web Testing
+        4: (2, 1),  # Findings Triage
+        5: (1, 3),  # Tools
+        6: (3, 0),  # CPENT
+        8: (1, 2),  # OSINT
+        9: (0, 2),  # Asset Inventory
+    }
+    for shortcut_index, destination in expected.items():
+        recorder = NavigationRecorder()
+        MainWindow._on_dashboard_navigation(recorder, shortcut_index)
+        assert recorder.destination == destination
+
+    recorder = NavigationRecorder()
+    MainWindow._on_dashboard_navigation(recorder, 7)
+    assert recorder.ai_focused is True
+    assert recorder.destination is None
+
+
+def test_scanner_launcher_routes_to_matching_workspace_subtabs():
+    """Regression: scanner launch shortcuts must open the matching tool workspace."""
+    from desktop.main_window import MainWindow
+
+    class NavigationRecorder:
+        def __init__(self):
+            self.destinations = []
+            self.web_view = type("WebViewRecorder", (), {"set_proxy_tab_visible": lambda self, visible: setattr(self, "proxy_visible", visible)})()
+
+        def _navigate_to_workspace_subtab(self, workspace_index, tab_index):
+            self.destinations.append((workspace_index, tab_index))
+
+    expected = {
+        "nmap": (1, 0),
+        "sqlmap": (1, 1),
+        "c0desec": (1, 1),
+        "wafw00f": (1, 1),
+        "gobuster": (1, 1),
+        "ptk": (1, 1),
+        "zaproxy": (1, 1),
+        "burpsuite": (1, 1),
+        "volatility3": (2, 1),
+        "bandit": (2, 1),
+        "amass": (1, 2),
+        "recon-ng": (1, 2),
+        "theharvester": (1, 2),
+    }
+    for tool_name, destination in expected.items():
+        recorder = NavigationRecorder()
+        MainWindow._on_open_scanner_requested(recorder, tool_name)
+        assert recorder.destinations == [destination]
