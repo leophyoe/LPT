@@ -1174,34 +1174,37 @@ class MainWindow(QMainWindow):
         self._refresh_project_data()
 
     def _on_dashboard_navigation(self, index: int):
+        """Routes dashboard shortcuts to their matching workspace and subtab."""
         mapping = {
-            0: (0, 1),  # Dashboard (Scope & Projects -> Tab 1)
-            1: (0, 0),  # Projects (Scope & Projects -> Tab 0)
-            2: (1, 1),  # Network (Security Workspace -> Tab 1)
-            3: (1, 2),  # Web (Security Workspace -> Tab 2)
-            4: (2, 0),  # Findings (Findings & Reports Workspace)
-            5: (1, 4),  # Tools (Security Workspace -> Tab 4)
-            6: (3, 0),  # CPENT (CPENT Labs Workspace)
-            7: (1, 0),  # AI Chat (Security Workspace -> Tab 0)
-            8: (1, 3),  # OSINT (Security Workspace -> Tab 3)
+            0: (0, 1),  # Dashboard
+            1: (0, 0),  # Projects / Scope
+            2: (1, 0),  # Network Discovery
+            3: (1, 1),  # Web Testing
+            4: (2, 1),  # Findings Triage
+            5: (1, 3),  # Tools Dashboard
+            6: (3, 0),  # CPENT Labs
+            8: (1, 2),  # OSINT
+            9: (0, 2),  # Asset Inventory
         }
-        if index in mapping:
+        if index == 7:
+            self._focus_ai_panel()
+        elif index in mapping:
             ws_idx, tab_idx = mapping[index]
             self._navigate_to_workspace_subtab(ws_idx, tab_idx)
 
     def _on_open_scanner_requested(self, tool_name: str):
         if tool_name == "nmap":
-            self._navigate_to_workspace_subtab(1, 1)  # Network Recon
+            self._navigate_to_workspace_subtab(1, 0)  # Network Discovery
         elif tool_name in ("c0desec", "sqlmap", "wafw00f", "gobuster", "ptk"):
-            self._navigate_to_workspace_subtab(1, 2)  # Web & API Assessment
+            self._navigate_to_workspace_subtab(1, 1)  # Web & API Assessment
         elif tool_name in ("zaproxy", "burpsuite"):
-            self._navigate_to_workspace_subtab(1, 2)  # Web & API Assessment
+            self._navigate_to_workspace_subtab(1, 1)  # Web & API Assessment
             if hasattr(self.web_view, "set_proxy_tab_visible"):
                 self.web_view.set_proxy_tab_visible(True)
         elif tool_name in ("volatility3", "bandit"):
-            self._navigate_to_workspace_subtab(2, 0)  # Findings & Reports
+            self._navigate_to_workspace_subtab(2, 1)  # Findings Triage
         elif tool_name in ("amass", "recon-ng", "theharvester"):
-            self._navigate_to_workspace_subtab(1, 3)  # OSINT Intelligence
+            self._navigate_to_workspace_subtab(1, 2)  # OSINT Intelligence
 
     def _on_open_shell_requested(self, tool_name: str, command: str):
         """Switches to the integrated Terminal prompt and pre-populates command."""
