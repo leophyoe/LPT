@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from desktop.theme import get_ui_font, ThemeManager, ThemeMode
 from desktop.widgets.google_dork_widget import GoogleDorkWidget
 from modules.osint.cert_transparency_adapter import CertTransparencyAdapter
 from modules.web.wafw00f_adapter import WAFW00FAdapter, WAFW00FOptions
@@ -90,7 +91,7 @@ class Behind24KpiCard(QFrame):
         text_layout.setSpacing(2)
 
         self.lbl_val = QLabel("0")
-        self.lbl_val.setFont(QFont("Segoe UI", 15, QFont.Bold))
+        self.lbl_val.setFont(get_ui_font(15, bold=True, heading=True))
         self.lbl_val.setStyleSheet("color: #ffffff;")
 
         self.lbl_title = QLabel(title)
@@ -102,6 +103,16 @@ class Behind24KpiCard(QFrame):
 
     def set_value(self, val: int | str):
         self.lbl_val.setText(str(val))
+
+    def update_theme(self, mode: ThemeMode):
+        if mode == ThemeMode.LIGHT:
+            self.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; }")
+            self.lbl_val.setStyleSheet("color: #0f172a;")
+            self.lbl_title.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
+        else:
+            self.setStyleSheet("QFrame { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }")
+            self.lbl_val.setStyleSheet("color: #ffffff;")
+            self.lbl_title.setStyleSheet("color: #cbd5e1; font-size: 11px; font-weight: 600;")
 
 
 class DistributionBar(QWidget):
@@ -126,7 +137,8 @@ class DistributionBar(QWidget):
         painter.setPen(Qt.NoPen)
 
         # Track
-        painter.setBrush(QColor("#1e293b"))
+        is_light = ThemeManager.instance().mode == ThemeMode.LIGHT
+        painter.setBrush(QColor("#e2e8f0" if is_light else "#1e293b"))
         painter.drawRoundedRect(rect, 4, 4)
 
         # Fill
@@ -166,6 +178,12 @@ class DistributionBarRow(QWidget):
         self.lbl_val.setText(str(count))
         self.bar.set_values(count, max_count)
 
+    def update_theme(self, mode: ThemeMode):
+        is_light = mode == ThemeMode.LIGHT
+        self.lbl_name.setStyleSheet(f"color: {'#334155' if is_light else '#e2e8f0'}; font-size: 12px; font-weight: 500;")
+        self.lbl_val.setStyleSheet(f"color: {'#0f172a' if is_light else '#ffffff'}; font-size: 12px; font-weight: bold;")
+        self.bar.update()
+
 
 class ExposureDonutWidget(QWidget):
     """Circular ring / donut gauge matching Behind24 Exposure Status card."""
@@ -184,8 +202,10 @@ class ExposureDonutWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(7, 7, -7, -7)
 
+        is_light = ThemeManager.instance().mode == ThemeMode.LIGHT
+
         # Background track
-        pen_bg = QPen(QColor("#1e293b"), 8)
+        pen_bg = QPen(QColor("#e2e8f0" if is_light else "#1e293b"), 8)
         pen_bg.setCapStyle(Qt.RoundCap)
         painter.setPen(pen_bg)
         painter.drawEllipse(rect)
@@ -199,8 +219,8 @@ class ExposureDonutWidget(QWidget):
             painter.drawArc(rect, 90 * 16, span_angle)
 
         # Center text
-        painter.setPen(QColor("#f8fafc"))
-        painter.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        painter.setPen(QColor("#0f172a" if is_light else "#f8fafc"))
+        painter.setFont(get_ui_font(12, bold=True, heading=True))
         painter.drawText(rect, Qt.AlignCenter, f"{self.percent}%")
 
 
@@ -222,8 +242,10 @@ class SegmentedSeverityBarWidget(QWidget):
         rect = self.rect()
         total = sum(self.counts.values())
 
+        is_light = ThemeManager.instance().mode == ThemeMode.LIGHT
+
         if total == 0:
-            painter.setBrush(QColor("#1e293b"))
+            painter.setBrush(QColor("#e2e8f0" if is_light else "#1e293b"))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 4, 4)
             return
@@ -273,6 +295,8 @@ class AssetsView(QWidget):
         self._is_compact: bool = False
         self.setObjectName("assetsView")
         self._init_ui()
+        ThemeManager.instance().theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(ThemeManager.instance().mode)
 
     def _init_ui(self):
         root_layout = QVBoxLayout(self)
@@ -280,10 +304,10 @@ class AssetsView(QWidget):
         root_layout.setSpacing(10)
 
         # --------------------------------------------------------------------
-        # 1. TOP HEADER TOOLBAR
+        # 1. TOP HEADER TOOLBAR (Two-Row High-Density Layout)
         # --------------------------------------------------------------------
-        header_bar = QHBoxLayout()
-        header_bar.setSpacing(12)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
@@ -291,115 +315,109 @@ class AssetsView(QWidget):
         lbl_title_row = QHBoxLayout()
         lbl_icon = QLabel("🛡️")
         lbl_icon.setStyleSheet("font-size: 16px; margin-right: 4px;")
-        lbl_title = QLabel("Digital Assets")
-        lbl_title.setFont(QFont("Segoe UI", 17, QFont.Bold))
-        lbl_title.setStyleSheet("color: #ffffff;")
+        self.lbl_title = QLabel("Digital Assets")
+        self.lbl_title.setFont(get_ui_font(16, bold=True, heading=True))
+        self.lbl_title.setStyleSheet("color: #f8fafc;")
         lbl_title_row.addWidget(lbl_icon)
-        lbl_title_row.addWidget(lbl_title)
+        lbl_title_row.addWidget(self.lbl_title)
         lbl_title_row.addStretch()
 
-        lbl_sub = QLabel("Inventory, exposure and operational signals across the attack surface.")
-        lbl_sub.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+        self.lbl_sub = QLabel("Inventory, exposure and operational signals across attack surface.")
+        self.lbl_sub.setStyleSheet("color: #cbd5e1; font-size: 12px;")
 
         title_box.addLayout(lbl_title_row)
-        title_box.addWidget(lbl_sub)
-        header_bar.addLayout(title_box)
+        title_box.addWidget(self.lbl_sub)
+        top_row.addLayout(title_box)
 
-        # Segmented Sub-View Switcher: Behind24 Assets vs Passive Recon & Google Dorks
-        self.mode_switcher_frame = QFrame()
-        self.mode_switcher_frame.setStyleSheet(
-            "QFrame { background-color: #111827; border: 1px solid #334155; border-radius: 6px; padding: 2px; }"
-        )
-        mode_layout = QHBoxLayout(self.mode_switcher_frame)
-        mode_layout.setContentsMargins(2, 2, 2, 2)
-        mode_layout.setSpacing(4)
-
-        self.btn_sub_assets = QPushButton("🛰️ Digital Assets (Behind24)")
-        self.btn_sub_assets.setCheckable(True)
-        self.btn_sub_assets.setChecked(True)
-        self.btn_sub_assets.setCursor(Qt.PointingHandCursor)
-        self.btn_sub_assets.setStyleSheet(
-            "QPushButton { background-color: #0284c7; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-            "QPushButton:hover { background-color: #0ea5e9; }"
-        )
-        self.btn_sub_assets.clicked.connect(lambda: self.set_sub_view(0))
-
-        self.btn_sub_dorks = QPushButton("🔎 Passive Recon & Google Dorks")
-        self.btn_sub_dorks.setCheckable(True)
-        self.btn_sub_dorks.setChecked(False)
-        self.btn_sub_dorks.setCursor(Qt.PointingHandCursor)
-        self.btn_sub_dorks.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #cbd5e1; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-            "QPushButton:hover { background-color: #1e293b; color: #ffffff; }"
-        )
-        self.btn_sub_dorks.clicked.connect(lambda: self.set_sub_view(1))
-
-        mode_layout.addWidget(self.btn_sub_assets)
-        mode_layout.addWidget(self.btn_sub_dorks)
-        header_bar.addWidget(self.mode_switcher_frame)
-
-        header_bar.addStretch()
-
-        # 100% active sample pill badge
-        self.lbl_sample_badge = QLabel("● 100% active in current sample")
-        self.lbl_sample_badge.setStyleSheet(
-            "background-color: #064e3b; color: #34d399; border: 1px solid #047857; border-radius: 12px; padding: 5px 12px; font-weight: 600; font-size: 11px;"
-        )
-        header_bar.addWidget(self.lbl_sample_badge)
-
-        # Total count badge (Preserves test compatibility!)
-        self.lbl_count_badge = QLabel("0 Total Assets")
-        self.lbl_count_badge.setStyleSheet(
-            "background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 4px; padding: 5px 12px; font-weight: bold; font-size: 12px;"
-        )
-        header_bar.addWidget(self.lbl_count_badge)
+        top_row.addStretch()
 
         # Search bar (Preserves test compatibility!)
         self.txt_search = QLineEdit()
         self.txt_search.setPlaceholderText("🔍  Search assets...")
-        self.txt_search.setFixedWidth(240)
+        self.txt_search.setFixedWidth(260)
         self.txt_search.setStyleSheet(
-            "QLineEdit { background-color: #111827; color: #ffffff; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
-            "QLineEdit:focus { border-color: #38bdf8; }"
+            "QLineEdit { background-color: #0d1526; color: #f8fafc; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
+            "QLineEdit:focus { border-color: #3b82f6; }"
         )
         self.txt_search.textChanged.connect(self._filter_assets_table)
-        header_bar.addWidget(self.txt_search)
+        top_row.addWidget(self.txt_search)
 
         # Refresh button
         btn_refresh = QPushButton("↻  Refresh")
         btn_refresh.setCursor(Qt.PointingHandCursor)
         btn_refresh.setStyleSheet(
             "QPushButton { background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; padding: 6px 14px; font-weight: bold; font-size: 12px; }"
-            "QPushButton:hover { background-color: #334155; color: #ffffff; }"
+            "QPushButton:hover { background-color: #283548; color: #ffffff; }"
         )
         btn_refresh.clicked.connect(self.refresh)
-        header_bar.addWidget(btn_refresh)
+        top_row.addWidget(btn_refresh)
 
-        root_layout.addLayout(header_bar)
+        root_layout.addLayout(top_row)
 
-        # Behind24 Inventory Sub-Container
-        self.inventory_container = QWidget()
-        inv_layout = QVBoxLayout(self.inventory_container)
-        inv_layout.setContentsMargins(0, 0, 0, 0)
-        inv_layout.setSpacing(10)
+        # Sub-header bar: Segmented View Switcher + Badges + Recon Actions
+        sub_bar = QHBoxLayout()
+        sub_bar.setSpacing(8)
 
-        # --------------------------------------------------------------------
-        # 1.5. PASSIVE RECON QUICK ACTIONS TOOLBAR
-        # --------------------------------------------------------------------
-        recon_toolbar = QHBoxLayout()
-        recon_toolbar.setContentsMargins(2, 0, 2, 0)
-        recon_toolbar.setSpacing(8)
+        # Segmented Sub-View Switcher: Digital Assets vs Passive Recon & Google Dorks
+        self.mode_switcher_frame = QFrame()
+        self.mode_switcher_frame.setStyleSheet(
+            "QFrame { background-color: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 2px; }"
+        )
+        mode_layout = QHBoxLayout(self.mode_switcher_frame)
+        mode_layout.setContentsMargins(2, 2, 2, 2)
+        mode_layout.setSpacing(4)
 
-        lbl_recon_pfx = QLabel("🛰️ Passive Recon Actions:")
-        lbl_recon_pfx.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.btn_sub_assets = QPushButton("🛰️ Digital Assets")
+        self.btn_sub_assets.setCheckable(True)
+        self.btn_sub_assets.setChecked(True)
+        self.btn_sub_assets.setCursor(Qt.PointingHandCursor)
+        self.btn_sub_assets.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+            "QPushButton:hover { background-color: #1d4ed8; }"
+        )
+        self.btn_sub_assets.clicked.connect(lambda: self.set_sub_view(0))
+
+        self.btn_sub_dorks = QPushButton("🔎 Passive Recon & Dorks")
+        self.btn_sub_dorks.setCheckable(True)
+        self.btn_sub_dorks.setChecked(False)
+        self.btn_sub_dorks.setCursor(Qt.PointingHandCursor)
+        self.btn_sub_dorks.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #cbd5e1; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+            "QPushButton:hover { background-color: #1e293b; color: #ffffff; }"
+        )
+        self.btn_sub_dorks.clicked.connect(lambda: self.set_sub_view(1))
+
+        mode_layout.addWidget(self.btn_sub_assets)
+        mode_layout.addWidget(self.btn_sub_dorks)
+        sub_bar.addWidget(self.mode_switcher_frame)
+
+        # 100% active sample pill badge
+        self.lbl_sample_badge = QLabel("● 100% active in current sample")
+        self.lbl_sample_badge.setStyleSheet(
+            "background-color: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid #059669; border-radius: 12px; padding: 4px 10px; font-weight: 600; font-size: 11px;"
+        )
+        sub_bar.addWidget(self.lbl_sample_badge)
+
+        # Total count badge (Preserves test compatibility!)
+        self.lbl_count_badge = QLabel("0 Total Assets")
+        self.lbl_count_badge.setStyleSheet(
+            "background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 11px;"
+        )
+        sub_bar.addWidget(self.lbl_count_badge)
+
+        sub_bar.addStretch()
+
+        # Passive Recon Quick Actions Toolbar
+        lbl_recon_pfx = QLabel("🛰️ Passive Recon:")
+        lbl_recon_pfx.setFont(get_ui_font(10, bold=True))
         lbl_recon_pfx.setStyleSheet("color: #94a3b8;")
-        recon_toolbar.addWidget(lbl_recon_pfx)
+        sub_bar.addWidget(lbl_recon_pfx)
 
         self.lbl_recon_target = QLabel("Target: None")
         self.lbl_recon_target.setStyleSheet(
             "background-color: #0f172a; color: #38bdf8; border: 1px solid #1e293b; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;"
         )
-        recon_toolbar.addWidget(self.lbl_recon_target)
+        sub_bar.addWidget(self.lbl_recon_target)
 
         self.btn_harvest_ct = QPushButton("📜 Harvest CT Subdomains (crt.sh)")
         self.btn_harvest_ct.setCursor(Qt.PointingHandCursor)
@@ -409,7 +427,7 @@ class AssetsView(QWidget):
             "QPushButton:hover { background-color: #0369a1; color: #ffffff; }"
         )
         self.btn_harvest_ct.clicked.connect(self._run_ct_harvest)
-        recon_toolbar.addWidget(self.btn_harvest_ct)
+        sub_bar.addWidget(self.btn_harvest_ct)
 
         self.btn_check_waf = QPushButton("🛡️ Detect WAF (WAFW00F)")
         self.btn_check_waf.setCursor(Qt.PointingHandCursor)
@@ -419,14 +437,19 @@ class AssetsView(QWidget):
             "QPushButton:hover { background-color: #991b1b; color: #ffffff; }"
         )
         self.btn_check_waf.clicked.connect(self._run_waf_detection)
-        recon_toolbar.addWidget(self.btn_check_waf)
+        sub_bar.addWidget(self.btn_check_waf)
 
         self.lbl_recon_status = QLabel("")
         self.lbl_recon_status.setStyleSheet("color: #34d399; font-size: 11px; font-weight: 500;")
-        recon_toolbar.addWidget(self.lbl_recon_status)
+        sub_bar.addWidget(self.lbl_recon_status)
 
-        recon_toolbar.addStretch()
-        inv_layout.addLayout(recon_toolbar)
+        root_layout.addLayout(sub_bar)
+
+        # Behind24 Inventory Sub-Container
+        self.inventory_container = QWidget()
+        inv_layout = QVBoxLayout(self.inventory_container)
+        inv_layout.setContentsMargins(0, 0, 0, 0)
+        inv_layout.setSpacing(8)
 
         # --------------------------------------------------------------------
         # 2. TOP KPI STAT RIBBON (8 CARDS)
@@ -457,20 +480,26 @@ class AssetsView(QWidget):
         # --------------------------------------------------------------------
         # 3. THREE VISUAL OVERVIEW CARDS
         # --------------------------------------------------------------------
+        self.overview_container = QWidget()
+        overview_container_layout = QVBoxLayout(self.overview_container)
+        overview_container_layout.setContentsMargins(0, 0, 0, 0)
+        overview_container_layout.setSpacing(0)
+
         overview_row = QHBoxLayout()
         overview_row.setSpacing(10)
 
         # --- Card 1: Asset Type Distribution ---
-        card1 = QFrame()
-        card1.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
-        c1_layout = QVBoxLayout(card1)
-        c1_layout.setContentsMargins(14, 12, 14, 12)
-        c1_layout.setSpacing(8)
+        self.card1 = QFrame()
+        self.card1.setMaximumHeight(155)
+        self.card1.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
+        c1_layout = QVBoxLayout(self.card1)
+        c1_layout.setContentsMargins(14, 10, 14, 10)
+        c1_layout.setSpacing(6)
 
-        lbl_c1_title = QLabel("Asset Type Distribution")
-        lbl_c1_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        lbl_c1_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
-        c1_layout.addWidget(lbl_c1_title)
+        self.lbl_c1_title = QLabel("Asset Type Distribution")
+        self.lbl_c1_title.setFont(get_ui_font(12, bold=True, heading=True))
+        self.lbl_c1_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
+        c1_layout.addWidget(self.lbl_c1_title)
 
         self.dist_subdomains = DistributionBarRow("Subdomains", "#06b6d4")
         self.dist_ips = DistributionBarRow("IP Addresses", "#a855f7")
@@ -485,19 +514,20 @@ class AssetsView(QWidget):
         c1_layout.addWidget(self.dist_vulns)
         c1_layout.addStretch()
 
-        overview_row.addWidget(card1, stretch=3)
+        overview_row.addWidget(self.card1, stretch=3)
 
         # --- Card 2: Exposure Status ---
-        card2 = QFrame()
-        card2.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
-        c2_layout = QVBoxLayout(card2)
-        c2_layout.setContentsMargins(14, 12, 14, 12)
-        c2_layout.setSpacing(8)
+        self.card2 = QFrame()
+        self.card2.setMaximumHeight(155)
+        self.card2.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
+        c2_layout = QVBoxLayout(self.card2)
+        c2_layout.setContentsMargins(14, 10, 14, 10)
+        c2_layout.setSpacing(6)
 
-        lbl_c2_title = QLabel("Exposure Status")
-        lbl_c2_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        lbl_c2_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
-        c2_layout.addWidget(lbl_c2_title)
+        self.lbl_c2_title = QLabel("Exposure Status")
+        self.lbl_c2_title.setFont(get_ui_font(12, bold=True, heading=True))
+        self.lbl_c2_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
+        c2_layout.addWidget(self.lbl_c2_title)
 
         gauge_box = QHBoxLayout()
         gauge_box.setSpacing(16)
@@ -506,7 +536,7 @@ class AssetsView(QWidget):
         gauge_box.addWidget(self.donut_gauge)
 
         legend_box = QVBoxLayout()
-        legend_box.setSpacing(6)
+        legend_box.setSpacing(4)
         legend_box.setAlignment(Qt.AlignVCenter)
 
         active_row = QHBoxLayout()
@@ -538,24 +568,25 @@ class AssetsView(QWidget):
         gauge_box.addLayout(legend_box)
         c2_layout.addLayout(gauge_box)
 
-        self.lbl_exposure_sub = QLabel("Based on the latest loaded assets.")
-        self.lbl_exposure_sub.setStyleSheet("color: #94a3b8; font-size: 11px; margin-top: 4px;")
+        self.lbl_exposure_sub = QLabel("Based on latest loaded assets.")
+        self.lbl_exposure_sub.setStyleSheet("color: #94a3b8; font-size: 11px; margin-top: 2px;")
         c2_layout.addWidget(self.lbl_exposure_sub)
         c2_layout.addStretch()
 
-        overview_row.addWidget(card2, stretch=2)
+        overview_row.addWidget(self.card2, stretch=2)
 
         # --- Card 3: Risk, Services & Tech ---
-        card3 = QFrame()
-        card3.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
-        c3_layout = QVBoxLayout(card3)
-        c3_layout.setContentsMargins(14, 12, 14, 12)
-        c3_layout.setSpacing(8)
+        self.card3 = QFrame()
+        self.card3.setMaximumHeight(155)
+        self.card3.setStyleSheet("QFrame { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }")
+        c3_layout = QVBoxLayout(self.card3)
+        c3_layout.setContentsMargins(14, 10, 14, 10)
+        c3_layout.setSpacing(6)
 
-        lbl_c3_title = QLabel("Risk, Services & Tech")
-        lbl_c3_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        lbl_c3_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
-        c3_layout.addWidget(lbl_c3_title)
+        self.lbl_c3_title = QLabel("Risk, Services & Tech")
+        self.lbl_c3_title.setFont(get_ui_font(12, bold=True, heading=True))
+        self.lbl_c3_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
+        c3_layout.addWidget(self.lbl_c3_title)
 
         # Segmented severity bar
         self.sev_bar = SegmentedSeverityBarWidget()
@@ -589,9 +620,9 @@ class AssetsView(QWidget):
         # Left sub-column: Services
         col_svc = QVBoxLayout()
         col_svc.setSpacing(4)
-        lbl_col_svc = QLabel("⚙️ SERVICES")
-        lbl_col_svc.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
-        col_svc.addWidget(lbl_col_svc)
+        self.lbl_col_svc = QLabel("⚙️ SERVICES")
+        self.lbl_col_svc.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
+        col_svc.addWidget(self.lbl_col_svc)
         self.svc_rows: List[DistributionBarRow] = [
             DistributionBarRow("—", "#0d9488"),
             DistributionBarRow("—", "#0d9488"),
@@ -604,9 +635,9 @@ class AssetsView(QWidget):
         # Right sub-column: Technologies
         col_tech = QVBoxLayout()
         col_tech.setSpacing(4)
-        lbl_col_tech = QLabel("🧩 TECHNOLOGIES")
-        lbl_col_tech.setStyleSheet("color: #fb923c; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
-        col_tech.addWidget(lbl_col_tech)
+        self.lbl_col_tech = QLabel("🧩 TECHNOLOGIES")
+        self.lbl_col_tech.setStyleSheet("color: #fb923c; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
+        col_tech.addWidget(self.lbl_col_tech)
         self.tech_rows: List[DistributionBarRow] = [
             DistributionBarRow("—", "#ea580c"),
             DistributionBarRow("—", "#ea580c"),
@@ -619,9 +650,10 @@ class AssetsView(QWidget):
         c3_layout.addLayout(sub_cols)
         c3_layout.addStretch()
 
-        overview_row.addWidget(card3, stretch=4)
+        overview_row.addWidget(self.card3, stretch=4)
 
-        inv_layout.addLayout(overview_row)
+        overview_container_layout.addLayout(overview_row)
+        inv_layout.addWidget(self.overview_container)
 
         # --------------------------------------------------------------------
         # 4. BOTTOM MASTER INVENTORY: FILTERS + DATA TABLE + INSPECTOR
@@ -630,24 +662,24 @@ class AssetsView(QWidget):
         splitter.setStyleSheet("QSplitter::handle { background-color: #1e293b; width: 2px; }")
 
         # --- A. Left Filter Drawer ---
-        filter_drawer = QFrame()
-        filter_drawer.setFixedWidth(180)
-        filter_drawer.setStyleSheet(
+        self.filter_drawer = QFrame()
+        self.filter_drawer.setFixedWidth(190)
+        self.filter_drawer.setStyleSheet(
             "QFrame { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
         )
-        f_layout = QVBoxLayout(filter_drawer)
-        f_layout.setContentsMargins(12, 12, 12, 12)
-        f_layout.setSpacing(10)
+        f_layout = QVBoxLayout(self.filter_drawer)
+        f_layout.setContentsMargins(10, 8, 10, 8)
+        f_layout.setSpacing(4)
 
-        lbl_f_title = QLabel("⚡ Filters")
-        lbl_f_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        lbl_f_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
-        f_layout.addWidget(lbl_f_title)
+        self.lbl_f_title = QLabel("⚡ Filters")
+        self.lbl_f_title.setFont(get_ui_font(11, bold=True, heading=True))
+        self.lbl_f_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px;")
+        f_layout.addWidget(self.lbl_f_title)
 
         # TYPE Section
-        lbl_f_type = QLabel("TYPE")
-        lbl_f_type.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
-        f_layout.addWidget(lbl_f_type)
+        self.lbl_f_type = QLabel("TYPE")
+        self.lbl_f_type.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
+        f_layout.addWidget(self.lbl_f_type)
 
         self.btn_f_all = self._create_filter_btn("✦ All Types", None)
         self.btn_f_sub = self._create_filter_btn("🌐 Subdomain", "subdomain")
@@ -675,9 +707,9 @@ class AssetsView(QWidget):
         f_layout.addSpacing(6)
 
         # STATUS Section
-        lbl_f_status = QLabel("STATUS")
-        lbl_f_status.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
-        f_layout.addWidget(lbl_f_status)
+        self.lbl_f_status = QLabel("STATUS")
+        self.lbl_f_status.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
+        f_layout.addWidget(self.lbl_f_status)
 
         self.btn_st_all = self._create_filter_btn("● All", "ALL", is_status=True)
         self.btn_st_act = self._create_filter_btn("● Active", "ACTIVE", is_status=True)
@@ -694,7 +726,7 @@ class AssetsView(QWidget):
         f_layout.addWidget(self.btn_st_inact)
 
         f_layout.addStretch()
-        splitter.addWidget(filter_drawer)
+        splitter.addWidget(self.filter_drawer)
 
         # --- B. Center Master Asset Table ---
         table_container = QWidget()
@@ -715,6 +747,17 @@ class AssetsView(QWidget):
         self.btn_compact.toggled.connect(self._toggle_compact)
         t_bar.addWidget(self.btn_compact)
 
+        self.btn_toggle_analytics = QPushButton("📊  Analytics Cards")
+        self.btn_toggle_analytics.setCheckable(True)
+        self.btn_toggle_analytics.setChecked(True)
+        self.btn_toggle_analytics.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_analytics.setStyleSheet(
+            "QPushButton { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 500; }"
+            "QPushButton:checked { background-color: #1e3a8a; color: #38bdf8; border-color: #2563eb; font-weight: bold; }"
+        )
+        self.btn_toggle_analytics.toggled.connect(self._toggle_analytics)
+        t_bar.addWidget(self.btn_toggle_analytics)
+
         t_bar.addStretch()
 
         self.lbl_table_rows = QLabel("Rows per page: 25")
@@ -730,20 +773,20 @@ class AssetsView(QWidget):
         ])
         hdr = self.asset_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        self.asset_table.setColumnWidth(0, 140)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.asset_table.setColumnWidth(1, 55)
+        self.asset_table.setColumnWidth(0, 160)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.asset_table.setColumnWidth(1, 95)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        self.asset_table.setColumnWidth(2, 100)
+        self.asset_table.setColumnWidth(2, 120)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        self.asset_table.setColumnWidth(3, 85)
+        self.asset_table.setColumnWidth(3, 100)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.asset_table.setColumnWidth(5, 85)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.asset_table.setColumnWidth(6, 90)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.asset_table.setColumnWidth(5, 95)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        self.asset_table.setColumnWidth(6, 120)
         hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        self.asset_table.setColumnWidth(7, 75)
+        self.asset_table.setColumnWidth(7, 85)
         self.asset_table.verticalHeader().setVisible(False)
         self.asset_table.verticalHeader().setDefaultSectionSize(38)
         self.asset_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -770,7 +813,7 @@ class AssetsView(QWidget):
         # Inspector Header
         insp_hdr = QHBoxLayout()
         self.lbl_insp_title = QLabel("Asset Details")
-        self.lbl_insp_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.lbl_insp_title.setFont(get_ui_font(12, bold=True, heading=True))
         self.lbl_insp_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 14px;")
         insp_hdr.addWidget(self.lbl_insp_title)
 
@@ -787,11 +830,12 @@ class AssetsView(QWidget):
 
         # IP and Meta box
         self.lbl_insp_ip = QLabel("Select an asset to inspect")
-        self.lbl_insp_ip.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        self.lbl_insp_ip.setFont(get_ui_font(12, bold=True))
         self.lbl_insp_ip.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 13px;")
         insp_layout.addWidget(self.lbl_insp_ip)
 
         self.lbl_insp_meta = QLabel("No node selected")
+        self.lbl_insp_meta.setFont(get_ui_font(11))
         self.lbl_insp_meta.setStyleSheet("color: #cbd5e1; font-size: 12px; line-height: 1.4;")
         insp_layout.addWidget(self.lbl_insp_meta)
 
@@ -807,7 +851,7 @@ class AssetsView(QWidget):
 
         # Discovered Services Table
         lbl_svc = QLabel("Discovered Services & Ports")
-        lbl_svc.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        lbl_svc.setFont(get_ui_font(11, bold=True))
         lbl_svc.setStyleSheet("color: #f1f5f9; font-weight: bold; font-size: 12px; margin-top: 6px;")
         insp_layout.addWidget(lbl_svc)
 
@@ -825,7 +869,7 @@ class AssetsView(QWidget):
 
         # Associated Findings List
         lbl_findings = QLabel("Confirmed Findings & Vulnerabilities")
-        lbl_findings.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        lbl_findings.setFont(get_ui_font(11, bold=True))
         lbl_findings.setStyleSheet("color: #f1f5f9; font-weight: bold; font-size: 12px; margin-top: 6px;")
         insp_layout.addWidget(lbl_findings)
 
@@ -855,18 +899,18 @@ class AssetsView(QWidget):
         root_layout.addWidget(self.main_stack, stretch=1)
 
     def set_sub_view(self, index: int):
-        """Switches between Behind24 Digital Assets Inventory (0) and Passive Recon & Dorks (1)."""
+        """Switches between Digital Assets Inventory (0) and Passive Recon & Dorks (1)."""
         self.main_stack.setCurrentIndex(index)
         if index == 0:
             self.btn_sub_assets.setChecked(True)
             self.btn_sub_dorks.setChecked(False)
             self.btn_sub_assets.setStyleSheet(
-                "QPushButton { background-color: #0284c7; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-                "QPushButton:hover { background-color: #0ea5e9; }"
+                "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+                "QPushButton:hover { background-color: #1d4ed8; }"
             )
             self.btn_sub_dorks.setStyleSheet(
-                "QPushButton { background-color: transparent; color: #94a3b8; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-                "QPushButton:hover { background-color: #1e293b; color: #f8fafc; }"
+                "QPushButton { background-color: transparent; color: #cbd5e1; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+                "QPushButton:hover { background-color: #1e293b; color: #ffffff; }"
             )
             self.lbl_sample_badge.setVisible(True)
             self.lbl_count_badge.setVisible(True)
@@ -875,12 +919,12 @@ class AssetsView(QWidget):
             self.btn_sub_assets.setChecked(False)
             self.btn_sub_dorks.setChecked(True)
             self.btn_sub_dorks.setStyleSheet(
-                "QPushButton { background-color: #0284c7; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-                "QPushButton:hover { background-color: #0ea5e9; }"
+                "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+                "QPushButton:hover { background-color: #1d4ed8; }"
             )
             self.btn_sub_assets.setStyleSheet(
-                "QPushButton { background-color: transparent; color: #94a3b8; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 6px 14px; }"
-                "QPushButton:hover { background-color: #1e293b; color: #f8fafc; }"
+                "QPushButton { background-color: transparent; color: #cbd5e1; font-weight: 500; font-size: 12px; border: none; border-radius: 4px; padding: 5px 12px; }"
+                "QPushButton:hover { background-color: #1e293b; color: #ffffff; }"
             )
             self.lbl_sample_badge.setVisible(False)
             self.lbl_count_badge.setVisible(False)
@@ -892,8 +936,10 @@ class AssetsView(QWidget):
         btn = QPushButton(label)
         btn.setCheckable(True)
         btn.setCursor(Qt.PointingHandCursor)
+        btn.setMinimumHeight(28)
+        btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #cbd5e1; border: none; border-radius: 4px; padding: 6px 10px; text-align: left; font-size: 12px; font-weight: 500; }"
+            "QPushButton { background-color: transparent; color: #cbd5e1; border: none; border-radius: 4px; padding: 5px 10px; text-align: left; font-size: 12px; font-weight: 500; }"
             "QPushButton:hover { background-color: #1e293b; color: #ffffff; }"
             "QPushButton:checked { background-color: #1e3a8a; color: #38bdf8; font-weight: bold; }"
         )
@@ -915,6 +961,129 @@ class AssetsView(QWidget):
         self._is_compact = checked
         row_height = 30 if checked else 38
         self.asset_table.verticalHeader().setDefaultSectionSize(row_height)
+
+    def _toggle_analytics(self, checked: bool):
+        if hasattr(self, "overview_container"):
+            self.overview_container.setVisible(checked)
+
+    def _on_theme_changed(self, mode: Union[ThemeMode, str]):
+        is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
+
+        # 1. Header texts
+        if hasattr(self, "lbl_title"):
+            self.lbl_title.setStyleSheet(f"color: {'#0f172a' if is_light else '#f8fafc'};")
+        if hasattr(self, "lbl_sub"):
+            self.lbl_sub.setStyleSheet(f"color: {'#64748b' if is_light else '#cbd5e1'}; font-size: 12px;")
+
+        # 2. Search & Filter Input
+        if hasattr(self, "txt_search"):
+            if is_light:
+                self.txt_search.setStyleSheet(
+                    "QLineEdit { background-color: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
+                    "QLineEdit:focus { border-color: #2563eb; }"
+                )
+            else:
+                self.txt_search.setStyleSheet(
+                    "QLineEdit { background-color: #0d1526; color: #f8fafc; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
+                    "QLineEdit:focus { border-color: #3b82f6; }"
+                )
+
+        # 3. KPI Cards
+        for kpi in [
+            getattr(self, "kpi_subdomains", None),
+            getattr(self, "kpi_ips", None),
+            getattr(self, "kpi_ports", None),
+            getattr(self, "kpi_webapps", None),
+            getattr(self, "kpi_vulns", None),
+            getattr(self, "kpi_dns", None),
+            getattr(self, "kpi_networks", None),
+            getattr(self, "kpi_cloud", None),
+        ]:
+            if kpi and hasattr(kpi, "update_theme"):
+                kpi.update_theme(mode)
+
+        # 4. Overview Cards
+        card_bg = "#ffffff" if is_light else "#111827"
+        card_border = "#e2e8f0" if is_light else "#1e293b"
+        title_color = "#0f172a" if is_light else "#ffffff"
+
+        for card in [getattr(self, "card1", None), getattr(self, "card2", None), getattr(self, "card3", None)]:
+            if card:
+                card.setStyleSheet(f"QFrame {{ background-color: {card_bg}; border: 1px solid {card_border}; border-radius: 8px; }}")
+
+        for lbl in [getattr(self, "lbl_c1_title", None), getattr(self, "lbl_c2_title", None), getattr(self, "lbl_c3_title", None)]:
+            if lbl:
+                lbl.setStyleSheet(f"color: {title_color}; font-weight: bold; font-size: 13px;")
+
+        # 5. Distribution Rows
+        for r in [
+            getattr(self, "dist_subdomains", None),
+            getattr(self, "dist_ips", None),
+            getattr(self, "dist_ports", None),
+            getattr(self, "dist_webapps", None),
+            getattr(self, "dist_vulns", None),
+        ] + getattr(self, "svc_rows", []) + getattr(self, "tech_rows", []):
+            if r and hasattr(r, "update_theme"):
+                r.update_theme(mode)
+
+        # 6. Filter Drawer
+        if hasattr(self, "filter_drawer"):
+            drawer_bg = "#ffffff" if is_light else "#0f172a"
+            drawer_border = "#e2e8f0" if is_light else "#1e293b"
+            self.filter_drawer.setStyleSheet(f"QFrame {{ background-color: {drawer_bg}; border: 1px solid {drawer_border}; border-radius: 8px; }}")
+
+        if hasattr(self, "lbl_f_title"):
+            self.lbl_f_title.setStyleSheet(f"color: {title_color}; font-weight: bold; font-size: 13px;")
+
+        # 7. Asset Table
+        if hasattr(self, "asset_table"):
+            if is_light:
+                self.asset_table.setStyleSheet(
+                    "QTableWidget { background-color: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; color: #0f172a; font-size: 12px; gridline-color: #e2e8f0; }"
+                    "QTableWidget::item { padding: 6px 10px; }"
+                    "QTableWidget::item:selected { background-color: #dbeafe; color: #1e3a8a; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #0f172a; font-weight: bold; font-size: 12px; border: none; padding: 8px 10px; border-bottom: 2px solid #cbd5e1; }"
+                )
+            else:
+                self.asset_table.setStyleSheet(
+                    "QTableWidget { background-color: #0b0f19; alternate-background-color: #111827; border: 1px solid #1e293b; border-radius: 6px; color: #f8fafc; font-size: 12px; gridline-color: #1e293b; }"
+                    "QTableWidget::item { padding: 6px 10px; }"
+                    "QTableWidget::item:selected { background-color: #1e3a8a; color: #ffffff; }"
+                    "QHeaderView::section { background-color: #0f172a; color: #e2e8f0; font-weight: bold; font-size: 12px; border: none; padding: 8px 10px; border-bottom: 2px solid #334155; }"
+                )
+
+        # 8. Inspector Panel
+        if hasattr(self, "inspector_panel"):
+            insp_bg = "#ffffff" if is_light else "#1e293b"
+            insp_border = "#e2e8f0" if is_light else "#334155"
+            self.inspector_panel.setStyleSheet(f"QFrame {{ background-color: {insp_bg}; border: 1px solid {insp_border}; border-radius: 8px; padding: 6px; }}")
+
+        if hasattr(self, "lbl_insp_title"):
+            self.lbl_insp_title.setStyleSheet(f"color: {title_color}; font-weight: bold; font-size: 14px;")
+
+        if hasattr(self, "services_table"):
+            if is_light:
+                self.services_table.setStyleSheet(
+                    "QTableWidget { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; color: #0f172a; font-size: 11px; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #334155; font-weight: bold; font-size: 11px; padding: 4px 6px; border: none; border-bottom: 1px solid #e2e8f0; }"
+                )
+            else:
+                self.services_table.setStyleSheet(
+                    "QTableWidget { background-color: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #f8fafc; font-size: 11px; }"
+                    "QHeaderView::section { background-color: #1e293b; color: #cbd5e1; font-weight: bold; font-size: 11px; padding: 4px 6px; border: none; border-bottom: 1px solid #334155; }"
+                )
+
+        if hasattr(self, "findings_table"):
+            if is_light:
+                self.findings_table.setStyleSheet(
+                    "QTableWidget { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; color: #0f172a; font-size: 11px; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #334155; font-weight: bold; font-size: 11px; padding: 4px 6px; border: none; border-bottom: 1px solid #e2e8f0; }"
+                )
+            else:
+                self.findings_table.setStyleSheet(
+                    "QTableWidget { background-color: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #f8fafc; font-size: 11px; }"
+                    "QHeaderView::section { background-color: #1e293b; color: #cbd5e1; font-weight: bold; font-size: 11px; padding: 4px 6px; border: none; border-bottom: 1px solid #334155; }"
+                )
 
     def _get_active_target_domain(self) -> Optional[str]:
         """Resolves target domain from selected table item or authorized scopes."""
@@ -1332,7 +1501,7 @@ class AssetsView(QWidget):
             # Col 6: Risk Posture
             it_risk = QTableWidgetItem(risk_text)
             it_risk.setForeground(QColor(risk_color))
-            it_risk.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            it_risk.setFont(get_ui_font(10, bold=True))
             self.asset_table.setItem(row_idx, 6, it_risk)
 
             # Col 7: Action (Inspect)
@@ -1381,7 +1550,7 @@ class AssetsView(QWidget):
         self._selected_node = None
         self.lbl_insp_title.setText("Asset Details")
         self.lbl_insp_ip.setText("No Asset Selected")
-        self.lbl_insp_meta.setText("Select an asset to inspect, or discover hosts via Terminal.")
+        self.lbl_insp_meta.setText("Select an asset from the table to inspect services, ports, and confirmed findings.")
         self.services_table.setRowCount(0)
         self.findings_table.setRowCount(0)
 
@@ -1433,7 +1602,7 @@ class AssetsView(QWidget):
             sev_item = QTableWidgetItem(sev_str)
             sev_color = "#ef4444" if sev_str == "CRITICAL" else ("#f97316" if sev_str == "HIGH" else "#eab308")
             sev_item.setForeground(QColor(sev_color))
-            sev_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            sev_item.setFont(get_ui_font(10, bold=True))
             self.findings_table.setItem(f_idx, 0, sev_item)
             self.findings_table.setItem(f_idx, 1, QTableWidgetItem(finding.title))
 

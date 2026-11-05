@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from desktop.theme import CPENTTheme
+from desktop.theme import CPENTTheme, ThemeManager, ThemeMode
 
 
 class SidebarNavItem(QPushButton):
@@ -64,13 +64,22 @@ class SidebarNavItem(QPushButton):
 
     def update_display(self, collapsed: bool):
         self.is_collapsed = collapsed
+        mode = ThemeManager.instance().current_mode
+        is_dark = mode == ThemeMode.DARK
+        text_color = "#CBD5E1" if is_dark else "#334155"
+        hover_bg = "#1E293B" if is_dark else "#E2E8F0"
+        hover_text = "#F8FAFC" if is_dark else "#0F172A"
+        checked_bg = "#1E293B" if is_dark else "#E2E8F0"
+        checked_text = "#38BDF8" if is_dark else "#2563EB"
+        checked_border = "#38BDF8" if is_dark else "#2563EB"
+
         if collapsed:
             self.setText(self.icon_text)
             self.setToolTip(f"{self.label_text} — {self.tooltip_text}")
             self.setStyleSheet(
-                "QPushButton { text-align: center; padding: 6px 0px; font-size: 13px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: #94a3b8; }"
-                "QPushButton:hover { background-color: #1e293b; color: #f1f5f9; }"
-                "QPushButton:checked { background-color: #1e293b; color: #38bdf8; font-weight: bold; border-left: 3px solid #38bdf8; }"
+                f"QPushButton {{ text-align: center; padding: 6px 0px; font-size: 13px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: {text_color}; }}"
+                f"QPushButton:hover {{ background-color: {hover_bg}; color: {hover_text}; }}"
+                f"QPushButton:checked {{ background-color: {checked_bg}; color: {checked_text}; font-weight: bold; border-left: 3px solid {checked_border}; }}"
             )
         else:
             badge_suffix = f"  [{self.badge_text}]" if self.badge_text else ""
@@ -78,9 +87,9 @@ class SidebarNavItem(QPushButton):
             self.setText(f"{self.icon_text}  {clean_label}{badge_suffix}")
             self.setToolTip(self.tooltip_text)
             self.setStyleSheet(
-                "QPushButton { text-align: left; padding: 6px 10px; font-size: 12px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: #94a3b8; }"
-                "QPushButton:hover { background-color: #1e293b; color: #f1f5f9; }"
-                "QPushButton:checked { background-color: #1e293b; color: #38bdf8; font-weight: bold; border-left: 3px solid #38bdf8; }"
+                f"QPushButton {{ text-align: left; padding: 6px 10px; font-size: 12px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: {text_color}; }}"
+                f"QPushButton:hover {{ background-color: {hover_bg}; color: {hover_text}; }}"
+                f"QPushButton:checked {{ background-color: {checked_bg}; color: {checked_text}; font-weight: bold; border-left: 3px solid {checked_border}; }}"
             )
 
 
@@ -128,6 +137,10 @@ class SidebarNavWidget(QWidget):
         self.section_headers: List[QLabel] = []
         self.visible_section_headers: List[QLabel] = []
         self._init_ui()
+
+        self.theme_manager = ThemeManager.instance()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(self.theme_manager.current_mode.value)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -384,4 +397,59 @@ class SidebarNavWidget(QWidget):
                 item.canonical_item.setChecked(True)
             else:
                 item.setChecked(True)
+
+    def _on_theme_changed(self, mode_str: str):
+        """Refreshes sidebar chrome and items upon Dark/Light mode toggle."""
+        is_dark = mode_str == "dark"
+        card_bg = "#0F172A" if is_dark else "#FFFFFF"
+        card_border = "#1E293B" if is_dark else "#CBD5E1"
+        card_hover = "#1E293B" if is_dark else "#F1F5F9"
+        proj_color = "#38BDF8" if is_dark else "#0284C7"
+        scope_color = "#94A3B8" if is_dark else "#64748B"
+        header_color = "#94A3B8" if is_dark else "#475569"
+        btn_color = "#CBD5E1" if is_dark else "#334155"
+        btn_hover = "#1E293B" if is_dark else "#E2E8F0"
+
+        if hasattr(self, "lbl_brand"):
+            self.lbl_brand.setStyleSheet(f"color: {'#F8FAFC' if is_dark else '#0F172A'};")
+        if hasattr(self, "lbl_subtitle"):
+            self.lbl_subtitle.setStyleSheet(f"color: {'#94A3B8' if is_dark else '#64748B'};")
+
+        if hasattr(self, "context_card"):
+            self.context_card.setStyleSheet(
+                f"QFrame#contextCard {{ background-color: {card_bg}; border: 1px solid {card_border}; border-radius: 6px; padding: 6px; }}"
+                f"QFrame#contextCard:hover {{ background-color: {card_hover}; border-color: {proj_color}; }}"
+            )
+        if hasattr(self, "lbl_project_name"):
+            self.lbl_project_name.setStyleSheet(f"color: {proj_color}; font-weight: 700;")
+        if hasattr(self, "lbl_scope_count"):
+            self.lbl_scope_count.setStyleSheet(f"color: {scope_color};")
+
+        for hdr in getattr(self, "visible_section_headers", []):
+            hdr.setStyleSheet(
+                f"color: {header_color}; padding-top: 10px; padding-bottom: 2px; padding-left: 6px; letter-spacing: 0.6px; font-weight: 700;"
+            )
+
+        if hasattr(self, "btn_collapse"):
+            self.btn_collapse.setStyleSheet(
+                f"QPushButton {{ background: {card_hover}; color: {btn_color}; border: 1px solid {card_border}; border-radius: 4px; font-size: 10px; }}"
+                f"QPushButton:hover {{ background: {card_border}; color: {'#ffffff' if is_dark else '#000000'}; }}"
+            )
+
+        if hasattr(self, "btn_theme"):
+            theme_label = "☀" if self.is_collapsed else ("☀  Light Mode" if is_dark else "🌙  Dark Mode")
+            self.btn_theme.setText(theme_label)
+            self.btn_theme.setStyleSheet(
+                f"QPushButton {{ text-align: left; padding: 4px 8px; font-size: 11px; color: {btn_color}; background: transparent; border: none; border-radius: 4px; }}"
+                f"QPushButton:hover {{ background: {btn_hover}; color: {'#ffffff' if is_dark else '#0F172A'}; }}"
+            )
+
+        if hasattr(self, "btn_settings"):
+            self.btn_settings.setStyleSheet(
+                f"QPushButton {{ text-align: left; padding: 4px 8px; font-size: 11px; color: {btn_color}; background: transparent; border: none; border-radius: 4px; }}"
+                f"QPushButton:hover {{ background: {btn_hover}; color: {'#ffffff' if is_dark else '#0F172A'}; }}"
+            )
+
+        for item in self.nav_items.values():
+            item.update_display(self.is_collapsed)
 

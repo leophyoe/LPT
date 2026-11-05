@@ -148,9 +148,11 @@ class VSCodeTerminalSession(QWidget):
 
         # WebEngine View
         from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtGui import QColor
 
         self.web_view = QWebEngineView()
-        self.web_view.setStyleSheet("background-color: #0b0d13;")
+        self.web_view.page().setBackgroundColor(QColor("#060911"))
+        self.web_view.setStyleSheet("background-color: #060911;")
 
         # HTML file path
         html_file = Path(__file__).parent.parent / "resources" / "terminal" / "terminal.html"

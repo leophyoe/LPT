@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
 logger = logging.getLogger(__name__)
@@ -311,10 +311,47 @@ class CPENTTheme:
     LIGHT_SECONDARY_TEXT = LIGHT_TOKENS.secondary_text
     LIGHT_BORDER = LIGHT_TOKENS.border
 
-    # Typography Font Stacks
-    FONT_FAMILY_HEADING = "'Poppins', 'Montserrat', 'Segoe UI', -apple-system, sans-serif"
-    FONT_FAMILY_BODY = "'Open Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif"
-    FONT_FAMILY_MONO = "'Fira Code', 'JetBrains Mono', 'Consolas', 'Courier New', monospace"
+    # Typography Font Stacks (High-Legibility & Burmese Inclusivity Standard)
+    FONT_FAMILY_HEADING = "'Inter', 'Noto Sans', 'Noto Sans Myanmar', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+    FONT_FAMILY_BODY = "'Inter', 'Noto Sans', 'Noto Sans Myanmar', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Ubuntu, sans-serif"
+    FONT_FAMILY_MONO = "'JetBrains Mono', 'Fira Code', 'Noto Sans Mono', 'Ubuntu Mono', 'DejaVu Sans Mono', Consolas, monospace"
+
+
+def get_ui_font(size: int = 12, bold: bool = False, heading: bool = False, mono: bool = False) -> QFont:
+    """Returns a standard, high-legibility QFont with verified font fallbacks for English and Burmese."""
+    font = QFont()
+    if mono:
+        font.setFamilies([
+            "JetBrains Mono",
+            "Fira Code",
+            "Noto Sans Mono",
+            "Ubuntu Mono",
+            "DejaVu Sans Mono",
+            "monospace",
+        ])
+    elif heading:
+        font.setFamilies([
+            "Inter",
+            "Noto Sans",
+            "Noto Sans Myanmar",
+            "Ubuntu",
+            "DejaVu Sans",
+            "sans-serif",
+        ])
+        font.setWeight(QFont.Weight.DemiBold if not bold else QFont.Weight.Bold)
+    else:
+        font.setFamilies([
+            "Inter",
+            "Noto Sans",
+            "Noto Sans Myanmar",
+            "Ubuntu",
+            "DejaVu Sans",
+            "sans-serif",
+        ])
+        if bold:
+            font.setWeight(QFont.Weight.Bold)
+    font.setPointSize(size)
+    return font
 
 
 # QColor instances for programmatic canvas drawing
@@ -1222,6 +1259,10 @@ class ThemeManager(QObject):
         return self._mode
 
     @property
+    def mode(self) -> ThemeMode:
+        return self._mode
+
+    @property
     def is_dark(self) -> bool:
         return self._mode == ThemeMode.DARK
 
@@ -1255,6 +1296,12 @@ class ThemeManager(QObject):
         tokens = self.get_tokens(new_mode)
         self._sync_global_tokens(tokens)
         self._save_preference()
+
+        try:
+            from desktop.icons import clear_cache as clear_icon_cache
+            clear_icon_cache()
+        except Exception:
+            pass
 
         if apply_to_app:
             self.apply_theme()

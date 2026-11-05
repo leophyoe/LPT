@@ -16,7 +16,7 @@ from __future__ import annotations
 import ipaddress
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 from core.preflight import PreflightChecker, VerificationCheckStatus
 from core.strix_triage import StrixTriageEngine
 from desktop.dialogs.strix_triage_dialog import StrixTriageDialog
-from desktop.theme import CPENTTheme, SEVERITY_QCOLORS, ThemeManager, get_badge_qss
+from desktop.theme import CPENTTheme, SEVERITY_QCOLORS, ThemeManager, ThemeMode, get_badge_qss, get_ui_font
 from storage.db import Database
 from storage.models import (
     AssetNode,
@@ -130,6 +130,8 @@ class RiskGauge(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        is_light = ThemeManager.instance().is_light
+
         side = min(self.width(), self.height()) - 28
         rect = self.rect().adjusted(
             (self.width() - side) // 2,
@@ -139,20 +141,21 @@ class RiskGauge(QWidget):
         )
 
         # Track background ring
-        painter.setPen(QPen(QColor(CPENTTheme.BORDER), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        track_color = QColor("#e2e8f0" if is_light else "#1e293b")
+        painter.setPen(QPen(track_color, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawArc(rect, 0, 360 * 16)
 
         # Progress Arc based on score
         if self.score >= 70:
-            arc_color = QColor(CPENTTheme.ERROR_RED)  # Red
+            arc_color = QColor("#ef4444")  # Red
         elif self.score >= 40:
-            arc_color = QColor("#F97316")  # Orange
+            arc_color = QColor("#f97316")  # Orange
         elif self.score >= 20:
-            arc_color = QColor(CPENTTheme.AMBER_ACCENT)  # Yellow
+            arc_color = QColor("#eab308")  # Yellow
         elif self.score > 0:
-            arc_color = QColor(CPENTTheme.SUCCESS_GREEN)  # Green
+            arc_color = QColor("#22c55e")  # Green
         else:
-            arc_color = QColor(CPENTTheme.MUTED_TEXT)  # Muted
+            arc_color = QColor("#94a3b8" if is_light else "#475569")
 
         if self.score > 0:
             painter.setPen(QPen(arc_color, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -160,20 +163,16 @@ class RiskGauge(QWidget):
             painter.drawArc(rect, 90 * 16, span_angle)
 
         # Inner text: Grade & Score
-        painter.setPen(QColor(CPENTTheme.PRIMARY_TEXT))
-        grade_font = QFont()
-        grade_font.setPointSize(28)
-        grade_font.setBold(True)
+        painter.setPen(QColor("#0f172a" if is_light else "#f8fafc"))
+        grade_font = get_ui_font(26, bold=True, heading=True)
         painter.setFont(grade_font)
 
         grade_rect = rect.adjusted(0, -18, 0, -18)
         painter.drawText(grade_rect, Qt.AlignmentFlag.AlignCenter, self.grade)
 
-        sub_font = QFont()
-        sub_font.setPointSize(10)
-        sub_font.setBold(False)
+        sub_font = get_ui_font(10, bold=False)
         painter.setFont(sub_font)
-        painter.setPen(QColor(CPENTTheme.SECONDARY_TEXT))
+        painter.setPen(QColor("#475569" if is_light else "#cbd5e1"))
         score_rect = rect.adjusted(0, 26, 0, 26)
         painter.drawText(score_rect, Qt.AlignmentFlag.AlignCenter, f"{self.score}/100\n{self.level}")
         painter.end()
@@ -196,6 +195,8 @@ class DashboardView(QWidget):
         self.setObjectName("dashboardView")
         self._build_ui()
         self.refresh()
+        ThemeManager.instance().theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(ThemeManager.instance().mode)
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
@@ -206,10 +207,10 @@ class DashboardView(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        container = QWidget()
-        container.setObjectName("dashboardContainer")
-        container.setStyleSheet("QWidget#dashboardContainer { background-color: #0b0f19; }")
-        root = QVBoxLayout(container)
+        self.container = QWidget()
+        self.container.setObjectName("dashboardContainer")
+        self.container.setStyleSheet("QWidget#dashboardContainer { background-color: #0b0f19; }")
+        root = QVBoxLayout(self.container)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(14)
 
@@ -219,6 +220,7 @@ class DashboardView(QWidget):
         title_box.setSpacing(2)
         self.title = QLabel("Executive Security Analytics")
         self.title.setObjectName("dashTitle")
+        self.title.setFont(get_ui_font(16, bold=True, heading=True))
         self.title.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
         self.subtitle = QLabel(
             "Continuous Attack Surface Management · Compromise Paths · Real-time Vulnerability Telemetry"
@@ -504,7 +506,7 @@ class DashboardView(QWidget):
         splitter.setStretchFactor(1, 4)
         root.addWidget(splitter, 1)
 
-        scroll.setWidget(container)
+        scroll.setWidget(self.container)
         main_layout.addWidget(scroll)
 
     def _metric_card(
@@ -923,8 +925,10 @@ class DashboardView(QWidget):
             self.findings_table.setItem(row, 0, sev_item)
 
             # 2. Title & Weakness
+            is_light = ThemeManager.instance().is_light
             weakness_tag = triaged.owasp_category.split(" - ")[0] if " - " in triaged.owasp_category else "CWE"
             title_item = QTableWidgetItem(f"{f.title}  ·  ({weakness_tag})")
+            title_item.setForeground(QColor("#0f172a" if is_light else "#f8fafc"))
             title_item.setData(Qt.ItemDataRole.UserRole, f)
             self.findings_table.setItem(row, 1, title_item)
 
@@ -933,7 +937,7 @@ class DashboardView(QWidget):
             if f.affected_port_service:
                 asset_text += f":{f.affected_port_service}"
             asset_item = QTableWidgetItem(asset_text)
-            asset_item.setForeground(QColor(CPENTTheme.INFO_CYAN))
+            asset_item.setForeground(QColor("#0284c7" if is_light else CPENTTheme.INFO_CYAN))
             self.findings_table.setItem(row, 2, asset_item)
 
             # 4. Status with clear visual styling
@@ -1239,3 +1243,30 @@ class DashboardView(QWidget):
         lines.append("")
         lines.append(f"Summary: {valid_count} Valid, {invalid_count} Tampered/Mismatch, {missing_count} Missing on disk.")
         self.txt_verification_summary.setPlainText("\n".join(lines))
+
+    def _on_theme_changed(self, mode: Union[ThemeMode, str]):
+        is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
+        bg = "#f8fafc" if is_light else "#0b0f19"
+        if hasattr(self, "container"):
+            self.container.setStyleSheet(f"QWidget#dashboardContainer {{ background-color: {bg}; }}")
+        if hasattr(self, "title"):
+            self.title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {'#0f172a' if is_light else '#f8fafc'};")
+        if hasattr(self, "subtitle"):
+            self.subtitle.setStyleSheet(f"font-size: 11px; color: {'#64748b' if is_light else '#94a3b8'};")
+        if hasattr(self, "findings_table"):
+            if is_light:
+                self.findings_table.setStyleSheet(
+                    "QTableWidget { background-color: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #e2e8f0; color: #0f172a; gridline-color: #e2e8f0; }"
+                    "QTableWidget::item:selected { background-color: #dbeafe; color: #1e3a8a; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #0f172a; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #cbd5e1; }"
+                )
+            else:
+                self.findings_table.setStyleSheet(
+                    "QTableWidget { background-color: #0b1120; alternate-background-color: #111827; border: 1px solid #1e293b; color: #f8fafc; gridline-color: #1e293b; }"
+                    "QTableWidget::item:selected { background-color: #1e3a8a; color: #ffffff; }"
+                    "QHeaderView::section { background-color: #0f172a; color: #cbd5e1; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #334155; }"
+                )
+        if hasattr(self, "gauge"):
+            self.gauge.update()
+        if hasattr(self, "_populate_findings_table"):
+            self._populate_findings_table()

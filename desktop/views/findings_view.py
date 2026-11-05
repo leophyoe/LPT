@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, List, Dict
 
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QColor
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.activity_logger import sanitize_text
-from desktop.theme import CPENTTheme, VALIDATION_COLORS_HEX
+from desktop.theme import CPENTTheme, VALIDATION_COLORS_HEX, get_ui_font, ThemeManager, ThemeMode
 from reports.builder import ReportBuilder
 from storage.db import Database
 from storage.models import Assessment, Finding, FindingSeverity, ValidationStatus
@@ -193,6 +193,8 @@ class FindingsView(QWidget):
         self._auto_report_signature = None
         self._auto_report_pending_project: Optional[int] = None
         self._init_ui()
+        ThemeManager.instance().theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(ThemeManager.instance().mode)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -201,10 +203,11 @@ class FindingsView(QWidget):
 
         # Header and Report Export Toolbar
         header_row = QHBoxLayout()
-        header = QLabel("🎯  Security Findings & Evidence Repository")
-        header.setObjectName("viewHeader")
-        header.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
-        header_row.addWidget(header)
+        self.header = QLabel("🎯  Security Findings & Evidence Repository")
+        self.header.setObjectName("viewHeader")
+        self.header.setFont(get_ui_font(16, bold=True, heading=True))
+        self.header.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
+        header_row.addWidget(self.header)
         header_row.addStretch()
 
         # Action Buttons
@@ -333,7 +336,19 @@ class FindingsView(QWidget):
         self.table.setHorizontalHeaderLabels([
             "ID", "Severity", "Finding Title", "Affected Asset", "Status", "Confidence", "Assessment"
         ])
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(1, 95)
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.Interactive)
+        self.table.setColumnWidth(3, 160)
+        hdr.setSectionResizeMode(4, QHeaderView.Interactive)
+        self.table.setColumnWidth(4, 110)
+        hdr.setSectionResizeMode(5, QHeaderView.Interactive)
+        self.table.setColumnWidth(5, 95)
+        hdr.setSectionResizeMode(6, QHeaderView.Interactive)
+        self.table.setColumnWidth(6, 120)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         splitter.addWidget(self.table)
@@ -343,9 +358,10 @@ class FindingsView(QWidget):
         details_layout = QVBoxLayout(details_widget)
         details_layout.setContentsMargins(0, 8, 0, 0)
 
-        details_title = QLabel("Finding Details & Remediation Guidance")
-        details_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #38bdf8;")
-        details_layout.addWidget(details_title)
+        self.details_title = QLabel("Finding Details & Remediation Guidance")
+        self.details_title.setFont(get_ui_font(12, bold=True, heading=True))
+        self.details_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #38bdf8;")
+        details_layout.addWidget(self.details_title)
 
         self.details_edit = QTextEdit()
         self.details_edit.setReadOnly(True)
@@ -879,3 +895,28 @@ class FindingsView(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Failed to generate report: {e}")
+
+    def _on_theme_changed(self, mode: Union[ThemeMode, str]):
+        is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
+        if hasattr(self, "header"):
+            self.header.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {'#0f172a' if is_light else '#f8fafc'};")
+        if hasattr(self, "details_title"):
+            self.details_title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {'#0369a1' if is_light else '#38bdf8'};")
+        if hasattr(self, "details_edit"):
+            bg = "#ffffff" if is_light else "#0b0f19"
+            fg = "#0f172a" if is_light else "#f8fafc"
+            border = "#cbd5e1" if is_light else "#1e293b"
+            self.details_edit.setStyleSheet(f"background-color: {bg}; color: {fg}; border: 1px solid {border};")
+        if hasattr(self, "table"):
+            if is_light:
+                self.table.setStyleSheet(
+                    "QTableWidget { background-color: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #e2e8f0; color: #0f172a; gridline-color: #e2e8f0; }"
+                    "QTableWidget::item:selected { background-color: #dbeafe; color: #1e3a8a; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #0f172a; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #cbd5e1; }"
+                )
+            else:
+                self.table.setStyleSheet(
+                    "QTableWidget { background-color: #0b1120; alternate-background-color: #111827; border: 1px solid #1e293b; color: #f8fafc; gridline-color: #1e293b; }"
+                    "QTableWidget::item:selected { background-color: #1e3a8a; color: #ffffff; }"
+                    "QHeaderView::section { background-color: #0f172a; color: #cbd5e1; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #334155; }"
+                )

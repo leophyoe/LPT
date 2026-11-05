@@ -8,7 +8,7 @@ and provides safe non-intrusive diagnostic verification and installation guidanc
 from __future__ import annotations
 
 import html
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QFont
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.registry import ToolMetadata, ToolRegistry
-from desktop.theme import CPENTTheme
+from desktop.theme import CPENTTheme, get_ui_font, ThemeManager, ThemeMode
 from modules.scanners_box.catalog import ScannersBoxCatalog, ScannersBoxItem
 from storage.db import Database
 
@@ -76,6 +76,8 @@ class ToolsDashboardView(QWidget):
 
         self._init_ui()
         self.refresh_tools()
+        ThemeManager.instance().theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(ThemeManager.instance().mode)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -85,11 +87,12 @@ class ToolsDashboardView(QWidget):
         # 1. Header Row
         header_row = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("Security Tool Integration Dashboard")
-        title.setObjectName("viewHeader")
+        self.header_title = QLabel("Security Tool Integration Dashboard")
+        self.header_title.setObjectName("viewHeader")
+        self.header_title.setFont(get_ui_font(16, bold=True, heading=True))
         subtitle = QLabel("Real-time environment discovery, execution readiness, and installation diagnostics.")
         subtitle.setObjectName("viewSubtitle")
-        title_box.addWidget(title)
+        title_box.addWidget(self.header_title)
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch()
@@ -161,7 +164,7 @@ class ToolsDashboardView(QWidget):
         self.btn_filter_installed.clicked.connect(self.show_available_tools_only)
         filter_row.addWidget(self.btn_filter_installed)
 
-        self.btn_filter_missing = QPushButton("📥 Unavailable Tools & Guides")
+        self.btn_filter_missing = QPushButton("📥 Unavailable Tools && Guides")
         self.btn_filter_missing.setFixedHeight(26)
         self.btn_filter_missing.setStyleSheet(
             f"QPushButton {{ background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.AMBER_ACCENT}; "
@@ -199,14 +202,22 @@ class ToolsDashboardView(QWidget):
             "GUI",
             "Parser",
         ])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 160)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(1, 110)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(2, 90)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(4, 55)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(5, 75)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(6, 55)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(7, 75)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setAlternatingRowColors(True)
@@ -220,9 +231,9 @@ class ToolsDashboardView(QWidget):
         detail_scroll.setStyleSheet("QScrollArea { background: transparent; border: 1px solid #1e293b; border-radius: 6px; }")
         if detail_scroll.viewport():
             detail_scroll.viewport().setStyleSheet("background: #0f172a; border-radius: 6px;")
-        detail_widget = QWidget()
-        detail_widget.setStyleSheet("background: #0f172a; border-radius: 6px;")
-        self.detail_layout = QVBoxLayout(detail_widget)
+        self.detail_widget = QWidget()
+        self.detail_widget.setStyleSheet("background: #0f172a; border-radius: 6px;")
+        self.detail_layout = QVBoxLayout(self.detail_widget)
         self.detail_layout.setContentsMargins(12, 12, 12, 12)
         self.detail_layout.setSpacing(10)
 
@@ -295,7 +306,7 @@ class ToolsDashboardView(QWidget):
         self.detail_layout.addWidget(self.btn_copy_cmd)
 
         self.detail_layout.addStretch()
-        detail_scroll.setWidget(detail_widget)
+        detail_scroll.setWidget(self.detail_widget)
         splitter.addWidget(detail_scroll)
 
         # 60% Table, 40% Details
@@ -734,4 +745,26 @@ class ToolsDashboardView(QWidget):
     def _on_sb_open_github_clicked(self):
         if self.selected_sb_item and self.selected_sb_item.github_url:
             QDesktopServices.openUrl(QUrl(self.selected_sb_item.github_url))
+
+    def _on_theme_changed(self, mode: Union[ThemeMode, str]):
+        is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
+        if hasattr(self, "header_title"):
+            self.header_title.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {'#0f172a' if is_light else '#f8fafc'};")
+        if hasattr(self, "detail_widget"):
+            bg = "#ffffff" if is_light else "#0f172a"
+            border = "#e2e8f0" if is_light else "#1e293b"
+            self.detail_widget.setStyleSheet(f"background: {bg}; border: 1px solid {border}; border-radius: 6px;")
+        if hasattr(self, "table"):
+            if is_light:
+                self.table.setStyleSheet(
+                    "QTableWidget { background-color: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #e2e8f0; color: #0f172a; gridline-color: #e2e8f0; }"
+                    "QTableWidget::item:selected { background-color: #dbeafe; color: #1e3a8a; }"
+                    "QHeaderView::section { background-color: #f1f5f9; color: #0f172a; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #cbd5e1; }"
+                )
+            else:
+                self.table.setStyleSheet(
+                    "QTableWidget { background-color: #0b1120; alternate-background-color: #111827; border: 1px solid #1e293b; color: #f8fafc; gridline-color: #1e293b; }"
+                    "QTableWidget::item:selected { background-color: #1e3a8a; color: #ffffff; }"
+                    "QHeaderView::section { background-color: #0f172a; color: #cbd5e1; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #334155; }"
+                )
 

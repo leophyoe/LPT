@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, List, Dict
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QColor
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from core.preflight import PreflightChecker, VerificationCheckStatus
 from core.scope import ScopeAuthorizationService
-from desktop.theme import CPENTTheme
+from desktop.theme import CPENTTheme, get_ui_font, ThemeManager, ThemeMode
 from desktop.widgets.attack_graph_view import AttackGraphView
 from modules.network.amass_adapter import AmassAdapter, AmassOptions
 from reports.cpent_engagement_pack import CPENTEngagementPackGenerator
@@ -424,6 +424,8 @@ class ProjectsView(QWidget):
 
         self._init_ui()
         self.load_projects()
+        ThemeManager.instance().theme_changed.connect(self._on_theme_changed)
+        self._on_theme_changed(ThemeManager.instance().mode)
 
     def _init_ui(self):
         root_layout = QVBoxLayout(self)
@@ -432,11 +434,12 @@ class ProjectsView(QWidget):
 
         # Top Bar: Row 1 = Title & Status Badge
         header_bar = QHBoxLayout()
-        header = QLabel("◈  Penetration Testing Engagements & Scoping")
-        header.setObjectName("viewHeader")
-        header.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
-        header.setWordWrap(True)
-        header_bar.addWidget(header, 1)
+        self.header = QLabel("◈  Penetration Testing Engagements && Scoping")
+        self.header.setObjectName("viewHeader")
+        self.header.setFont(get_ui_font(16, bold=True, heading=True))
+        self.header.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
+        self.header.setWordWrap(True)
+        header_bar.addWidget(self.header, 1)
 
         self.lbl_status_badge = QLabel("[No Active Engagement]")
         self.lbl_status_badge.setObjectName("viewSubtitle")
@@ -472,7 +475,7 @@ class ProjectsView(QWidget):
         self.btn_edit_project.clicked.connect(self._on_edit_project)
         top_bar.addWidget(self.btn_edit_project)
 
-        self.btn_edit_roe = QPushButton("📋 Edit RoE & State")
+        self.btn_edit_roe = QPushButton("📋 Edit RoE && State")
         self.btn_edit_roe.setProperty("class", "action-secondary")
         self.btn_edit_roe.setFixedHeight(30)
         self.btn_edit_roe.clicked.connect(self._on_edit_roe)
@@ -590,7 +593,7 @@ class ProjectsView(QWidget):
         scope_hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         scope_layout.addWidget(self.scopes_table)
 
-        self.tabs.addTab(scope_widget, "🎯 Scope Boundaries & Exclusions")
+        self.tabs.addTab(scope_widget, "🎯 Scope Boundaries && Exclusions")
 
         # Tab 2: OWASP Amass OSINT Reconnaissance
         amass_widget = QWidget()
@@ -640,7 +643,7 @@ class ProjectsView(QWidget):
         self.audit_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         audit_layout.addWidget(self.audit_table)
 
-        self.tabs.addTab(audit_widget, "📜 RoE & Audit Trail")
+        self.tabs.addTab(audit_widget, "📜 RoE && Audit Trail")
 
         # Tab 5: Assessments
         self.tab_plans = self._create_assessment_plans_tab()
@@ -1135,7 +1138,14 @@ class ProjectsView(QWidget):
         self.plans_table = QTableWidget()
         self.plans_table.setColumnCount(6)
         self.plans_table.setHorizontalHeaderLabels(["ID", "Name", "Status", "Authorized Scope", "Timeline", "Notes"])
+        self.plans_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.plans_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.plans_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.plans_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.plans_table.setColumnWidth(3, 160)
+        self.plans_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Interactive)
+        self.plans_table.setColumnWidth(4, 120)
+        self.plans_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.plans_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.plans_table.itemSelectionChanged.connect(self._on_plan_selected)
         splitter.addWidget(self.plans_table)
@@ -1473,3 +1483,30 @@ class ProjectsView(QWidget):
             self.db.delete_assessment_plan(plan_id)
             if self.active_project:
                 self.load_assessment_plans(self.active_project.id)
+
+    def _on_theme_changed(self, mode: Union[ThemeMode, str]):
+        is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
+        if hasattr(self, "header"):
+            self.header.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {'#0f172a' if is_light else '#f8fafc'};")
+        if hasattr(self, "lbl_status_badge"):
+            bg = "#f1f5f9" if is_light else "#0f172a"
+            fg = "#475569" if is_light else "#94a3b8"
+            border = "#cbd5e1" if is_light else "#1e293b"
+            self.lbl_status_badge.setStyleSheet(
+                f"background-color: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 4px; padding: 4px 10px; font-weight: 600; font-size: 11px; margin-right: 8px;"
+            )
+        if hasattr(self, "amass_log"):
+            bg = "#ffffff" if is_light else "#0b1120"
+            fg = "#0f172a" if is_light else "#f8fafc"
+            border = "#cbd5e1" if is_light else "#1e293b"
+            self.amass_log.setStyleSheet(f"background-color: {bg}; color: {fg}; border: 1px solid {border}; font-family: monospace;")
+        if hasattr(self, "plan_preflight_view"):
+            bg = "#fef2f2" if is_light else "#0b0f19"
+            fg = "#b91c1c" if is_light else "#f87171"
+            border = "#fecaca" if is_light else "#7f1d1d"
+            self.plan_preflight_view.setStyleSheet(f"background-color: {bg}; color: {fg}; border: 1px solid {border}; font-family: monospace;")
+        if hasattr(self, "plan_criteria_view"):
+            bg = "#ffffff" if is_light else "#0f172a"
+            fg = "#0f172a" if is_light else "#f8fafc"
+            border = "#cbd5e1" if is_light else "#1e293b"
+            self.plan_criteria_view.setStyleSheet(f"background-color: {bg}; color: {fg}; border: 1px solid {border};")
