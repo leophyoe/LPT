@@ -1,0 +1,258 @@
+[
+  {
+    "original": "core/ai_copilot.py.bak_20261105_phase1",
+    "archived": ".archive/core/ai_copilot.py.bak_20261105_phase1"
+  },
+  {
+    "original": "core/registry.py.bak_20261101_phase6a",
+    "archived": ".archive/core/registry.py.bak_20261101_phase6a"
+  },
+  {
+    "original": "core/registry.py.bak_20261101_phase6b",
+    "archived": ".archive/core/registry.py.bak_20261101_phase6b"
+  },
+  {
+    "original": "reports/builder.py.bak_20261101_phase6b",
+    "archived": ".archive/reports/builder.py.bak_20261101_phase6b"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_minimalist",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_minimalist"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_phase6b",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_phase6b"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_003436",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_003436"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_013201",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_013201"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_option_a",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_option_a"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/main_window.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_design2",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_design2"
+  },
+  {
+    "original": "desktop/main_window.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/main_window.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/theme.py.bak_20261101_design",
+    "archived": ".archive/desktop/theme.py.bak_20261101_design"
+  },
+  {
+    "original": "tests/test_2d_3d_network_visualization.py.bak_20261101_phase6a4",
+    "archived": ".archive/tests/test_2d_3d_network_visualization.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "modules/vuln/verifier.py.bak_20261105_phase1",
+    "archived": ".archive/modules/vuln/verifier.py.bak_20261105_phase1"
+  },
+  {
+    "original": "modules/osint/passive_recon.py.bak_20261101_phase7a",
+    "archived": ".archive/modules/osint/passive_recon.py.bak_20261101_phase7a"
+  },
+  {
+    "original": "modules/identity/ldap_client.py.bak_20261101_phase6a1",
+    "archived": ".archive/modules/identity/ldap_client.py.bak_20261101_phase6a1"
+  },
+  {
+    "original": "modules/identity/ldap_adapter.py.bak_20261101_phase6a1",
+    "archived": ".archive/modules/identity/ldap_adapter.py.bak_20261101_phase6a1"
+  },
+  {
+    "original": "modules/identity/ldap_adapter.py.bak_20261101_phase6a3",
+    "archived": ".archive/modules/identity/ldap_adapter.py.bak_20261101_phase6a3"
+  },
+  {
+    "original": "modules/crypto/tls_adapter.py.bak_20261101_phase7d",
+    "archived": ".archive/modules/crypto/tls_adapter.py.bak_20261101_phase7d"
+  },
+  {
+    "original": "modules/crypto/tls_analyzer.py.bak_20261101_phase7d",
+    "archived": ".archive/modules/crypto/tls_analyzer.py.bak_20261101_phase7d"
+  },
+  {
+    "original": "modules/crypto/tls_analyzer.py.bak_20261105_phase1",
+    "archived": ".archive/modules/crypto/tls_analyzer.py.bak_20261105_phase1"
+  },
+  {
+    "original": "desktop/dialogs/scanner_preview_dialog.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/dialogs/scanner_preview_dialog.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/dialogs/scanner_preview_dialog.py.bak_20261101_readability",
+    "archived": ".archive/desktop/dialogs/scanner_preview_dialog.py.bak_20261101_readability"
+  },
+  {
+    "original": "desktop/views/network_scan_view.py.bak_20261101_phase6b",
+    "archived": ".archive/desktop/views/network_scan_view.py.bak_20261101_phase6b"
+  },
+  {
+    "original": "desktop/views/active_directory_view.py.bak_20261101_phase6a",
+    "archived": ".archive/desktop/views/active_directory_view.py.bak_20261101_phase6a"
+  },
+  {
+    "original": "desktop/views/assets_view.py.bak_20261101_readability",
+    "archived": ".archive/desktop/views/assets_view.py.bak_20261101_readability"
+  },
+  {
+    "original": "desktop/views/dashboard_view.py.bak_20261101_behind24",
+    "archived": ".archive/desktop/views/dashboard_view.py.bak_20261101_behind24"
+  },
+  {
+    "original": "desktop/views/dashboard_view.py.bak_20261101_design",
+    "archived": ".archive/desktop/views/dashboard_view.py.bak_20261101_design"
+  },
+  {
+    "original": "desktop/views/tools_view.py.bak_20261101_design2",
+    "archived": ".archive/desktop/views/tools_view.py.bak_20261101_design2"
+  },
+  {
+    "original": "desktop/views/dashboard_view.py.bak_20261101_design2",
+    "archived": ".archive/desktop/views/dashboard_view.py.bak_20261101_design2"
+  },
+  {
+    "original": "desktop/views/findings_view.py.bak_20261101_design",
+    "archived": ".archive/desktop/views/findings_view.py.bak_20261101_design"
+  },
+  {
+    "original": "desktop/views/projects_view.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/views/projects_view.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/views/visualization_workspace.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/views/visualization_workspace.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/views/assets_view.py.bak_20261101_behind24",
+    "archived": ".archive/desktop/views/assets_view.py.bak_20261101_behind24"
+  },
+  {
+    "original": "desktop/views/visualization_workspace.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/views/visualization_workspace.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/views/projects_view.py.bak_20261101_design",
+    "archived": ".archive/desktop/views/projects_view.py.bak_20261101_design"
+  },
+  {
+    "original": "desktop/widgets/webgl_3d_network_view.py.bak_20261101_phase6a3",
+    "archived": ".archive/desktop/widgets/webgl_3d_network_view.py.bak_20261101_phase6a3"
+  },
+  {
+    "original": "desktop/widgets/vscode_terminal.py.bak_20261101_readability",
+    "archived": ".archive/desktop/widgets/vscode_terminal.py.bak_20261101_readability"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/widgets/network_map_view.py.bak_20261101_phase6a3",
+    "archived": ".archive/desktop/widgets/network_map_view.py.bak_20261101_phase6a3"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_option_a",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_option_a"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_design2",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_design2"
+  },
+  {
+    "original": "desktop/widgets/webgl_3d_network_view.py.bak_20261101_010429",
+    "archived": ".archive/desktop/widgets/webgl_3d_network_view.py.bak_20261101_010429"
+  },
+  {
+    "original": "desktop/widgets/vscode_terminal.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/widgets/vscode_terminal.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/widgets/terminal_view.py.bak_20261101_phase4",
+    "archived": ".archive/desktop/widgets/terminal_view.py.bak_20261101_phase4"
+  },
+  {
+    "original": "desktop/widgets/webgl_3d_network_view.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/widgets/webgl_3d_network_view.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/widgets/network_map_view.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/widgets/network_map_view.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_minimalist",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_minimalist"
+  },
+  {
+    "original": "desktop/widgets/network_map_view.py.bak_20261101_phase6a5",
+    "archived": ".archive/desktop/widgets/network_map_view.py.bak_20261101_phase6a5"
+  },
+  {
+    "original": "desktop/widgets/topology_designer.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/widgets/topology_designer.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/widgets/ad_ldap_enumerator_widget.py.bak_20261101_phase6a3",
+    "archived": ".archive/desktop/widgets/ad_ldap_enumerator_widget.py.bak_20261101_phase6a3"
+  },
+  {
+    "original": "desktop/widgets/terminal_session_history.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/widgets/terminal_session_history.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/widgets/topology_designer.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/widgets/topology_designer.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/widgets/webgl_3d_network_view.py.bak_20261101_radial_upgrade",
+    "archived": ".archive/desktop/widgets/webgl_3d_network_view.py.bak_20261101_radial_upgrade"
+  },
+  {
+    "original": "desktop/widgets/terminal_view.py.bak_20261102_phase_a",
+    "archived": ".archive/desktop/widgets/terminal_view.py.bak_20261102_phase_a"
+  },
+  {
+    "original": "desktop/widgets/sidebar_nav.py.bak_20261101_013201",
+    "archived": ".archive/desktop/widgets/sidebar_nav.py.bak_20261101_013201"
+  },
+  {
+    "original": "desktop/widgets/vscode_terminal.py.bak_20261101_phase4",
+    "archived": ".archive/desktop/widgets/vscode_terminal.py.bak_20261101_phase4"
+  },
+  {
+    "original": "desktop/widgets/terminal_view.py.bak_20261101_readability",
+    "archived": ".archive/desktop/widgets/terminal_view.py.bak_20261101_readability"
+  },
+  {
+    "original": "desktop/widgets/network_map_view.py.bak_20261101_phase6a4",
+    "archived": ".archive/desktop/widgets/network_map_view.py.bak_20261101_phase6a4"
+  },
+  {
+    "original": "desktop/resources/visualization/3d_map.html.bak_20261101_010429",
+    "archived": ".archive/desktop/resources/visualization/3d_map.html.bak_20261101_010429"
+  }
+]

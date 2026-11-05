@@ -19,6 +19,7 @@ import re
 import socket
 import ssl
 import tempfile
+import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -412,61 +413,63 @@ class TLSProtocolAnalyzer:
         results.append(cls._probe_ssl_legacy("SSLv3", getattr(ssl, "HAS_SSLv3", False)))
 
         # 2. TLS Protocols
-        tls_versions = [
-            ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
-            ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
-            ("TLSv1.2", getattr(ssl.TLSVersion, "TLSv1_2", None)),
-            ("TLSv1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
-        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            tls_versions = [
+                ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+                ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+                ("TLSv1.2", getattr(ssl.TLSVersion, "TLSv1_2", None)),
+                ("TLSv1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
+            ]
 
-        sock_target = connect_ip or host
-        for ver_name, ver_enum in tls_versions:
-            if ver_enum is None:
-                results.append(TLSProtocolStatus(
-                    protocol_version=ver_name,
-                    status="unavailable",
-                    notes="Client OpenSSL does not support this protocol version."
-                ))
-                continue
+            sock_target = connect_ip or host
+            for ver_name, ver_enum in tls_versions:
+                if ver_enum is None:
+                    results.append(TLSProtocolStatus(
+                        protocol_version=ver_name,
+                        status="unavailable",
+                        notes="Client OpenSSL does not support this protocol version."
+                    ))
+                    continue
 
-            try:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                ctx.minimum_version = ver_enum
-                ctx.maximum_version = ver_enum
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    ctx.minimum_version = ver_enum
+                    ctx.maximum_version = ver_enum
 
-                with socket.create_connection((sock_target, port), timeout=timeout) as sock:
-                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                        neg_ver = ssock.version()
-                        neg_cipher = ssock.cipher()
-                        cipher_name = neg_cipher[0] if neg_cipher else "Unknown"
+                    with socket.create_connection((sock_target, port), timeout=timeout) as sock:
+                        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                            neg_ver = ssock.version()
+                            neg_cipher = ssock.cipher()
+                            cipher_name = neg_cipher[0] if neg_cipher else "Unknown"
+                            results.append(TLSProtocolStatus(
+                                protocol_version=ver_name,
+                                status="supported",
+                                negotiated_cipher=cipher_name,
+                                notes=f"Successfully negotiated {neg_ver} using {cipher_name}"
+                            ))
+                except ssl.SSLError as ssl_err:
+                    err_text = str(ssl_err).lower()
+                    if "alert" in err_text or "protocol_version" in err_text or "handshake_failure" in err_text or "wrong version" in err_text or "unsupported protocol" in err_text:
                         results.append(TLSProtocolStatus(
                             protocol_version=ver_name,
-                            status="supported",
-                            negotiated_cipher=cipher_name,
-                            notes=f"Successfully negotiated {neg_ver} using {cipher_name}"
+                            status="rejected",
+                            notes=f"Server rejected {ver_name} handshake (TLS Alert)."
                         ))
-            except ssl.SSLError as ssl_err:
-                err_text = str(ssl_err).lower()
-                if "alert" in err_text or "protocol_version" in err_text or "handshake_failure" in err_text or "wrong version" in err_text or "unsupported protocol" in err_text:
+                    else:
+                        results.append(TLSProtocolStatus(
+                            protocol_version=ver_name,
+                            status="rejected",
+                            notes=f"Handshake failed: {ssl_err}"
+                        ))
+                except (socket.timeout, ConnectionRefusedError, OSError) as net_err:
                     results.append(TLSProtocolStatus(
                         protocol_version=ver_name,
-                        status="rejected",
-                        notes=f"Server rejected {ver_name} handshake (TLS Alert)."
+                        status="error",
+                        notes=f"Network error connecting to {host}:{port}: {net_err}"
                     ))
-                else:
-                    results.append(TLSProtocolStatus(
-                        protocol_version=ver_name,
-                        status="rejected",
-                        notes=f"Handshake failed: {ssl_err}"
-                    ))
-            except (socket.timeout, ConnectionRefusedError, OSError) as net_err:
-                results.append(TLSProtocolStatus(
-                    protocol_version=ver_name,
-                    status="error",
-                    notes=f"Network error connecting to {host}:{port}: {net_err}"
-                ))
 
         return results
 

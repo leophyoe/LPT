@@ -683,7 +683,40 @@ class AICopilotEngine:
                     provider_used="builtin_offline",
                 )
 
-        # 5. Nmap Success Summary
+        # 5. Generic Web Application Firewall (WAF) or HTTP 403 Forbidden
+        if "waf" in lowered or "403 forbidden" in lowered or "access denied by security policy" in lowered or "cloudflare" in lowered:
+            return AIDiagnosticResult(
+                analysis="Web Application Firewall (WAF) or access filter detected blocking HTTP requests.",
+                root_cause="Automated security requests or scanner headers were identified and blocked by edge protection.",
+                suggested_fix="Fingerprint the perimeter firewall using WAFW00F: 'wafw00f <url>', and consider rate throttling or header normalization.",
+                suggested_command="wafw00f <target_url>",
+                severity="HIGH",
+                provider_used="builtin_offline",
+            )
+
+        # 6. SSL/TLS Certificate or Handshake Failures
+        if "certificate_verify_failed" in lowered or "ssl: handshake failure" in lowered or "self-signed certificate" in lowered:
+            return AIDiagnosticResult(
+                analysis="TLS/SSL certificate validation error encountered during handshake.",
+                root_cause="Remote host uses an untrusted, self-signed, or expired SSL certificate.",
+                suggested_fix="Inspect the cipher suite and certificate chain using the integrated TLS Security Analyzer or pass '-k' / '--insecure'.",
+                suggested_command="python3 -m modules.crypto.tls_analyzer <target_host> 443",
+                severity="MEDIUM",
+                provider_used="builtin_offline",
+            )
+
+        # 7. Engagement Scope Guard Enforcement
+        if "[scope guard]" in lowered or "unauthorized target" in lowered or "blocked by engagement scope guard" in lowered:
+            return AIDiagnosticResult(
+                analysis="Security operation strictly blocked by legal Engagement Scope Guard.",
+                root_cause="The target host or network is not authorized in the active project scope boundaries.",
+                suggested_fix="Verify project scope rules in 'Engagements & Scope'. Never scan unauthorized infrastructure.",
+                suggested_command=None,
+                severity="HIGH",
+                provider_used="builtin_offline",
+            )
+
+        # 8. Nmap Success Summary
         if "nmap done:" in lowered or "nmap scan report" in lowered:
             return AIDiagnosticResult(
                 analysis="Nmap network port scan completed successfully.",

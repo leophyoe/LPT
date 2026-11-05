@@ -23,6 +23,7 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,31 +233,33 @@ class VulnerabilityVerifier:
         accepted_versions = []
         ciphers_used = []
 
-        protocols = [
-            ("TLSv1.0", ssl.TLSVersion.TLSv1 if hasattr(ssl.TLSVersion, "TLSv1") else None),
-            ("TLSv1.1", ssl.TLSVersion.TLSv1_1 if hasattr(ssl.TLSVersion, "TLSv1_1") else None),
-        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            protocols = [
+                ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+                ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+            ]
 
-        for ver_name, ver_enum in protocols:
-            if ver_enum is None:
-                continue
-            try:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                ctx.minimum_version = ver_enum
-                ctx.maximum_version = ver_enum
+            for ver_name, ver_enum in protocols:
+                if ver_enum is None:
+                    continue
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    ctx.minimum_version = ver_enum
+                    ctx.maximum_version = ver_enum
 
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3.0)
-                with ctx.wrap_socket(s, server_hostname=host) as ssock:
-                    ssock.connect((host, port))
-                    cipher_info = ssock.cipher()
-                    accepted_versions.append(ver_name)
-                    if cipher_info:
-                        ciphers_used.append(f"{ver_name}: {cipher_info[0]} ({cipher_info[1]})")
-            except Exception:
-                pass
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(3.0)
+                    with ctx.wrap_socket(s, server_hostname=host) as ssock:
+                        ssock.connect((host, port))
+                        cipher_info = ssock.cipher()
+                        accepted_versions.append(ver_name)
+                        if cipher_info:
+                            ciphers_used.append(f"{ver_name}: {cipher_info[0]} ({cipher_info[1]})")
+                except Exception:
+                    pass
 
         if accepted_versions:
             proof = (
