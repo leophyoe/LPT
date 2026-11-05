@@ -1202,7 +1202,7 @@ class MainWindow(QMainWindow):
             if hasattr(self.web_view, "set_proxy_tab_visible"):
                 self.web_view.set_proxy_tab_visible(True)
         elif tool_name in ("volatility3", "bandit"):
-            self._navigate_to_workspace_subtab(2, 1)  # Findings Triage
+            self._navigate_to_workspace_subtab(2, 0)  # Reports workspace (preserve existing behavior)
         elif tool_name in ("amass", "recon-ng", "theharvester"):
             self._navigate_to_workspace_subtab(1, 2)  # OSINT Intelligence
 
