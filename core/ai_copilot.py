@@ -1985,9 +1985,7 @@ class AICopilotEngine:
         if operator_confirmed:
             return "Confirmed"
 
-        if finding.validation_status == ValidationStatus.CONFIRMED:
-            return "Confirmed"
-        elif finding.validation_status == ValidationStatus.FALSE_POSITIVE:
+        if finding.validation_status == ValidationStatus.FALSE_POSITIVE:
             return "False Positive"
 
         text = f"{finding.title} {finding.description} {raw_evidence}".lower()

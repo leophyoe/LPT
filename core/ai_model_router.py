@@ -171,12 +171,28 @@ def redact_sensitive_ai_data(text: str) -> str:
     """Masks authorization tokens, private keys, AWS credentials, and passwords prior to cloud transmission."""
     if not text:
         return ""
-    # Mask JWT Bearer Tokens
+    # Mask JWT Bearer Tokens and Standalone JWTs
     text = re.sub(r"Bearer\s+ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "Bearer [REDACTED_JWT]", text, flags=re.IGNORECASE)
-    # Mask AWS Access Keys
-    text = re.sub(r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_KEY]", text)
-    # Mask Private Key blocks
-    text = re.sub(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", text)
+    text = re.sub(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "[REDACTED_JWT]", text)
+    # Mask AWS Access and Secret Keys
+    text = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]", text)
+    text = re.sub(r"(?i)(aws_secret_access_key|aws_secret_key)\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?", r"\1: [REDACTED_AWS_SECRET]", text)
+    # Mask GCP Service Account private keys
+    text = re.sub(r'(?i)"private_key"\s*:\s*"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----\\n"', '"private_key": "[REDACTED_GCP_PRIVATE_KEY]"', text)
+    # Mask GitHub Personal Access Tokens
+    text = re.sub(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b", "[REDACTED_GITHUB_TOKEN]", text)
+    text = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{82}\b", "[REDACTED_GITHUB_TOKEN]", text)
+    # Mask OpenAI and Anthropic API keys
+    text = re.sub(r"\bsk-(?:proj-|admin-)?[A-Za-z0-9_-]{20,}\b", "[REDACTED_OPENAI_KEY]", text)
+    text = re.sub(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b", "[REDACTED_ANTHROPIC_KEY]", text)
+    # Mask Google Gemini API keys
+    text = re.sub(r"\bAIzaSy[A-Za-z0-9_-]{33}\b", "[REDACTED_GEMINI_KEY]", text)
+    # Mask Private Key blocks (PEM and OpenSSH)
+    text = re.sub(r"-----BEGIN [A-Z0-9_\- ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9_\- ]+PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", text)
+    # Mask URL-embedded basic authentication credentials
+    text = re.sub(r"(https?://)([^:\s]+):([^@\s]+)@", r"\1\2:[REDACTED_PASSWORD]@", text)
+    # Mask CLI password parameters
+    text = re.sub(r"(?i)(--password|--pass|-P)\s+([^\s]+)", r"\1 [REDACTED_PASSWORD]", text)
     # Mask Generic API Keys / Passwords in flags or assignments
     text = re.sub(r"(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?", r"\1: [REDACTED_SECRET]", text, flags=re.IGNORECASE)
     return text

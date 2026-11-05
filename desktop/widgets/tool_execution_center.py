@@ -745,6 +745,7 @@ class ToolExecutionCenterWidget(QWidget):
             display_name=f"{tool_name.upper()} Scan against {target}",
             timeout=timeout,
             scopes=scopes,
+            high_risk_confirmed=self.chk_high_risk.isChecked() if self.chk_high_risk.isVisible() else True,
         )
         self._current_job = job
 

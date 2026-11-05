@@ -91,6 +91,8 @@ class ExecutionJob:
     execution_record: Optional[ToolExecution] = None
     findings: List[Finding] = field(default_factory=list)
     custom_parser: Optional[Callable[[ExecutionJob], List[Finding]]] = None
+    high_risk_confirmed: bool = False
+    is_destructive: bool = False
 
 
 class ToolExecutionService:
@@ -181,26 +183,60 @@ class ToolExecutionService:
         # 1. State: VALIDATING
         change_state(JobState.VALIDATING)
 
-        # Scope and engagement verification
-        if self.db and job.project_id:
-            project = self.db.get_project(job.project_id)
-            scopes = job.scopes if job.scopes is not None else self.db.list_scopes(job.project_id)
-            scope_check = ScopeAuthorizationService.is_target_authorized(
-                job.target, scopes, project=project
+        # Fail-closed engagement verification: A valid active project is strictly required
+        if not job.project_id:
+            job.error_message = "Execution blocked: No active engagement project specified; failed closed."
+            change_state(JobState.BLOCKED)
+            if on_output:
+                on_output(f"[-] Operational Block: {job.error_message}\n", "stderr")
+            return job
+
+        if not self.db:
+            job.error_message = "Execution blocked: Database connection unavailable to verify project scope; failed closed."
+            change_state(JobState.BLOCKED)
+            if on_output:
+                on_output(f"[-] Operational Block: {job.error_message}\n", "stderr")
+            return job
+
+        project = self.db.get_project(job.project_id)
+        if not project:
+            job.error_message = f"Execution blocked: Engagement project ID {job.project_id} does not exist; failed closed."
+            change_state(JobState.BLOCKED)
+            if on_output:
+                on_output(f"[-] Operational Block: {job.error_message}\n", "stderr")
+            return job
+
+        # Validate engagement lifecycle
+        lifecycle_ok, lifecycle_msg = ScopeAuthorizationService.validate_engagement_lifecycle(project)
+        if not lifecycle_ok:
+            job.error_message = f"Engagement Blocked: {lifecycle_msg}"
+            change_state(JobState.BLOCKED)
+            if on_output:
+                on_output(f"[-] Operational Block: {lifecycle_msg}\n", "stderr")
+            ActivityLogger(self.db).log(
+                project_id=job.project_id,
+                action="tool_execution_blocked",
+                outcome="blocked",
+                details={"tool": job.tool_name, "target": job.target, "reason": lifecycle_msg},
             )
-            if not scope_check.is_allowed:
-                job.error_message = f"Scope Blocked: {scope_check.reason}"
-                change_state(JobState.BLOCKED)
-                if on_output:
-                    on_output(f"[-] Operational Block: Target '{job.target}' is unauthorized: {scope_check.reason}\n", "stderr")
-                if self.db:
-                    ActivityLogger(self.db).log(
-                        project_id=job.project_id,
-                        action="tool_execution_blocked",
-                        outcome="blocked",
-                        details={"tool": job.tool_name, "target": job.target, "reason": scope_check.reason},
-                    )
-                return job
+            return job
+
+        scopes = job.scopes if job.scopes is not None else self.db.list_scopes(job.project_id)
+        scope_check = ScopeAuthorizationService.is_target_authorized(
+            job.target, scopes, project=project
+        )
+        if not scope_check.is_allowed:
+            job.error_message = f"Scope Blocked: {scope_check.reason}"
+            change_state(JobState.BLOCKED)
+            if on_output:
+                on_output(f"[-] Operational Block: Target '{job.target}' is unauthorized: {scope_check.reason}\n", "stderr")
+            ActivityLogger(self.db).log(
+                project_id=job.project_id,
+                action="tool_execution_blocked",
+                outcome="blocked",
+                details={"tool": job.tool_name, "target": job.target, "reason": scope_check.reason},
+            )
+            return job
 
         # Binary availability verification
         binary = job.command[0] if job.command else ""

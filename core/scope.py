@@ -116,6 +116,9 @@ class ScopeAuthorizationService:
                 # Exactly one colon: host:port or ipv4:port
                 parts = target.split(":")
                 if len(parts) == 2 and parts[1].isdigit():
+                    port_val = int(parts[1])
+                    if not (1 <= port_val <= 65535):
+                        return ""
                     target = parts[0]
                 else:
                     return ""
