@@ -28,14 +28,14 @@ def test_theme_tokens_specifications():
     """Verify dark and light tokens match the requested design specifications."""
     hex_pattern = re.compile(r"^#[0-9a-fA-F]{6}$")
 
-    # Dark Tokens Verification
+    # Dark Tokens Verification (PentestX Theme)
     assert DARK_TOKENS.mode == ThemeMode.DARK
-    assert DARK_TOKENS.accent_red == "#D32F2F"
+    assert DARK_TOKENS.accent_red == "#E53935"
     assert DARK_TOKENS.accent_hover == "#B71C1C"
-    assert DARK_TOKENS.app_bg == "#15171C"
-    assert DARK_TOKENS.surface_bg == "#20232B"
-    assert DARK_TOKENS.primary_text == "#F3F4F6"
-    assert DARK_TOKENS.secondary_text == "#A7ADB8"
+    assert DARK_TOKENS.app_bg == "#111318"
+    assert DARK_TOKENS.surface_bg == "#1C222C"
+    assert DARK_TOKENS.primary_text == "#F5F5F5"
+    assert DARK_TOKENS.secondary_text == "#AAB2BD"
 
     # Light Tokens Verification
     assert LIGHT_TOKENS.mode == ThemeMode.LIGHT

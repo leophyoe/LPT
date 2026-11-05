@@ -21,7 +21,9 @@ if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os
         os.environ["QT_QPA_PLATFORM"] = "vnc"
         print("[*] No active display server detected. CyberSecuritySuite GUI started on VNC display (port 5900).")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from core.registry import ToolRegistry
 from desktop.main_window import MainWindow
@@ -31,16 +33,35 @@ from storage.db import Database
 def main():
     """Main execution function."""
     app = QApplication(sys.argv)
-    app.setApplicationName("CyberSecuritySuite")
-    app.setOrganizationName("CyberSecuritySuite")
+    app.setApplicationName("PentestX")
+    app.setApplicationDisplayName("PentestX")
+    app.setOrganizationName("PentestX")
+
+    # Application Window Icon
+    logo_path = PROJECT_ROOT / "Glossy PentestX Logo on Black.png"
+    if logo_path.exists():
+        app.setWindowIcon(QIcon(str(logo_path)))
+
+    # Startup Splash Screen (Smooth, non-disruptive)
+    splash = None
+    if logo_path.exists() and not os.environ.get("CYBERSECURITYSUITE_NO_SPLASH") and not os.environ.get("PENTESTX_NO_SPLASH"):
+        pm = QPixmap(str(logo_path))
+        if not pm.isNull():
+            scaled_splash = pm.scaled(480, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            splash = QSplashScreen(scaled_splash, Qt.WindowStaysOnTopHint)
+            splash.show()
+            app.processEvents()
 
     # Use the populated persistent database shared by the GUI and CLI.
-    db_path = Path(__file__).resolve().parent.parent / "storage" / "data" / "cybersecuritysuite.db"
+    db_path = PROJECT_ROOT / "storage" / "data" / "cybersecuritysuite.db"
     db = Database(db_path)
     registry = ToolRegistry()
 
     window = MainWindow(db=db, registry=registry)
     window.show()
+
+    if splash:
+        splash.finish(window)
 
     sys.exit(app.exec())
 

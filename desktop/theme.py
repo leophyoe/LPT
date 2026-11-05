@@ -24,6 +24,8 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOGO_PATH = PROJECT_ROOT / "Glossy PentestX Logo on Black.png"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 CHECKMARK_ICON_PATH = (ASSETS_DIR / "checkmark.png").as_posix()
 RADIO_DOT_ICON_PATH = (ASSETS_DIR / "radio_dot.png").as_posix()
@@ -160,57 +162,57 @@ PROFESSIONAL_DARK_TOKENS = ThemeTokens(
 )
 
 
-# Default Dark Mode Design Tokens
+# Default Dark Mode Design Tokens (PentestX Cybersecurity Theme)
 DARK_TOKENS = ThemeTokens(
     mode=ThemeMode.DARK,
-    accent_red="#D32F2F",
+    accent_red="#E53935",
     accent_hover="#B71C1C",
     accent_pressed="#9A0007",
-    accent_subtle="rgba(211, 47, 47, 0.16)",
+    accent_subtle="rgba(229, 57, 53, 0.16)",
 
-    app_bg="#15171C",
-    surface_bg="#20232B",
-    sidebar_bg="#1A1D24",
-    elevated_bg="#262A34",
-    card_bg="#20232B",
-    card_hover_bg="#2B303C",
-    input_bg="#181A20",
-    terminal_bg="#0F1014",
+    app_bg="#111318",
+    surface_bg="#1C222C",
+    sidebar_bg="#171B22",
+    elevated_bg="#222935",
+    card_bg="#1C222C",
+    card_hover_bg="#27303E",
+    input_bg="#151921",
+    terminal_bg="#0D0F13",
 
-    primary_text="#F3F4F6",
-    secondary_text="#A7ADB8",
-    muted_text="#8B95A3",
-    inactive_text="#8B95A3",
+    primary_text="#F5F5F5",
+    secondary_text="#AAB2BD",
+    muted_text="#848D9A",
+    inactive_text="#848D9A",
 
-    border="#2B303C",
-    border_subtle="#1E2128",
-    border_focus="#D32F2F",
-    border_light="#3A4150",
+    border="#303743",
+    border_subtle="#1F252F",
+    border_focus="#E53935",
+    border_light="#3E4756",
 
-    table_header_bg="#1A1D24",
-    table_alt_row="#1C1F27",
-    table_selected_bg="#2D3341",
+    table_header_bg="#171B22",
+    table_alt_row="#191F28",
+    table_selected_bg="#27303E",
 
-    scrollbar_bg="#15171C",
-    scrollbar_handle="#373E4D",
-    scrollbar_handle_hover="#4B5563",
+    scrollbar_bg="#111318",
+    scrollbar_handle="#303743",
+    scrollbar_handle_hover="#3E4756",
 
-    canvas_bg="#15171C",
-    canvas_grid_minor="#1E2128",
-    canvas_grid_major="#2B303C",
+    canvas_bg="#111318",
+    canvas_grid_minor="#1F252F",
+    canvas_grid_major="#303743",
 
     severity_critical="#FF6B72",
     severity_high="#FF9F5A",
     severity_medium="#FFD166",
     severity_low="#63B3ED",
-    severity_informational="#A7ADB8",
+    severity_informational="#AAB2BD",
 
-    status_success="#4ADE80",
-    status_warning="#FFD166",
+    status_success="#2EAD65",
+    status_warning="#F0A52B",
     status_error="#FF6B72",
     status_info="#63B3ED",
     status_observed="#60A5FA",
-    status_muted="#8B95A3",
+    status_muted="#848D9A",
 )
 
 # Default Light Mode Design Tokens

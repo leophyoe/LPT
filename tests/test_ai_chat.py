@@ -79,7 +79,7 @@ def test_ai_chat_view_widget(qtbot, test_db):
     qtbot.addWidget(view)
     view.show()
 
-    assert "CyberSecuritySuite AI Assistant" in view.chat_display.toPlainText()
+    assert view.chat_display.toPlainText().strip() == ""
     assert view.provider_combo.count() == 7
     assert "Offline Ready" in view.lbl_key_status.text()
 

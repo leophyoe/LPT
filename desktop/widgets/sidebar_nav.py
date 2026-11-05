@@ -17,9 +17,10 @@ Supports:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -33,6 +34,9 @@ from PySide6.QtWidgets import (
 )
 
 from desktop.theme import CPENTTheme, ThemeManager, ThemeMode
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+LOGO_PATH = PROJECT_ROOT / "Glossy PentestX Logo on Black.png"
 
 
 class SidebarNavItem(QPushButton):
@@ -66,12 +70,12 @@ class SidebarNavItem(QPushButton):
         self.is_collapsed = collapsed
         mode = ThemeManager.instance().current_mode
         is_dark = mode == ThemeMode.DARK
-        text_color = "#CBD5E1" if is_dark else "#334155"
-        hover_bg = "#1E293B" if is_dark else "#E2E8F0"
-        hover_text = "#F8FAFC" if is_dark else "#0F172A"
-        checked_bg = "#1E293B" if is_dark else "#E2E8F0"
-        checked_text = "#38BDF8" if is_dark else "#2563EB"
-        checked_border = "#38BDF8" if is_dark else "#2563EB"
+        text_color = "#AAB2BD" if is_dark else "#334155"
+        hover_bg = "#1C222C" if is_dark else "#E2E8F0"
+        hover_text = "#F5F5F5" if is_dark else "#0F172A"
+        checked_bg = "#22191B" if is_dark else "#FEE2E2"
+        checked_text = "#E53935" if is_dark else "#B42318"
+        checked_border = "#E53935" if is_dark else "#B42318"
 
         if collapsed:
             self.setText(self.icon_text)
@@ -120,6 +124,7 @@ class SidebarNavWidget(QWidget):
 
     route_requested = Signal(str)  # item_id
     collapsed_toggled = Signal(bool)
+    about_requested = Signal()
 
     EXPANDED_WIDTH = 238
     COLLAPSED_WIDTH = 58
@@ -147,18 +152,32 @@ class SidebarNavWidget(QWidget):
         layout.setContentsMargins(6, 10, 6, 8)
         layout.setSpacing(4)
 
-        # Header: App Brand + Subtitle + Collapse Toggle Button
+        # Header: PentestX Logo + Subtitle + Collapse Toggle Button
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(4, 2, 4, 4)
 
         brand_vbox = QVBoxLayout()
-        brand_vbox.setSpacing(1)
-        self.lbl_brand = QLabel("CyberSecuritySuite")
-        self.lbl_brand.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.lbl_brand.setStyleSheet("color: #f8fafc;")
+        brand_vbox.setSpacing(2)
+        self.lbl_brand = QLabel()
+        self.lbl_brand.setObjectName("sidebarLogo")
+        if LOGO_PATH.exists():
+            pm = QPixmap(str(LOGO_PATH))
+            if not pm.isNull():
+                scaled = pm.scaled(168, 56, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.lbl_brand.setPixmap(scaled)
+            else:
+                self.lbl_brand.setText("PentestX")
+                self.lbl_brand.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                self.lbl_brand.setStyleSheet("color: #F5F5F5;")
+        else:
+            self.lbl_brand.setText("PentestX")
+            self.lbl_brand.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            self.lbl_brand.setStyleSheet("color: #F5F5F5;")
+        self.lbl_logo = self.lbl_brand
 
-        self.lbl_subtitle = QLabel("Professional Penetration Testing Platform")
-        self.lbl_subtitle.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 500; letter-spacing: 0.2px;")
+        self.lbl_subtitle = QLabel("Penetration Testing & Security Assessment Platform")
+        self.lbl_subtitle.setStyleSheet("color: #AAB2BD; font-size: 9px; font-weight: 500; letter-spacing: 0.1px;")
+        self.lbl_subtitle.setWordWrap(True)
         brand_vbox.addWidget(self.lbl_brand)
         brand_vbox.addWidget(self.lbl_subtitle)
         header_layout.addLayout(brand_vbox, stretch=1)
@@ -168,8 +187,8 @@ class SidebarNavWidget(QWidget):
         self.btn_collapse.setCursor(Qt.PointingHandCursor)
         self.btn_collapse.setToolTip("Collapse / Expand Navigation Sidebar")
         self.btn_collapse.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; font-size: 10px; }"
-            "QPushButton:hover { background: #334155; color: #ffffff; }"
+            "QPushButton { background: #171B22; color: #AAB2BD; border: 1px solid #303743; border-radius: 4px; font-size: 10px; }"
+            "QPushButton:hover { background: #1C222C; color: #F5F5F5; border-color: #E53935; }"
         )
         self.btn_collapse.clicked.connect(self.toggle_collapse)
         header_layout.addWidget(self.btn_collapse)
@@ -180,8 +199,8 @@ class SidebarNavWidget(QWidget):
         self.context_card.setObjectName("contextCard")
         self.context_card.setCursor(Qt.PointingHandCursor)
         self.context_card.setStyleSheet(
-            "QFrame#contextCard { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 6px; }"
-            "QFrame#contextCard:hover { background-color: #1e293b; border-color: #38bdf8; }"
+            "QFrame#contextCard { background-color: #171B22; border: 1px solid #303743; border-radius: 6px; padding: 6px; }"
+            "QFrame#contextCard:hover { background-color: #1C222C; border-color: #E53935; }"
         )
         self.context_card.mousePressEvent = lambda e: self.route_requested.emit("projects")
         card_layout = QVBoxLayout(self.context_card)
@@ -190,12 +209,12 @@ class SidebarNavWidget(QWidget):
 
         self.lbl_project_name = QLabel("◈ Project: None")
         self.lbl_project_name.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        self.lbl_project_name.setStyleSheet("color: #38bdf8;")
+        self.lbl_project_name.setStyleSheet("color: #E53935;")
         card_layout.addWidget(self.lbl_project_name)
 
         self.lbl_scope_count = QLabel("Scope: Unassigned")
         self.lbl_scope_count.setFont(QFont("Segoe UI", 8))
-        self.lbl_scope_count.setStyleSheet("color: #94a3b8;")
+        self.lbl_scope_count.setStyleSheet("color: #AAB2BD;")
         card_layout.addWidget(self.lbl_scope_count)
 
         layout.addWidget(self.context_card)
@@ -220,20 +239,31 @@ class SidebarNavWidget(QWidget):
         scroll_area.setWidget(scroll_content)
         layout.addWidget(scroll_area, stretch=1)
 
-        # Bottom Utilities: Light Mode & API Settings
+        # Bottom Utilities: About, Light Mode & API Settings
+        self.btn_about = QPushButton("ℹ️  About PentestX")
+        self.btn_about.setObjectName("btnSidebarAbout")
+        self.btn_about.setFixedHeight(28)
+        self.btn_about.setCursor(Qt.PointingHandCursor)
+        self.btn_about.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px; font-size: 11px; color: #AAB2BD; background: transparent; border: none; border-radius: 4px; }"
+            "QPushButton:hover { background: #1C222C; color: #F5F5F5; }"
+        )
+        self.btn_about.clicked.connect(lambda: self.about_requested.emit())
+        layout.addWidget(self.btn_about)
+
         self.btn_theme = QPushButton("☀  Light Mode")
-        self.btn_theme.setFixedHeight(30)
+        self.btn_theme.setFixedHeight(28)
         self.btn_theme.setCursor(Qt.PointingHandCursor)
-        self.btn_theme.setStyleSheet("QPushButton { text-align: left; padding: 4px 8px; font-size: 11px; color: #94a3b8; background: transparent; border: none; border-radius: 4px; } QPushButton:hover { background: #1e293b; color: #ffffff; }")
+        self.btn_theme.setStyleSheet("QPushButton { text-align: left; padding: 4px 8px; font-size: 11px; color: #AAB2BD; background: transparent; border: none; border-radius: 4px; } QPushButton:hover { background: #1C222C; color: #F5F5F5; }")
         layout.addWidget(self.btn_theme)
 
         # Settings reference backward compatibility
         self.btn_settings = self.nav_items.get("settings", None)
         if not self.btn_settings:
             self.btn_settings = QPushButton("⚙️  Settings")
-            self.btn_settings.setFixedHeight(30)
+            self.btn_settings.setFixedHeight(28)
             self.btn_settings.setCursor(Qt.PointingHandCursor)
-            self.btn_settings.setStyleSheet("QPushButton { text-align: left; padding: 4px 8px; font-size: 11px; color: #94a3b8; background: transparent; border: none; border-radius: 4px; } QPushButton:hover { background: #1e293b; color: #ffffff; }")
+            self.btn_settings.setStyleSheet("QPushButton { text-align: left; padding: 4px 8px; font-size: 11px; color: #AAB2BD; background: transparent; border: none; border-radius: 4px; } QPushButton:hover { background: #1C222C; color: #F5F5F5; }")
             layout.addWidget(self.btn_settings)
 
     def _add_section_header(self, title: str) -> QLabel:
@@ -376,11 +406,17 @@ class SidebarNavWidget(QWidget):
             item.update_display(collapsed)
 
         if collapsed:
+            if hasattr(self, "btn_about"):
+                self.btn_about.setText("ℹ️")
+                self.btn_about.setToolTip("About PentestX – CyberSecuritySuite")
             self.btn_theme.setText("☀")
             self.btn_theme.setToolTip("Switch application theme (Dark / Light)")
             self.btn_settings.setText("⚙️")
             self.btn_settings.setToolTip("Settings & API Keys")
         else:
+            if hasattr(self, "btn_about"):
+                self.btn_about.setText("ℹ️  About PentestX")
+                self.btn_about.setToolTip("")
             self.btn_theme.setText("☀  Light Mode")
             self.btn_theme.setToolTip("")
             self.btn_settings.setText("⚙️  Settings")
@@ -409,19 +445,19 @@ class SidebarNavWidget(QWidget):
     def _on_theme_changed(self, mode_str: str):
         """Refreshes sidebar chrome and items upon Dark/Light mode toggle."""
         is_dark = mode_str == "dark"
-        card_bg = "#0F172A" if is_dark else "#FFFFFF"
-        card_border = "#1E293B" if is_dark else "#CBD5E1"
-        card_hover = "#1E293B" if is_dark else "#F1F5F9"
-        proj_color = "#38BDF8" if is_dark else "#0284C7"
-        scope_color = "#94A3B8" if is_dark else "#64748B"
-        header_color = "#94A3B8" if is_dark else "#475569"
-        btn_color = "#CBD5E1" if is_dark else "#334155"
-        btn_hover = "#1E293B" if is_dark else "#E2E8F0"
+        card_bg = "#171B22" if is_dark else "#FFFFFF"
+        card_border = "#303743" if is_dark else "#CBD5E1"
+        card_hover = "#1C222C" if is_dark else "#F1F5F9"
+        proj_color = "#E53935" if is_dark else "#B42318"
+        scope_color = "#AAB2BD" if is_dark else "#64748B"
+        header_color = "#AAB2BD" if is_dark else "#475569"
+        btn_color = "#AAB2BD" if is_dark else "#334155"
+        btn_hover = "#1C222C" if is_dark else "#E2E8F0"
 
         if hasattr(self, "lbl_brand"):
-            self.lbl_brand.setStyleSheet(f"color: {'#F8FAFC' if is_dark else '#0F172A'};")
+            self.lbl_brand.setStyleSheet(f"color: {'#F5F5F5' if is_dark else '#0F172A'};")
         if hasattr(self, "lbl_subtitle"):
-            self.lbl_subtitle.setStyleSheet(f"color: {'#94A3B8' if is_dark else '#64748B'};")
+            self.lbl_subtitle.setStyleSheet(f"color: {'#AAB2BD' if is_dark else '#64748B'};")
 
         if hasattr(self, "context_card"):
             self.context_card.setStyleSheet(

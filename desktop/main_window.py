@@ -1,9 +1,10 @@
-"""Main application window for CyberSecuritySuite desktop platform."""
+"""Main application window for PentestX – CyberSecuritySuite desktop platform."""
 
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -23,6 +24,9 @@ from PySide6.QtWidgets import (
 from core.registry import ToolRegistry
 from desktop.theme import CPENTTheme, DARK_THEME_QSS, ThemeManager, ThemeMode
 from desktop.widgets.sidebar_nav import SidebarNavWidget
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOGO_PATH = PROJECT_ROOT / "Glossy PentestX Logo on Black.png"
 
 
 class WorkspaceSplitterHandle(QSplitterHandle):
@@ -135,7 +139,13 @@ class MainWindow(QMainWindow):
         self.theme_manager = ThemeManager.instance()
         self.theme_manager.theme_changed.connect(self._on_theme_changed)
 
-        self.setWindowTitle("CyberSecuritySuite — Security Testing & CPENT Platform")
+        self.setWindowTitle("PentestX – CyberSecuritySuite")
+        if LOGO_PATH.exists():
+            self.setWindowIcon(QIcon(str(LOGO_PATH)))
+
+        self.shortcut_about = QShortcut(QKeySequence("F1"), self)
+        self.shortcut_about.activated.connect(self.show_about_dialog)
+
         self.setWindowFlags(
             Qt.Window
             | Qt.WindowTitleHint
@@ -178,6 +188,7 @@ class MainWindow(QMainWindow):
         # 1. Left Modern Collapsible Sidebar Navigation
         self.sidebar_nav = SidebarNavWidget(self)
         self.sidebar_nav.route_requested.connect(self._on_sidebar_route_requested)
+        self.sidebar_nav.about_requested.connect(self.show_about_dialog)
         main_layout.addWidget(self.sidebar_nav)
 
         # Legacy button compatibility container (retained for backward compatibility and test suites)
@@ -354,7 +365,18 @@ class MainWindow(QMainWindow):
         self.main_horizontal_splitter.setStretchFactor(0, 7)
         self.main_horizontal_splitter.setStretchFactor(1, 3)
 
-        main_layout.addWidget(self.main_horizontal_splitter)
+        # Right main area container with top application branding header
+        right_container = QWidget()
+        right_container.setObjectName("rightMainContainer")
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        self.main_header = self._create_main_header()
+        right_layout.addWidget(self.main_header)
+        right_layout.addWidget(self.main_horizontal_splitter, stretch=1)
+
+        main_layout.addWidget(right_container, stretch=1)
 
         # Connect inter-view signals
         self.projects_view.project_selected.connect(self._on_project_selected)
@@ -417,6 +439,98 @@ class MainWindow(QMainWindow):
         self.shortcut_term_backtick.activated.connect(self._toggle_terminal_visibility)
         self.shortcut_term_f12 = QShortcut(QKeySequence("F12"), self)
         self.shortcut_term_f12.activated.connect(self._toggle_terminal_visibility)
+
+    def _create_main_header(self) -> QWidget:
+        """Constructs the top application branding header with PentestX logo and controls."""
+        header = QFrame()
+        header.setObjectName("mainAppHeader")
+        header.setFixedHeight(44)
+        header.setStyleSheet(
+            "QFrame#mainAppHeader { background-color: #171B22; border-bottom: 1px solid #303743; }"
+        )
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(12)
+
+        # 1. Main Header PentestX Logo (Preserving exact 3:1 aspect ratio)
+        self.header_logo = QLabel()
+        self.header_logo.setObjectName("mainHeaderLogo")
+        if LOGO_PATH.exists():
+            pm = QPixmap(str(LOGO_PATH))
+            if not pm.isNull():
+                scaled = pm.scaled(96, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.header_logo.setPixmap(scaled)
+        layout.addWidget(self.header_logo)
+
+        # Divider
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Plain)
+        sep.setStyleSheet("color: #303743; max-height: 18px;")
+        layout.addWidget(sep)
+
+        # Subtitle
+        self.header_subtitle = QLabel("Penetration Testing & Security Assessment Platform")
+        self.header_subtitle.setObjectName("headerSubtitle")
+        self.header_subtitle.setStyleSheet("color: #AAB2BD; font-size: 11px; font-weight: 500;")
+        layout.addWidget(self.header_subtitle)
+
+        layout.addStretch()
+
+        # Active Scope Pill
+        self.header_scope_pill = QLabel("◈ Scope: Unassigned")
+        self.header_scope_pill.setObjectName("headerScopePill")
+        self.header_scope_pill.setStyleSheet(
+            "background-color: #1C222C; color: #E53935; border: 1px solid #303743; "
+            "border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 600;"
+        )
+        layout.addWidget(self.header_scope_pill)
+
+        # Quick Actions: About button
+        self.btn_header_about = QPushButton("ℹ️  About")
+        self.btn_header_about.setObjectName("btnHeaderAbout")
+        self.btn_header_about.setCursor(Qt.PointingHandCursor)
+        self.btn_header_about.setStyleSheet(
+            "QPushButton { background: transparent; color: #AAB2BD; border: 1px solid #303743; "
+            "border-radius: 4px; padding: 3px 10px; font-size: 11px; font-weight: 500; } "
+            "QPushButton:hover { background: #1C222C; color: #F5F5F5; border-color: #E53935; }"
+        )
+        self.btn_header_about.clicked.connect(self.show_about_dialog)
+        layout.addWidget(self.btn_header_about)
+
+        # Quick Actions: Theme toggle button
+        self.btn_header_theme = QPushButton("☀" if self.theme_manager.is_dark else "🌙")
+        self.btn_header_theme.setObjectName("btnHeaderTheme")
+        self.btn_header_theme.setToolTip("Toggle Theme (Dark / Light)")
+        self.btn_header_theme.setCursor(Qt.PointingHandCursor)
+        self.btn_header_theme.setStyleSheet(
+            "QPushButton { background: transparent; color: #AAB2BD; border: 1px solid #303743; "
+            "border-radius: 4px; padding: 3px 8px; font-size: 11px; } "
+            "QPushButton:hover { background: #1C222C; color: #F5F5F5; border-color: #E53935; }"
+        )
+        self.btn_header_theme.clicked.connect(self._toggle_theme)
+        layout.addWidget(self.btn_header_theme)
+
+        # Quick Actions: AI toggle button
+        self.btn_header_ai = QPushButton("🤖 AI")
+        self.btn_header_ai.setObjectName("btnHeaderAI")
+        self.btn_header_ai.setToolTip("Toggle AI Assistant Panel (Ctrl+L / Ctrl+I)")
+        self.btn_header_ai.setCursor(Qt.PointingHandCursor)
+        self.btn_header_ai.setStyleSheet(
+            "QPushButton { background: #1C222C; color: #F5F5F5; border: 1px solid #303743; "
+            "border-radius: 4px; padding: 3px 10px; font-size: 11px; font-weight: 600; } "
+            "QPushButton:hover { background: #E53935; color: #FFFFFF; border-color: #E53935; }"
+        )
+        self.btn_header_ai.clicked.connect(lambda: self._toggle_ai_panel())
+        layout.addWidget(self.btn_header_ai)
+
+        return header
+
+    def show_about_dialog(self):
+        """Displays the official PentestX About dialog."""
+        from desktop.dialogs.about_dialog import AboutDialog
+        dialog = AboutDialog(self)
+        dialog.exec()
 
     def _toggle_terminal_visibility(self):
         """Toggles the persistent bottom terminal panel visible or hidden (VS Code Ctrl+` behavior)."""
@@ -975,6 +1089,8 @@ class MainWindow(QMainWindow):
                 self.terminal_widget.set_active_project(None, self.db)
             if hasattr(self, "sidebar_nav"):
                 self.sidebar_nav.set_active_project("None", "Unassigned")
+            if hasattr(self, "header_scope_pill"):
+                self.header_scope_pill.setText("◈ Scope: Unassigned")
             if hasattr(self, "view_stack"):
                 self._on_workspace_view_changed(self.view_stack.currentIndex())
             return
@@ -984,6 +1100,10 @@ class MainWindow(QMainWindow):
             scopes = self.db.list_scopes(project.id) if (project and self.db) else []
             scope_str = f"{len(scopes)} Boundary Rules" if scopes else "Unassigned"
             self.sidebar_nav.set_active_project(project.name, scope_str)
+        if hasattr(self, "header_scope_pill"):
+            scopes = self.db.list_scopes(project.id) if (project and self.db) else []
+            scope_str = f"{len(scopes)} Rules" if scopes else "Unassigned"
+            self.header_scope_pill.setText(f"◈ {project.name} ({scope_str})")
         if hasattr(self, "status_project_label"):
             self.status_project_label.setText(f"Project: {project.name} (Client: {project.client_name or 'N/A'})")
         if hasattr(self, "network_view"):
@@ -1144,6 +1264,8 @@ class MainWindow(QMainWindow):
     def _on_theme_changed(self, mode: str):
         """Slot invoked when theme changes dynamically at runtime."""
         self._update_theme_toggle_ui()
+        if hasattr(self, "btn_header_theme"):
+            self.btn_header_theme.setText("☀" if self.theme_manager.is_dark else "🌙")
         self.theme_manager.apply_theme(self)
         if hasattr(self, "content_splitter"):
             self.content_splitter.update()

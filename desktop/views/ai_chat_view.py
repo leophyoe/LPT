@@ -2,7 +2,7 @@
 
 Provides an interactive multi-turn chatbot interface with prompt templates,
 code block extractors, offline CPENT heuristic knowledge, and live terminal integration.
-Redesigned for Phase 1 with a modern, compact, ChatGPT/Copilot-style interface.
+Updated for Phase 5.1.1 with non-blocking cooperative cancellation and clean empty chat UI.
 """
 
 from __future__ import annotations
@@ -77,8 +77,8 @@ class ChatInputTextEdit(QTextEdit):
 class AIChatWorker(QThread):
     """Background worker executing chat query to prevent GUI freeze."""
 
-    response_ready = Signal(str, str)  # reply_text, provider_used
-    error_occurred = Signal(str)
+    response_ready = Signal(str, str, int)  # reply_text, provider_used, generation_id
+    error_occurred = Signal(str, int)       # error_message, generation_id
 
     def __init__(
         self,
@@ -86,31 +86,40 @@ class AIChatWorker(QThread):
         messages: List[Dict[str, str]],
         project_context: Optional[str] = None,
         user_consented: bool = True,
+        generation_id: int = 0,
     ):
         super().__init__()
         self.engine = engine
         self.messages = messages
         self.project_context = project_context
         self.user_consented = user_consented
+        self.generation_id = generation_id
         self._is_cancelled = False
 
     def cancel(self):
+        """Sets cooperative cancellation flag."""
         self._is_cancelled = True
 
+    @property
+    def is_cancelled(self) -> bool:
+        return self._is_cancelled
+
     def run(self):
+        # Check cancellation before query execution
+        if self._is_cancelled:
+            return
         try:
-            if self._is_cancelled:
-                return
             reply, prov = self.engine.chat(
                 self.messages,
                 project_context=self.project_context,
                 user_consented=self.user_consented,
             )
+            # Check cancellation flag again after network response finishes
             if not self._is_cancelled:
-                self.response_ready.emit(reply, prov)
+                self.response_ready.emit(reply, prov, self.generation_id)
         except Exception as e:
             if not self._is_cancelled:
-                self.error_occurred.emit(str(e))
+                self.error_occurred.emit(str(e), self.generation_id)
 
 
 class AIChatView(QWidget):
@@ -135,8 +144,15 @@ class AIChatView(QWidget):
         self.messages: List[Dict[str, str]] = []
         self.chat_history: List[Dict[str, str]] = []
         self._worker: Optional[AIChatWorker] = None
+        self._active_workers: List[AIChatWorker] = []
+        self._current_generation_id: int = 0
+        self._is_generating: bool = False
         self.extracted_commands: List[str] = []
         self._last_user_query: str = ""
+
+        self._copy_timer = QTimer(self)
+        self._copy_timer.setSingleShot(True)
+        self._copy_timer.timeout.connect(self._clear_copied_status)
 
         ThemeManager.instance().theme_changed.connect(self.update_theme)
 
@@ -395,30 +411,11 @@ class AIChatView(QWidget):
         self.input_edit.setTextCursor(cursor)
 
     def _show_empty_state(self):
-        """Renders a clean, compact placeholder when no conversation is active."""
-        is_light = ThemeManager.instance().is_light
-        text_color = "#475569" if is_light else "#94A3B8"
-        heading_color = "#0F172A" if is_light else "#F8FAFC"
-        sub_color = "#64748B" if is_light else "#64748B"
-        border_color = "#E2E8F0" if is_light else "#1E293B"
-        card_bg = "#F8FAFC" if is_light else "#0F172A"
-
-        html_content = (
-            f"<div style='text-align: center; margin: 30px 10px; padding: 24px; "
-            f"border: 1px dashed {border_color}; border-radius: 8px; background-color: {card_bg};'>"
-            f"<div style='font-size: 26px; margin-bottom: 6px;'>🤖</div>"
-            f"<div style='font-size: 14px; font-weight: bold; color: {heading_color}; margin-bottom: 6px;'>"
-            f"CyberSecuritySuite AI Assistant</div>"
-            f"<div style='font-size: 12px; color: {sub_color}; max-width: 340px; margin: 0 auto; line-height: 1.5;'>"
-            f"Ready to assist with penetration testing, scan analysis, tool guidance, and CPENT methodologies.<br>"
-            f"<span style='font-size: 11px; color: {text_color};'>Type a question or click <b>⚡ Quick Actions</b> below.</span>"
-            f"</div>"
-            f"</div>"
-        )
-        self.chat_display.setHtml(html_content)
+        """Resets the chat display to a clean, empty conversation area without any text or banners."""
+        self.chat_display.clear()
 
     def _add_welcome_message(self):
-        """Backward-compatible entry point that resets display to clean empty state."""
+        """Backward-compatible entry point that resets display to a clean, empty state."""
         self._show_empty_state()
 
     def _send_quick_prompt(self, prompt: str):
@@ -428,7 +425,7 @@ class AIChatView(QWidget):
 
     @Slot()
     def new_chat(self):
-        """Starts a fresh conversation, clearing memory and history."""
+        """Starts a fresh conversation, clearing memory and history to a completely clean state."""
         self.chat_history.clear()
         self.messages.clear()
         self.chat_display.clear()
@@ -438,28 +435,58 @@ class AIChatView(QWidget):
 
     @Slot()
     def clear_chat(self):
-        """Clears conversation transcript."""
+        """Clears conversation transcript completely."""
         self.new_chat()
 
     def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait()
+        """Cleanly cancels any active background workers during view destruction."""
+        for worker in list(self._active_workers):
+            if worker.isRunning():
+                worker.cancel()
+                try:
+                    worker.response_ready.disconnect()
+                except Exception:
+                    pass
+                try:
+                    worker.error_occurred.disconnect()
+                except Exception:
+                    pass
+                worker.wait(150)
+        self._active_workers.clear()
         super().closeEvent(event)
 
     @Slot()
     def _stop_generation(self):
-        """Immediately stops the running AI query worker safely."""
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait()
+        """Immediately stops the active AI generation without blocking the GUI thread."""
+        if not self._is_generating and not (self._worker and self._worker.isRunning()):
+            return
 
+        self._is_generating = False
+
+        if self._worker:
+            self._worker.cancel()
+            try:
+                self._worker.response_ready.disconnect(self._on_response_ready)
+            except Exception:
+                pass
+            try:
+                self._worker.error_occurred.disconnect(self._on_worker_error)
+            except Exception:
+                pass
+            # Invalidate generation ID so any late response from this worker is ignored
+            self._current_generation_id += 1
+            self._worker = None
+
+        # Immediately restore UI controls without waiting for network request
         self.btn_send.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.input_edit.setEnabled(True)
         self.lbl_loading.setText("Generation stopped by operator.")
         self.input_edit.setFocus()
-        self._append_message("assistant", "*[Generation stopped by operator]*", "stopped")
+
+        # Prevent duplicate cancellation messages in conversation history
+        if not self.chat_history or self.chat_history[-1].get("provider") != "stopped":
+            self._append_message("assistant", "*[Generation stopped by operator]*", "stopped")
 
     def retry_last(self):
         """Retries the last user query if available."""
@@ -467,14 +494,71 @@ class AIChatView(QWidget):
             self.input_edit.setText(self._last_user_query)
             self._on_send_clicked()
 
+    def _build_project_context(self) -> Optional[str]:
+        """Constructs evidence-grounded project context summary."""
+        if not hasattr(self, "cb_safe_context") or not self.cb_safe_context.isChecked():
+            return None
+
+        ctx_items = []
+        if self.active_project:
+            pid = self.active_project.id
+            status_str = getattr(self.active_project.status, "value", str(self.active_project.status))
+            ctx_items.append(f"Engagement: {self.active_project.name} (Client: {self.active_project.client_name or 'N/A'}, Status: {status_str})")
+            if self.db and pid:
+                try:
+                    scopes = self.db.list_scopes(pid)
+                    if scopes:
+                        allowed_targets = [s.target for s in scopes if s.is_authorized]
+                        excluded_targets = [s.target for s in scopes if s.rule_type == ScopeRuleType.EXCLUDED]
+                        ctx_items.append(f"Authorized Scopes ({len(allowed_targets)}): {', '.join(allowed_targets[:6])}")
+                        if excluded_targets:
+                            ctx_items.append(f"Strict Exclusions ({len(excluded_targets)}): {', '.join(excluded_targets[:4])}")
+
+                    nodes = self.db.list_asset_nodes(pid)
+                    ip_nodes = [n for n in nodes if n.node_type == "ip"]
+                    if ip_nodes:
+                        asset_summaries = []
+                        for n in ip_nodes[:8]:
+                            meta = {}
+                            try:
+                                meta = json.loads(n.metadata_json) if n.metadata_json else {}
+                            except Exception:
+                                meta = {}
+                            open_ports = meta.get("open_ports", [])
+                            port_str = f"ports: {open_ports}" if open_ports else "0 open ports"
+                            hn = f" ({n.label})" if (n.label and n.label != n.value) else ""
+                            asset_summaries.append(f"{n.value}{hn} [{port_str}, via {n.source_tool}]")
+                        ctx_items.append(f"Discovered Assets ({len(ip_nodes)} total): " + "; ".join(asset_summaries))
+
+                    findings = self.db.list_findings(pid)
+                    if findings:
+                        crit = sum(1 for f in findings if f.severity == FindingSeverity.CRITICAL)
+                        high = sum(1 for f in findings if f.severity == FindingSeverity.HIGH)
+                        med = sum(1 for f in findings if f.severity == FindingSeverity.MEDIUM)
+                        low = sum(1 for f in findings if f.severity in (FindingSeverity.LOW, FindingSeverity.INFORMATIONAL))
+                        top_findings = [f"[{f.severity.value.upper()}] {f.title} on {f.affected_asset} ({f.validation_status.value})" for f in findings[:5]]
+                        ctx_items.append(f"Findings: {len(findings)} total (Critical: {crit}, High: {high}, Medium: {med}, Low: {low}). Top: " + "; ".join(top_findings))
+
+                    ev_list = self.db.list_evidence(pid)
+                    ctx_items.append(f"Evidence Artifacts: {len(ev_list)} cryptographic logs/captures verified")
+                except Exception:
+                    pass
+        ctx_items.append(f"Active Workspace: {self.current_workspace}")
+        return " | ".join(ctx_items)
+
     @Slot()
     def _on_send_clicked(self):
         text = self.input_edit.toPlainText().strip() if hasattr(self.input_edit, "toPlainText") else self.input_edit.text().strip()
         if not text:
             return
 
+        # Prevent double-submission while already generating
+        if self._is_generating:
+            return
+
         self._last_user_query = text
         self.input_edit.clear()
+        self._is_generating = True
         self.btn_send.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.input_edit.setEnabled(False)
@@ -486,72 +570,52 @@ class AIChatView(QWidget):
         self.messages.append({"role": "user", "content": clean_user_text})
         self._append_message("user", clean_user_text)
 
-        # Prepare rich, evidence-grounded context string (if safe context sharing is checked)
-        ctx = None
-        if hasattr(self, "cb_safe_context") and self.cb_safe_context.isChecked():
-            ctx_items = []
-            if self.active_project:
-                pid = self.active_project.id
-                status_str = getattr(self.active_project.status, "value", str(self.active_project.status))
-                ctx_items.append(f"Engagement: {self.active_project.name} (Client: {self.active_project.client_name or 'N/A'}, Status: {status_str})")
-                if self.db and pid:
-                    try:
-                        scopes = self.db.list_scopes(pid)
-                        if scopes:
-                            allowed_targets = [s.target for s in scopes if s.is_authorized]
-                            excluded_targets = [s.target for s in scopes if s.rule_type == ScopeRuleType.EXCLUDED]
-                            ctx_items.append(f"Authorized Scopes ({len(allowed_targets)}): {', '.join(allowed_targets[:6])}")
-                            if excluded_targets:
-                                ctx_items.append(f"Strict Exclusions ({len(excluded_targets)}): {', '.join(excluded_targets[:4])}")
+        # Prepare rich context
+        ctx = self._build_project_context()
 
-                        # Include Authoritative Asset Inventory
-                        nodes = self.db.list_asset_nodes(pid)
-                        ip_nodes = [n for n in nodes if n.node_type == "ip"]
-                        if ip_nodes:
-                            asset_summaries = []
-                            for n in ip_nodes[:8]:
-                                meta = {}
-                                try:
-                                    meta = json.loads(n.metadata_json) if n.metadata_json else {}
-                                except Exception:
-                                    meta = {}
-                                open_ports = meta.get("open_ports", [])
-                                port_str = f"ports: {open_ports}" if open_ports else "0 open ports"
-                                hn = f" ({n.label})" if (n.label and n.label != n.value) else ""
-                                asset_summaries.append(f"{n.value}{hn} [{port_str}, via {n.source_tool}]")
-                            ctx_items.append(f"Discovered Assets ({len(ip_nodes)} total): " + "; ".join(asset_summaries))
+        # Increment generation ID for tracking
+        self._current_generation_id += 1
+        gen_id = self._current_generation_id
 
-                        # Include Findings Summary
-                        findings = self.db.list_findings(pid)
-                        if findings:
-                            crit = sum(1 for f in findings if f.severity == FindingSeverity.CRITICAL)
-                            high = sum(1 for f in findings if f.severity == FindingSeverity.HIGH)
-                            med = sum(1 for f in findings if f.severity == FindingSeverity.MEDIUM)
-                            low = sum(1 for f in findings if f.severity in (FindingSeverity.LOW, FindingSeverity.INFORMATIONAL))
-                            top_findings = [f"[{f.severity.value.upper()}] {f.title} on {f.affected_asset} ({f.validation_status.value})" for f in findings[:5]]
-                            ctx_items.append(f"Findings: {len(findings)} total (Critical: {crit}, High: {high}, Medium: {med}, Low: {low}). Top: " + "; ".join(top_findings))
-
-                        # Evidence Count
-                        ev_list = self.db.list_evidence(pid)
-                        ctx_items.append(f"Evidence Artifacts: {len(ev_list)} cryptographic logs/captures verified")
-                    except Exception:
-                        pass
-            ctx_items.append(f"Active Workspace: {self.current_workspace}")
-            ctx = " | ".join(ctx_items)
-
-        # Run in worker thread
-        self._worker = AIChatWorker(
+        # Run in worker thread with safe lifecycle management
+        worker = AIChatWorker(
             engine=self.engine,
-            messages=self.messages,
+            messages=list(self.messages),
             project_context=ctx,
             user_consented=False,
+            generation_id=gen_id,
         )
-        self._worker.response_ready.connect(self._on_response_ready)
-        self._worker.error_occurred.connect(self._on_worker_error)
-        self._worker.start()
+        self._worker = worker
+        self._active_workers.append(worker)
 
+        worker.response_ready.connect(self._on_response_ready)
+        worker.error_occurred.connect(self._on_worker_error)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.start()
+
+    def _on_worker_finished(self, worker: AIChatWorker):
+        """Safe signal-driven cleanup for finished background workers."""
+        if worker in self._active_workers:
+            self._active_workers.remove(worker)
+        if self._worker is worker:
+            self._worker = None
+            if not worker.is_cancelled:
+                self._is_generating = False
+                self.btn_send.setEnabled(True)
+                self.btn_stop.setEnabled(False)
+                self.input_edit.setEnabled(True)
+        worker.deleteLater()
+
+    @Slot(str, str, int)
     @Slot(str, str)
-    def _on_response_ready(self, reply: str, provider_used: str):
+    def _on_response_ready(self, reply: str, provider_used: str, generation_id: int = 0):
+        # Ignore response if generation was cancelled or overtaken by a newer generation
+        if generation_id != 0 and generation_id != self._current_generation_id:
+            return
+        if not self._is_generating and generation_id != 0:
+            return
+
+        self._is_generating = False
         self.btn_send.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.input_edit.setEnabled(True)
@@ -566,15 +630,27 @@ class AIChatView(QWidget):
         commands = self.extract_shell_commands(clean_reply)
         self._update_commands_shelf(commands)
 
+    @Slot(str, int)
     @Slot(str)
-    def _on_worker_error(self, err_msg: str):
+    def _on_worker_error(self, err_msg: str, generation_id: int = 0):
+        # Ignore error if generation was cancelled or overtaken by a newer generation
+        if generation_id != 0 and generation_id != self._current_generation_id:
+            return
+        if not self._is_generating and generation_id != 0:
+            return
+
+        self._is_generating = False
         self.btn_send.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.input_edit.setEnabled(True)
         self.lbl_loading.setText("")
         self.input_edit.setFocus()
         clean_err = sanitize_text(err_msg)
-        self._append_message("assistant", f"⚠️ **Error executing query**: {clean_err}\n\n[ 🔄 Retry Query ](retry:last)", "error")
+        self._append_message(
+            "assistant",
+            f"⚠️ **Error executing query**: {clean_err}\n\n[ 🔄 Retry Query ](retry:last)",
+            "error",
+        )
 
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """Extract fenced markdown code blocks with language and content."""
@@ -658,6 +734,13 @@ class AIChatView(QWidget):
         ok_col = "#15803D" if is_light else "#4ade80"
         self.lbl_context.setStyleSheet(f"color: {ok_col}; font-size: 11px; font-weight: 500;")
 
+    def _clear_copied_status(self):
+        try:
+            if hasattr(self, "lbl_loading") and self.lbl_loading.text() == "✓ Copied to clipboard":
+                self.lbl_loading.setText("")
+        except Exception:
+            pass
+
     @Slot(QUrl)
     def _on_anchor_clicked(self, url: QUrl):
         """Handles link clicks in the chat transcript: copy:, retry:, shell:, and web links."""
@@ -669,12 +752,7 @@ class AIChatView(QWidget):
             if text_to_copy:
                 QApplication.clipboard().setText(text_to_copy)
                 self.lbl_loading.setText("✓ Copied to clipboard")
-                QTimer.singleShot(
-                    2500,
-                    lambda: self.lbl_loading.setText("")
-                    if self.lbl_loading.text() == "✓ Copied to clipboard"
-                    else None,
-                )
+                self._copy_timer.start(2500)
         elif scheme == "retry":
             self.retry_last()
         elif scheme == "shell":
@@ -690,7 +768,6 @@ class AIChatView(QWidget):
 
     def _markdown_to_html(self, content: str, is_light: bool = False) -> str:
         """Converts markdown content into theme-aware HTML with copyable code blocks."""
-        # 1. Preprocess fenced code blocks into placeholders
         blocks: List[tuple[str, str]] = []
 
         def repl_code(m):
@@ -703,7 +780,6 @@ class AIChatView(QWidget):
         code_pattern = re.compile(r"```([a-zA-Z0-9_\-+]*)\s*\n(.*?)\n```", re.DOTALL)
         preprocessed = code_pattern.sub(repl_code, content)
 
-        # 2. Render markdown using QTextDocument
         doc = QTextDocument()
         doc.setMarkdown(preprocessed)
         raw_html = doc.toHtml()
@@ -735,7 +811,7 @@ class AIChatView(QWidget):
         inner_html = inner_html.replace("<span style=\"", f"<span style=\"color: {text_color}; ")
         inner_html = inner_html.replace("<span>", f"<span style=\"color: {text_color};\">")
 
-        # 3. Replace placeholders with rich code cards (with [ 📋 Copy Code ] action)
+        # Replace placeholders with rich code cards
         for idx, (lang, code) in enumerate(blocks):
             esc_code = html.escape(code)
             quoted_code = quote(code)
@@ -748,11 +824,9 @@ class AIChatView(QWidget):
                 f"<pre style='margin: 0; padding: 8px 10px; color: {code_fg}; font-family: monospace; font-size: 12px;'>{esc_code}</pre>"
                 f"</div>"
             )
-            # Match both plain and paragraph-wrapped placeholder
             inner_html = inner_html.replace(f"<p>@@@CODE_BLOCK_{idx}@@@</p>", code_card)
             inner_html = inner_html.replace(f"@@@CODE_BLOCK_{idx}@@@", code_card)
 
-        # Style any residual <pre> blocks
         inner_html = inner_html.replace(
             "<pre style=\"",
             f"<pre style=\"background-color: {code_card_bg}; color: {code_fg}; border: 1px solid {code_border}; padding: 8px 10px; border-radius: 6px; font-family: monospace; "
@@ -765,10 +839,6 @@ class AIChatView(QWidget):
         return f"<div style=\"color: {text_color}; font-size: 13px; line-height: 1.5;\">{inner_html}</div>"
 
     def _render_message(self, role: str, content: str, provider_used: str = "", timestamp: str = ""):
-        # If this is the first message being rendered, clear the empty state
-        if len(self.chat_history) <= 1:
-            self.chat_display.clear()
-
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.chat_display.setTextCursor(cursor)
