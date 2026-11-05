@@ -293,7 +293,7 @@ class DashboardView(QWidget):
 
         # Wire clicks to real navigation destinations
         self.card_threat.clicked.connect(lambda: self.navigate_requested.emit(4))
-        self.metric_assets.clicked.connect(lambda: self.navigate_requested.emit(1))
+        self.metric_assets.clicked.connect(lambda: self.navigate_requested.emit(9))
         self.metric_findings.clicked.connect(lambda: self.navigate_requested.emit(4))
         self.card_arsenal.clicked.connect(lambda: self.navigate_requested.emit(5))
         self.card_remediation.clicked.connect(lambda: self.navigate_requested.emit(4))
