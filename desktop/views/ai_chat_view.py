@@ -2,10 +2,12 @@
 
 Provides an interactive multi-turn chatbot interface with prompt templates,
 code block extractors, offline CPENT heuristic knowledge, and live terminal integration.
+Redesigned for Phase 1 with a modern, compact, ChatGPT/Copilot-style interface.
 """
 
 from __future__ import annotations
 
+import datetime
 import html
 import json
 import os
@@ -13,8 +15,8 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QFont, QTextCursor, QTextDocument
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -89,17 +92,25 @@ class AIChatWorker(QThread):
         self.messages = messages
         self.project_context = project_context
         self.user_consented = user_consented
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         try:
+            if self._is_cancelled:
+                return
             reply, prov = self.engine.chat(
                 self.messages,
                 project_context=self.project_context,
                 user_consented=self.user_consented,
             )
-            self.response_ready.emit(reply, prov)
+            if not self._is_cancelled:
+                self.response_ready.emit(reply, prov)
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            if not self._is_cancelled:
+                self.error_occurred.emit(str(e))
 
 
 class AIChatView(QWidget):
@@ -125,11 +136,12 @@ class AIChatView(QWidget):
         self.chat_history: List[Dict[str, str]] = []
         self._worker: Optional[AIChatWorker] = None
         self.extracted_commands: List[str] = []
+        self._last_user_query: str = ""
 
         ThemeManager.instance().theme_changed.connect(self.update_theme)
 
         self._init_ui()
-        self._add_welcome_message()
+        self._show_empty_state()
 
     def set_active_project(self, project: Optional[Project]):
         self.active_project = project
@@ -169,33 +181,37 @@ class AIChatView(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
-        # 1. Header Toolbar (VS Code Side Panel Header Style)
+        # 1. Compact Header (ChatGPT / Copilot Style)
         header_widget = QWidget()
         header_layout = QVBoxLayout(header_widget)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(4)
 
-        # Row 1: Title, Subtitle, and Panel Controls
+        # Row 1: Title, Mode Indicator Badge, Stretch, and Panel Actions
         top_row = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title_box.setSpacing(1)
+        top_row.setSpacing(6)
+
         self.lbl_title = QLabel("🤖 AI Assistant")
         self.lbl_title.setObjectName("viewHeader")
-        self.lbl_sub = QLabel("Chat · Context-aware")
-        self.lbl_sub.setObjectName("viewSubtitle")
-        title_box.addWidget(self.lbl_title)
-        title_box.addWidget(self.lbl_sub)
-        top_row.addLayout(title_box)
+        self.lbl_title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        top_row.addWidget(self.lbl_title)
+
+        self.lbl_mode = QLabel("[ 🔒 Offline Mode ]")
+        self.lbl_mode.setStyleSheet(
+            "font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; "
+            "background: rgba(74, 222, 128, 0.15); color: #4ade80;"
+        )
+        top_row.addWidget(self.lbl_mode)
         top_row.addStretch()
 
-        self.btn_settings = QPushButton("⚙️")
-        self.btn_settings.setFixedSize(26, 26)
-        self.btn_settings.setToolTip("Configure AI Provider & API Keys")
-        self.btn_settings.setStyleSheet("QPushButton { font-size: 12px; padding: 0; }")
-        self.btn_settings.clicked.connect(self._open_settings)
-        top_row.addWidget(self.btn_settings)
+        self.btn_new_chat = QPushButton("➕")
+        self.btn_new_chat.setFixedSize(26, 26)
+        self.btn_new_chat.setToolTip("Start New Conversation")
+        self.btn_new_chat.setStyleSheet("QPushButton { font-size: 12px; padding: 0; }")
+        self.btn_new_chat.clicked.connect(self.new_chat)
+        top_row.addWidget(self.btn_new_chat)
 
         self.btn_clear = QPushButton("🗑️")
         self.btn_clear.setFixedSize(26, 26)
@@ -203,6 +219,13 @@ class AIChatView(QWidget):
         self.btn_clear.setStyleSheet("QPushButton { font-size: 12px; padding: 0; }")
         self.btn_clear.clicked.connect(self.clear_chat)
         top_row.addWidget(self.btn_clear)
+
+        self.btn_settings = QPushButton("⚙️")
+        self.btn_settings.setFixedSize(26, 26)
+        self.btn_settings.setToolTip("Configure AI Provider & API Keys")
+        self.btn_settings.setStyleSheet("QPushButton { font-size: 12px; padding: 0; }")
+        self.btn_settings.clicked.connect(self._open_settings)
+        top_row.addWidget(self.btn_settings)
 
         self.btn_collapse = QPushButton("◨")
         self.btn_collapse.setFixedSize(26, 26)
@@ -213,8 +236,9 @@ class AIChatView(QWidget):
 
         header_layout.addLayout(top_row)
 
-        # Row 2: Engine Selector & Status
+        # Row 2: Provider Selector & Real Connection Status Indicator
         engine_row = QHBoxLayout()
+        engine_row.setSpacing(6)
         self.provider_combo = QComboBox()
         self.provider_combo.addItems([
             "Built-in Security Engine (100% Offline)",
@@ -232,64 +256,17 @@ class AIChatView(QWidget):
         engine_row.addWidget(self.lbl_key_status)
         header_layout.addLayout(engine_row)
 
-        # Row 3: Active Context & Safe Context Checkbox
+        # Row 3: Active Context Label
         ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(6)
         self.lbl_context = QLabel("Project: None | 📌 Projects")
         self._update_context_label()
         ctx_row.addWidget(self.lbl_context, 1)
-
-        self.cb_safe_context = QCheckBox("Share context")
-        self.cb_safe_context.setChecked(True)
-        self.cb_safe_context.setToolTip("Shares sanitized project & workspace summary with AI without sensitive credentials")
-        ctx_row.addWidget(self.cb_safe_context)
         header_layout.addLayout(ctx_row)
 
         layout.addWidget(header_widget)
 
-        # 2. Quick Prompt Template Chips
-        quick_chips_box = QFrame()
-        quick_chips_box.setObjectName("dashboardPanel")
-        chips_layout = QHBoxLayout(quick_chips_box)
-        chips_layout.setContentsMargins(6, 4, 6, 4)
-        chips_layout.setSpacing(6)
-
-        lbl_quick = QLabel("⚡ Quick Prompts:")
-        lbl_quick.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {CPENTTheme.PRIMARY_BLUE};")
-        chips_layout.addWidget(lbl_quick)
-
-        chips = [
-            ("🌐 ZAP & Burp Proxy Guide", "How do I configure and launch OWASP ZAP and Burp Suite proxy in this suite?"),
-            ("🧰 OWASP PTK Workbench", "How do I use OWASP PTK (Penetration Testing Kit) R-Builder, JWT Security Lab, and Encoders in this app?"),
-            ("⚡ Sn1per Pipelines", "Explain the Sn1per multi-stage scan pipelines (Recon, Stealth, Discovery, Web, Airstrike)."),
-            ("🛡️ Strix AI Triage", "How does Strix AI triage vulnerability findings, calculate CVSS, and generate remediation code?"),
-            ("🧰 Scanners-Box Arsenal", "Show me the Scanners-Box curated arsenal across 12 penetration testing domains."),
-            ("🎯 AI Tool Router", "Can you plan an assessment tool workflow for my target?"),
-            ("🛠️ Where are all tools?", "Where can I find and use all the other security tools like Nmap, SQLMap, Hydra, and Volatility?"),
-            ("📡 Nmap Stealth Scan", "Give me recommended Nmap stealth scan commands with service and version detection."),
-            ("💥 SQLMap Tamper Scripts", "What are the best SQLMap tamper scripts to bypass Web Application Firewalls?"),
-            ("🔀 CPENT Pivoting & Chisel", "How do I perform multi-hop pivoting and port forwarding for CPENT using Chisel and SSH?"),
-            ("🇲🇲 မြန်မာလို လမ်းညွှန်ချက်", "CyberSecuritySuite မှာပါတဲ့ tools တွေနဲ့ ZAP, Burp Suite, PTK, Nmap အသုံးပြုပုံကို မြန်မာလို အကျဉ်းချုပ် ရှင်းပြပေးပါ။"),
-        ]
-
-        for label, prompt_text in chips:
-            btn = QPushButton(label)
-            btn.setProperty("class", "quick-chip")
-            btn.setFixedHeight(28)
-            btn.clicked.connect(lambda checked=False, p=prompt_text: self._send_quick_prompt(p))
-            chips_layout.addWidget(btn)
-
-        chips_layout.addStretch()
-
-        chips_scroll = QScrollArea()
-        chips_scroll.setWidgetResizable(True)
-        chips_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        chips_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        chips_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        chips_scroll.setFixedHeight(48)
-        chips_scroll.setWidget(quick_chips_box)
-        layout.addWidget(chips_scroll)
-
-        # 3. Main Chat History Transcript
+        # 2. Main Chat History Transcript
         self.chat_display = QTextBrowser()
         self.chat_display.setObjectName("aiChatDisplay")
         self.chat_display.setOpenExternalLinks(False)
@@ -297,16 +274,16 @@ class AIChatView(QWidget):
         self.chat_display.setFont(QFont("sans-serif", 10))
         layout.addWidget(self.chat_display, 1)
 
-        # 3.5. Suggested Commands Action Shelf
+        # 2.5. Suggested Commands Action Shelf (Collapsible)
         self.commands_shelf = QFrame()
         self.commands_shelf.setObjectName("commandsShelf")
         self.commands_shelf.setVisible(False)
         self.commands_shelf_layout = QVBoxLayout(self.commands_shelf)
         self.commands_shelf_layout.setContentsMargins(6, 4, 6, 4)
-        self.commands_shelf_layout.setSpacing(6)
+        self.commands_shelf_layout.setSpacing(4)
 
         shelf_header = QHBoxLayout()
-        lbl_shelf_title = QLabel("⚡ Suggested Commands (Click to load into Command Console for review):")
+        lbl_shelf_title = QLabel("⚡ Suggested Commands (Click to load into Console for review):")
         lbl_shelf_title.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {CPENTTheme.AMBER_ACCENT};")
         shelf_header.addWidget(lbl_shelf_title)
         shelf_header.addStretch()
@@ -325,47 +302,170 @@ class AIChatView(QWidget):
 
         layout.addWidget(self.commands_shelf)
 
-        # 4. Input Row
+        # 3. Bottom Composer Area
         input_frame = QFrame()
         input_frame.setObjectName("dashboardPanel")
         input_layout = QVBoxLayout(input_frame)
         input_layout.setContentsMargins(6, 6, 6, 6)
-        input_layout.setSpacing(4)
+        input_layout.setSpacing(6)
 
         self.input_edit = ChatInputTextEdit()
         self.input_edit.setObjectName("aiChatInput")
         self.input_edit.return_pressed.connect(self._on_send_clicked)
         input_layout.addWidget(self.input_edit)
 
+        # Action Toolbar below multiline input
         bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(6)
+
+        # Quick Actions Dropdown Menu Button
+        self.btn_quick_menu = QPushButton("⚡ Quick Actions ▾")
+        self.btn_quick_menu.setFixedHeight(26)
+        self.btn_quick_menu.setStyleSheet("font-size: 11px;")
+        self.btn_quick_menu.setToolTip("Insert structured prompt template")
+        self._setup_quick_menu()
+        bottom_row.addWidget(self.btn_quick_menu)
+
+        self.cb_safe_context = QCheckBox("Share context")
+        self.cb_safe_context.setChecked(True)
+        self.cb_safe_context.setStyleSheet("font-size: 11px;")
+        self.cb_safe_context.setToolTip(
+            "Shares sanitized project & workspace summary with AI without sensitive credentials"
+        )
+        bottom_row.addWidget(self.cb_safe_context)
+
+        bottom_row.addStretch()
+
         self.lbl_loading = QLabel("")
         self.lbl_loading.setStyleSheet(f"color: {CPENTTheme.PRIMARY_BLUE}; font-size: 11px; font-style: italic;")
-        bottom_row.addWidget(self.lbl_loading, 1)
+        bottom_row.addWidget(self.lbl_loading)
+
+        self.btn_stop = QPushButton("⏹ Stop")
+        self.btn_stop.setFixedHeight(26)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip("Stop active AI generation")
+        self.btn_stop.clicked.connect(self._stop_generation)
+        bottom_row.addWidget(self.btn_stop)
 
         self.btn_send = QPushButton("✈ Send")
         self.btn_send.setProperty("class", "action-primary")
-        self.btn_send.setFixedSize(76, 28)
+        self.btn_send.setFixedSize(70, 26)
         self.btn_send.clicked.connect(self._on_send_clicked)
         bottom_row.addWidget(self.btn_send)
 
         input_layout.addLayout(bottom_row)
         layout.addWidget(input_frame)
 
-    def _add_welcome_message(self):
-        welcome = (
-            "### 🤖 Welcome to CyberSecuritySuite AI Assistant!\n\n"
-            "I am your conversational penetration testing assistant and CPENT instructor. "
-            "I can help you formulate scan commands, explain vulnerabilities, guide tool usage "
-            "(**OWASP ZAP**, **Burp Suite**, **Nmap**, **SQLMap**, **Gobuster**, **Hydra**, **Volatility 3**), "
-            "and provide step-by-step pivoting and privilege escalation checklists.\n\n"
-            "🇲🇲 **မြန်မာဘာသာဖြင့် အပြည့်အစုံ မေးမြန်းနိုင်ပါသည်!**\n\n"
-            "*Click any of the Quick Prompts above or type your question below to start.*"
+    def _setup_quick_menu(self):
+        """Creates the compact quick-action template menu."""
+        self.quick_menu = QMenu(self)
+        actions = [
+            (
+                "🔍 Explain Vulnerability",
+                "Explain this vulnerability in detail, including CVSS score, root cause, and remediation steps:\n",
+            ),
+            (
+                "📊 Analyze Nmap Output",
+                "Analyze the following Nmap scan output and suggest next enumeration steps:\n",
+            ),
+            (
+                "💻 Explain Command",
+                "Explain what this penetration testing command does and its risk level:\n",
+            ),
+            (
+                "🎯 CPENT Learning",
+                "Explain the methodology and tools for CPENT pivoting and privilege escalation:\n",
+            ),
+            (
+                "📝 Generate Report Outline",
+                "Generate a professional penetration testing report executive summary for our findings:\n",
+            ),
+        ]
+        for title, prompt_tmpl in actions:
+            act = self.quick_menu.addAction(title)
+            act.triggered.connect(lambda checked=False, t=prompt_tmpl: self._insert_quick_action(t))
+        self.btn_quick_menu.setMenu(self.quick_menu)
+
+    def _insert_quick_action(self, template: str):
+        """Inserts quick-action prompt into composer and focuses editor."""
+        self.input_edit.setText(template)
+        self.input_edit.setFocus()
+        cursor = self.input_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.input_edit.setTextCursor(cursor)
+
+    def _show_empty_state(self):
+        """Renders a clean, compact placeholder when no conversation is active."""
+        is_light = ThemeManager.instance().is_light
+        text_color = "#475569" if is_light else "#94A3B8"
+        heading_color = "#0F172A" if is_light else "#F8FAFC"
+        sub_color = "#64748B" if is_light else "#64748B"
+        border_color = "#E2E8F0" if is_light else "#1E293B"
+        card_bg = "#F8FAFC" if is_light else "#0F172A"
+
+        html_content = (
+            f"<div style='text-align: center; margin: 30px 10px; padding: 24px; "
+            f"border: 1px dashed {border_color}; border-radius: 8px; background-color: {card_bg};'>"
+            f"<div style='font-size: 26px; margin-bottom: 6px;'>🤖</div>"
+            f"<div style='font-size: 14px; font-weight: bold; color: {heading_color}; margin-bottom: 6px;'>"
+            f"CyberSecuritySuite AI Assistant</div>"
+            f"<div style='font-size: 12px; color: {sub_color}; max-width: 340px; margin: 0 auto; line-height: 1.5;'>"
+            f"Ready to assist with penetration testing, scan analysis, tool guidance, and CPENT methodologies.<br>"
+            f"<span style='font-size: 11px; color: {text_color};'>Type a question or click <b>⚡ Quick Actions</b> below.</span>"
+            f"</div>"
+            f"</div>"
         )
-        self._append_message("assistant", welcome, "builtin_offline")
+        self.chat_display.setHtml(html_content)
+
+    def _add_welcome_message(self):
+        """Backward-compatible entry point that resets display to clean empty state."""
+        self._show_empty_state()
 
     def _send_quick_prompt(self, prompt: str):
+        """Populates composer and immediately dispatches query."""
         self.input_edit.setText(prompt)
         self._on_send_clicked()
+
+    @Slot()
+    def new_chat(self):
+        """Starts a fresh conversation, clearing memory and history."""
+        self.chat_history.clear()
+        self.messages.clear()
+        self.chat_display.clear()
+        self._update_commands_shelf([])
+        self._update_context_label()
+        self._show_empty_state()
+
+    @Slot()
+    def clear_chat(self):
+        """Clears conversation transcript."""
+        self.new_chat()
+
+    def closeEvent(self, event):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+        super().closeEvent(event)
+
+    @Slot()
+    def _stop_generation(self):
+        """Immediately stops the running AI query worker safely."""
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+
+        self.btn_send.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.input_edit.setEnabled(True)
+        self.lbl_loading.setText("Generation stopped by operator.")
+        self.input_edit.setFocus()
+        self._append_message("assistant", "*[Generation stopped by operator]*", "stopped")
+
+    def retry_last(self):
+        """Retries the last user query if available."""
+        if self._last_user_query:
+            self.input_edit.setText(self._last_user_query)
+            self._on_send_clicked()
 
     @Slot()
     def _on_send_clicked(self):
@@ -373,8 +473,10 @@ class AIChatView(QWidget):
         if not text:
             return
 
+        self._last_user_query = text
         self.input_edit.clear()
         self.btn_send.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.input_edit.setEnabled(False)
         self.lbl_loading.setText("⏳ AI Assistant is thinking...")
         self.commands_shelf.setVisible(False)
@@ -451,6 +553,7 @@ class AIChatView(QWidget):
     @Slot(str, str)
     def _on_response_ready(self, reply: str, provider_used: str):
         self.btn_send.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         self.input_edit.setEnabled(True)
         self.lbl_loading.setText("")
         self.input_edit.setFocus()
@@ -466,10 +569,12 @@ class AIChatView(QWidget):
     @Slot(str)
     def _on_worker_error(self, err_msg: str):
         self.btn_send.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         self.input_edit.setEnabled(True)
         self.lbl_loading.setText("")
         self.input_edit.setFocus()
-        self._append_message("assistant", f"⚠️ **Error executing query**: {sanitize_text(err_msg)}", "error")
+        clean_err = sanitize_text(err_msg)
+        self._append_message("assistant", f"⚠️ **Error executing query**: {clean_err}\n\n[ 🔄 Retry Query ](retry:last)", "error")
 
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """Extract fenced markdown code blocks with language and content."""
@@ -555,9 +660,24 @@ class AIChatView(QWidget):
 
     @Slot(QUrl)
     def _on_anchor_clicked(self, url: QUrl):
-        """Handles link clicks in the chat transcript, routing shell: links to the terminal."""
+        """Handles link clicks in the chat transcript: copy:, retry:, shell:, and web links."""
         scheme = url.scheme()
-        if scheme == "shell":
+        if scheme == "copy":
+            raw_spec = url.toString()
+            payload = raw_spec[5:] if raw_spec.startswith("copy:") else raw_spec
+            text_to_copy = unquote(payload).strip()
+            if text_to_copy:
+                QApplication.clipboard().setText(text_to_copy)
+                self.lbl_loading.setText("✓ Copied to clipboard")
+                QTimer.singleShot(
+                    2500,
+                    lambda: self.lbl_loading.setText("")
+                    if self.lbl_loading.text() == "✓ Copied to clipboard"
+                    else None,
+                )
+        elif scheme == "retry":
+            self.retry_last()
+        elif scheme == "shell":
             raw_spec = url.toString()
             cmd_part = raw_spec[6:] if raw_spec.startswith("shell:") else raw_spec
             if cmd_part.startswith("//"):
@@ -569,9 +689,23 @@ class AIChatView(QWidget):
             QDesktopServices.openUrl(url)
 
     def _markdown_to_html(self, content: str, is_light: bool = False) -> str:
-        """Converts markdown content into theme-aware, high-contrast HTML."""
+        """Converts markdown content into theme-aware HTML with copyable code blocks."""
+        # 1. Preprocess fenced code blocks into placeholders
+        blocks: List[tuple[str, str]] = []
+
+        def repl_code(m):
+            lang = m.group(1).strip() or "CODE"
+            code = m.group(2).strip()
+            idx = len(blocks)
+            blocks.append((lang, code))
+            return f"\n\n@@@CODE_BLOCK_{idx}@@@\n\n"
+
+        code_pattern = re.compile(r"```([a-zA-Z0-9_\-+]*)\s*\n(.*?)\n```", re.DOTALL)
+        preprocessed = code_pattern.sub(repl_code, content)
+
+        # 2. Render markdown using QTextDocument
         doc = QTextDocument()
-        doc.setMarkdown(content)
+        doc.setMarkdown(preprocessed)
         raw_html = doc.toHtml()
 
         body_start = raw_html.find("<body")
@@ -584,11 +718,13 @@ class AIChatView(QWidget):
 
         text_color = "#182230" if is_light else "#F8FAFC"
         heading_color = "#0F172A" if is_light else "#FFFFFF"
-        code_bg = "#F1F5F9" if is_light else "#1E293B"
+        code_card_bg = "#F1F5F9" if is_light else "#0F172A"
+        code_header_bg = "#E2E8F0" if is_light else "#1E293B"
         code_fg = "#0369A1" if is_light else "#38BDF8"
         code_border = "#CBD5E1" if is_light else "#334155"
+        accent_blue = "#1D4ED8" if is_light else "#60A5FA"
 
-        # Explicitly colorize paragraphs, headings, list items, and spans so Qt doesn't fallback to #000000
+        # Explicitly colorize paragraphs, headings, list items, and spans
         inner_html = inner_html.replace("<p style=\"", f"<p style=\"color: {text_color}; margin-top: 4px; margin-bottom: 4px; ")
         inner_html = inner_html.replace("<p>", f"<p style=\"color: {text_color}; margin-top: 4px; margin-bottom: 4px;\">")
         for h in ["h1", "h2", "h3", "h4", "h5", "h6"]:
@@ -599,79 +735,134 @@ class AIChatView(QWidget):
         inner_html = inner_html.replace("<span style=\"", f"<span style=\"color: {text_color}; ")
         inner_html = inner_html.replace("<span>", f"<span style=\"color: {text_color};\">")
 
+        # 3. Replace placeholders with rich code cards (with [ 📋 Copy Code ] action)
+        for idx, (lang, code) in enumerate(blocks):
+            esc_code = html.escape(code)
+            quoted_code = quote(code)
+            code_card = (
+                f"<div style='margin: 8px 0; border: 1px solid {code_border}; border-radius: 6px; background-color: {code_card_bg};'>"
+                f"<div style='padding: 4px 8px; background-color: {code_header_bg}; border-bottom: 1px solid {code_border}; font-size: 11px;'>"
+                f"<span style='font-weight: bold; color: {heading_color};'>{lang.upper()}</span> &nbsp;&nbsp; "
+                f"<a href='copy:{quoted_code}' style='color: {accent_blue}; text-decoration: none; font-weight: bold;'>[ 📋 Copy Code ]</a>"
+                f"</div>"
+                f"<pre style='margin: 0; padding: 8px 10px; color: {code_fg}; font-family: monospace; font-size: 12px;'>{esc_code}</pre>"
+                f"</div>"
+            )
+            # Match both plain and paragraph-wrapped placeholder
+            inner_html = inner_html.replace(f"<p>@@@CODE_BLOCK_{idx}@@@</p>", code_card)
+            inner_html = inner_html.replace(f"@@@CODE_BLOCK_{idx}@@@", code_card)
+
+        # Style any residual <pre> blocks
         inner_html = inner_html.replace(
             "<pre style=\"",
-            f"<pre style=\"background-color: {code_bg}; color: {code_fg}; border: 1px solid {code_border}; padding: 8px 12px; border-radius: 6px; font-family: monospace; "
+            f"<pre style=\"background-color: {code_card_bg}; color: {code_fg}; border: 1px solid {code_border}; padding: 8px 10px; border-radius: 6px; font-family: monospace; "
         )
         if "<pre>" in inner_html:
             inner_html = inner_html.replace(
                 "<pre>",
-                f"<pre style=\"background-color: {code_bg}; color: {code_fg}; border: 1px solid {code_border}; padding: 8px 12px; border-radius: 6px; font-family: monospace;\">"
+                f"<pre style=\"background-color: {code_card_bg}; color: {code_fg}; border: 1px solid {code_border}; padding: 8px 10px; border-radius: 6px; font-family: monospace;\">"
             )
         return f"<div style=\"color: {text_color}; font-size: 13px; line-height: 1.5;\">{inner_html}</div>"
 
-    def _render_message(self, role: str, content: str, provider_used: str = ""):
+    def _render_message(self, role: str, content: str, provider_used: str = "", timestamp: str = ""):
+        # If this is the first message being rendered, clear the empty state
+        if len(self.chat_history) <= 1:
+            self.chat_display.clear()
+
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.chat_display.setTextCursor(cursor)
 
         is_light = ThemeManager.instance().is_light
+        time_str = timestamp or datetime.datetime.now().strftime("%H:%M")
+
         if role == "user":
             escaped_user = html.escape(content).replace("\n", "<br>")
             bubble_bg = "#E2E8F0" if is_light else "#1E293B"
             bubble_fg = "#0F172A" if is_light else "#F8FAFC"
             bubble_border = "#CBD5E1" if is_light else "#334155"
+            ts_color = "#64748B" if is_light else "#94A3B8"
             user_html = (
-                f"<div style='margin: 12px 0; text-align: right;'>"
-                f"<div style='display: inline-block; background-color: {bubble_bg}; color: {bubble_fg}; padding: 8px 14px; border: 1px solid {bubble_border}; border-radius: 8px; max-width: 80%; text-align: left;'>"
-                f"<b>👤 You:</b><br>{escaped_user}"
+                f"<div style='margin: 10px 0; text-align: right;'>"
+                f"<div style='display: inline-block; background-color: {bubble_bg}; color: {bubble_fg}; "
+                f"padding: 8px 12px; border: 1px solid {bubble_border}; border-radius: 8px; max-width: 82%; text-align: left;'>"
+                f"<div style='font-size: 11px; margin-bottom: 4px; color: {ts_color};'><b>👤 You</b> · {time_str}</div>"
+                f"<div style='font-size: 13px; line-height: 1.4;'>{escaped_user}</div>"
                 f"</div></div>"
             )
             cursor.insertHtml(user_html)
         else:
             accent_blue = "#1D4ED8" if is_light else "#60A5FA"
             heading_color = "#0F172A" if is_light else "#FFFFFF"
-            prov_badge = f"<span style='color: {accent_blue}; font-size: 10px; font-weight: normal;'> [{provider_used}]</span>" if provider_used else ""
-            cursor.insertHtml(f"<div style='margin: 12px 0; color: {heading_color};'><b>🤖 AI Assistant</b>{prov_badge}:</div>")
+            ts_color = "#64748B" if is_light else "#94A3B8"
+            prov_badge = f"<span style='color: {accent_blue}; font-size: 10px; font-weight: 500;'> [{provider_used}]</span>" if provider_used else ""
+
+            header_html = (
+                f"<div style='margin-top: 10px; margin-bottom: 4px; color: {heading_color}; font-size: 12px;'>"
+                f"<b>🤖 AI Assistant</b>{prov_badge} <span style='color: {ts_color}; font-size: 10px;'>· {time_str}</span>"
+                f"</div>"
+            )
+            cursor.insertHtml(header_html)
 
             styled_html = self._markdown_to_html(content, is_light=is_light)
             cursor.insertHtml(styled_html)
 
+            # Footer actions: [ 📋 Copy Response ] + Shell Action Links
+            quoted_full = quote(content)
+            amber = "#B45309" if is_light else "#F59E0B"
+            footer_html = "<div style='margin-top: 6px; margin-bottom: 8px; font-size: 11px;'>"
+            footer_html += (
+                f"<a href='copy:{quoted_full}' style='color: {accent_blue}; text-decoration: none; margin-right: 14px; font-weight: bold;'>"
+                f"[ 📋 Copy Response ]</a>"
+            )
+
             cmds = self.extract_shell_commands(content)
             if cmds:
-                amber = "#B45309" if is_light else "#F59E0B"
-                actions_html = "<div style='margin-top: 6px; font-size: 11px;'>"
-                actions_html += f"<span style='color: {amber}; font-weight: bold;'>⚡ Shell Actions: </span>"
+                footer_html += f"<span style='color: {amber}; font-weight: bold;'>⚡ Shell Actions: </span>"
                 for cmd in cmds[:3]:
                     escaped_cmd = html.escape(cmd if len(cmd) <= 45 else cmd[:42] + "...")
                     quoted_cmd = quote(cmd)
-                    actions_html += (
-                        f"<a href='shell:{quoted_cmd}' style='color: {accent_blue}; text-decoration: none; margin-right: 12px;'>"
+                    footer_html += (
+                        f"<a href='shell:{quoted_cmd}' style='color: {accent_blue}; text-decoration: none; margin-right: 10px;'>"
                         f"<b>[ ↗ Load: <code>{escaped_cmd}</code> ]</b></a>"
                     )
-                actions_html += "</div>"
-                cursor.insertHtml(actions_html)
+            footer_html += "</div>"
+            cursor.insertHtml(footer_html)
 
             divider_color = "#CBD5E1" if is_light else "#334155"
-            cursor.insertHtml(f"<hr style='border: 0; border-top: 1px solid {divider_color}; margin: 12px 0;'>")
+            cursor.insertHtml(f"<hr style='border: 0; border-top: 1px solid {divider_color}; margin: 8px 0;'>")
 
         sb = self.chat_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def _append_message(self, role: str, content: str, provider_used: str = ""):
-        self.chat_history.append({"role": role, "content": content, "provider": provider_used})
-        self._render_message(role, content, provider_used)
+        timestamp = datetime.datetime.now().strftime("%H:%M")
+        self.chat_history.append({
+            "role": role,
+            "content": content,
+            "provider": provider_used,
+            "timestamp": timestamp,
+        })
+        self._render_message(role, content, provider_used, timestamp)
 
     def update_theme(self, mode: Optional[str] = None):
         """Re-renders existing chat history with updated theme colors and refreshes status badges."""
         self.chat_display.clear()
-        for msg in self.chat_history:
-            self._render_message(msg["role"], msg["content"], msg.get("provider", ""))
+        if not self.chat_history:
+            self._show_empty_state()
+        else:
+            for msg in self.chat_history:
+                self._render_message(
+                    msg["role"],
+                    msg["content"],
+                    msg.get("provider", ""),
+                    msg.get("timestamp", ""),
+                )
         self._update_context_label()
         self._update_key_status_label()
 
     def _update_key_status_label(self):
-        """Updates provider status label with accessible high-contrast colors."""
+        """Updates provider status label and mode indicator with accessible high-contrast colors."""
         if not hasattr(self, "lbl_key_status") or not hasattr(self, "provider_combo"):
             return
         idx = self.provider_combo.currentIndex()
@@ -683,9 +874,21 @@ class AIChatView(QWidget):
         if idx == 0:
             self.lbl_key_status.setText("● Offline Ready")
             self.lbl_key_status.setStyleSheet(f"color: {ok_color}; font-size: 11px; font-weight: bold;")
+            if hasattr(self, "lbl_mode"):
+                self.lbl_mode.setText("[ 🔒 Offline Mode ]")
+                self.lbl_mode.setStyleSheet(
+                    f"font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; "
+                    f"background: rgba(74, 222, 128, 0.15); color: {ok_color};"
+                )
         elif idx == 1:
             self.lbl_key_status.setText("● Local (No Key)")
             self.lbl_key_status.setStyleSheet(f"color: {info_color}; font-size: 11px; font-weight: bold;")
+            if hasattr(self, "lbl_mode"):
+                self.lbl_mode.setText("[ 🏠 Local Ollama ]")
+                self.lbl_mode.setStyleSheet(
+                    f"font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; "
+                    f"background: rgba(96, 165, 250, 0.15); color: {info_color};"
+                )
         else:
             provider_map = {
                 2: AIProvider.GEMINI_API,
@@ -704,15 +907,12 @@ class AIChatView(QWidget):
             else:
                 self.lbl_key_status.setText("○ Key Missing")
                 self.lbl_key_status.setStyleSheet(f"color: {warn_color}; font-size: 11px; font-weight: bold;")
-
-    @Slot()
-    def clear_chat(self):
-        self.chat_history.clear()
-        self.messages.clear()
-        self.chat_display.clear()
-        self._update_commands_shelf([])
-        self._update_context_label()
-        self._add_welcome_message()
+            if hasattr(self, "lbl_mode"):
+                self.lbl_mode.setText("[ ☁️ Cloud API ]")
+                self.lbl_mode.setStyleSheet(
+                    f"font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; "
+                    f"background: rgba(245, 158, 11, 0.15); color: {warn_color if not has_key else ok_color};"
+                )
 
     @Slot(int)
     def _on_provider_changed(self, index: int):
