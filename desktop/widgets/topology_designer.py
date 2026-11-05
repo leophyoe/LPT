@@ -2276,6 +2276,7 @@ class TopologyDesignerWidget(QWidget):
         # Page 1: Standalone Cyber Sentinel Radial View
         self.sentinel_view = NetworkMapView(self)
         self.sentinel_view.hide_sentinel_header()
+        self.sentinel_view.analyse_path_requested.connect(self._on_analyse_attack_path)
         self.map_stack.addWidget(self.sentinel_view)
 
         # Page 2: Standalone 3D Cyber Mesh View
@@ -2297,6 +2298,19 @@ class TopologyDesignerWidget(QWidget):
     def _toggle_devices_drawer(self, checked: bool):
         if hasattr(self, "devices_drawer"):
             self.devices_drawer.setVisible(checked)
+
+    def _on_analyse_attack_path(self, target_ip: str):
+        """Opens real Attack Path Analysis dialog for the selected target host."""
+        from desktop.dialogs.attack_path_dialog import AttackPathAnalysisDialog
+
+        dialog = AttackPathAnalysisDialog(
+            target_ip=target_ip,
+            project=self.active_project,
+            db=self.db,
+            parent=self,
+        )
+        self._last_attack_path_dialog = dialog
+        dialog.exec()
 
     def _toggle_inspector_panel(self, checked: bool):
         if hasattr(self, "inspector"):

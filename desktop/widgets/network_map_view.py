@@ -1484,11 +1484,6 @@ class NetworkMapView(QWidget):
     def _trigger_analyse_path(self):
         if self._selected_host:
             self.analyse_path_requested.emit(self._selected_host.ip)
-            QMessageBox.information(
-                self,
-                "Attack Path Analysis",
-                f"Initiating CPENT Multi-Hop pivoting path analysis against target {self._selected_host.ip}...",
-            )
 
     def to_svg(self) -> str:
         """Exports the current network map as a standalone SVG string for reports."""

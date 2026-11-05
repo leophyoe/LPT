@@ -45,6 +45,7 @@ class VisualizationWorkspace(QWidget):
     """Unified Workspace offering 2D Fortinet Topology and 3D WebGL Cyber Mesh."""
 
     host_selected = Signal(object)  # Emits HostResult or host IP
+    analyse_path_requested = Signal(str)  # Emits target IP
 
     def __init__(self, db: Database, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -141,6 +142,7 @@ class VisualizationWorkspace(QWidget):
         self.map_2d = NetworkMapView(self)
         self.map_2d.hide_sentinel_header()
         self.map_2d.host_selected.connect(self._on_2d_host_selected)
+        self.map_2d.analyse_path_requested.connect(self._on_analyse_attack_path)
         self.canvas_stack.addWidget(self.map_2d)
 
         # Page 1: 3D WebGL Network View
@@ -174,6 +176,20 @@ class VisualizationWorkspace(QWidget):
                     self.map_2d._on_device_list_clicked(item)
                     break
         self.host_selected.emit(ip)
+
+    def _on_analyse_attack_path(self, target_ip: str):
+        """Opens real Attack Path Analysis dialog for the selected target host."""
+        self.analyse_path_requested.emit(target_ip)
+        from desktop.dialogs.attack_path_dialog import AttackPathAnalysisDialog
+
+        dialog = AttackPathAnalysisDialog(
+            target_ip=target_ip,
+            project=self.active_project,
+            db=self.db,
+            parent=self,
+        )
+        self._last_attack_path_dialog = dialog
+        dialog.exec()
 
     def set_active_project(self, project: Optional[Project]):
         self.active_project = project
