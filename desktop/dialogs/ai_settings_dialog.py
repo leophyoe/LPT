@@ -17,16 +17,21 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from core.ai_copilot import AICopilotEngine, AIProvider
+from core.ai_model_router import AIModelRouter, ModelTierConfig, ReferencePricing
 from core.credential_manager import CredentialManager
 from desktop.theme import CPENTTheme
 
@@ -37,9 +42,10 @@ class AISettingsDialog(QDialog):
     def __init__(self, engine: Optional[AICopilotEngine] = None, parent=None):
         super().__init__(parent)
         self.engine = engine or AICopilotEngine()
+        self.router = AIModelRouter.get_instance()
         self.setWindowTitle("⚙️ AI Provider Settings & API Key Management")
-        self.setMinimumWidth(680)
-        self.setMinimumHeight(520)
+        self.setMinimumWidth(720)
+        self.setMinimumHeight(560)
 
         self._init_ui()
         self._load_current_values()
@@ -546,6 +552,18 @@ class AISettingsDialog(QDialog):
 
         self.tabs.addTab(tab_builtin, "Built-in Offline Engine")
 
+        # -------------------------------------------------------------
+        # Tab 8: Fallback Routing Chain
+        # -------------------------------------------------------------
+        tab_fallback = self._create_fallback_routing_tab()
+        self.tabs.addTab(tab_fallback, "🔄 Fallback Routing Chain")
+
+        # -------------------------------------------------------------
+        # Tab 9: Token & Cost Tracker
+        # -------------------------------------------------------------
+        tab_usage = self._create_usage_tracker_tab()
+        self.tabs.addTab(tab_usage, "📊 Token & Cost Tracker")
+
         main_layout.addWidget(self.tabs)
 
         # Bottom Close Row
@@ -895,3 +913,221 @@ class AISettingsDialog(QDialog):
             "The Built-in Cybersecurity Heuristic Engine is now selected as your active AI engine.\n\n"
             "All output diagnosis and command generation will operate 100% offline without external network transmission.",
         )
+
+    # -------------------------------------------------------------
+    # Tab 8: Fallback Routing Chain
+    # -------------------------------------------------------------
+    def _create_fallback_routing_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(12)
+
+        lbl_info = QLabel(
+            "Configure the automated 3-tier fallback routing chain for all AI assessment queries. "
+            "If the Primary provider times out, returns HTTP 429 (rate limit), or encounters connection failure, "
+            "the router automatically fails over to the Secondary provider, and finally to the offline heuristic engine."
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        layout.addWidget(lbl_info)
+
+        # Tier 1: Primary
+        p_group = QGroupBox("1. Primary AI Tier")
+        p_layout = QHBoxLayout(p_group)
+        self.combo_primary_provider = QComboBox()
+        self.combo_primary_provider.addItems([
+            "Google Gemini API",
+            "OpenAI API",
+            "Anthropic Claude API",
+            "OpenRouter API",
+            "DeepSeek API",
+            "Local Ollama",
+            "Built-in Offline Engine",
+        ])
+        self.input_primary_model = QLineEdit()
+        self.input_primary_model.setText(self.router.primary.model_name)
+        p_layout.addWidget(QLabel("Provider:"))
+        p_layout.addWidget(self.combo_primary_provider, 1)
+        p_layout.addWidget(QLabel("Model:"))
+        p_layout.addWidget(self.input_primary_model, 1)
+        layout.addWidget(p_group)
+
+        # Tier 2: Secondary
+        s_group = QGroupBox("2. Secondary AI Tier (Failover 1)")
+        s_layout = QHBoxLayout(s_group)
+        self.combo_secondary_provider = QComboBox()
+        self.combo_secondary_provider.addItems([
+            "OpenAI API",
+            "Google Gemini API",
+            "Anthropic Claude API",
+            "OpenRouter API",
+            "DeepSeek API",
+            "Local Ollama",
+            "Built-in Offline Engine",
+        ])
+        self.input_secondary_model = QLineEdit()
+        self.input_secondary_model.setText(self.router.secondary.model_name)
+        s_layout.addWidget(QLabel("Provider:"))
+        s_layout.addWidget(self.combo_secondary_provider, 1)
+        s_layout.addWidget(QLabel("Model:"))
+        s_layout.addWidget(self.input_secondary_model, 1)
+        layout.addWidget(s_group)
+
+        # Tier 3: Final Fallback
+        f_group = QGroupBox("3. Final Fallback Tier (Zero-Fail Guarantee)")
+        f_layout = QHBoxLayout(f_group)
+        self.combo_final_provider = QComboBox()
+        self.combo_final_provider.addItems([
+            "Built-in Offline Engine (100% Availability)",
+            "Local Ollama",
+        ])
+        f_layout.addWidget(QLabel("Provider:"))
+        f_layout.addWidget(self.combo_final_provider, 1)
+        layout.addWidget(f_group)
+
+        # Action Buttons
+        b_row = QHBoxLayout()
+        self.btn_test_fallback = QPushButton("🔌 Test Fallback Chain")
+        self.btn_test_fallback.clicked.connect(self._test_fallback_chain)
+        b_row.addWidget(self.btn_test_fallback)
+
+        self.btn_save_fallback = QPushButton("💾 Save Fallback Chain Settings")
+        self.btn_save_fallback.setProperty("class", "action-primary")
+        self.btn_save_fallback.clicked.connect(self._save_fallback_settings)
+        b_row.addWidget(self.btn_save_fallback)
+        layout.addLayout(b_row)
+
+        self.lbl_fallback_status = QLabel("")
+        self.lbl_fallback_status.setWordWrap(True)
+        layout.addWidget(self.lbl_fallback_status)
+        layout.addStretch()
+        return tab
+
+    def _provider_from_text(self, text: str) -> AIProvider:
+        t = text.lower()
+        if "gemini" in t:
+            return AIProvider.GEMINI_API
+        elif "openai" in t:
+            return AIProvider.OPENAI_API
+        elif "anthropic" in t or "claude" in t:
+            return AIProvider.ANTHROPIC_API
+        elif "openrouter" in t:
+            return AIProvider.OPENROUTER_API
+        elif "deepseek" in t:
+            return AIProvider.DEEPSEEK_API
+        elif "ollama" in t:
+            return AIProvider.LOCAL_OLLAMA
+        return AIProvider.BUILTIN_OFFLINE
+
+    @Slot()
+    def _save_fallback_settings(self):
+        p_prov = self._provider_from_text(self.combo_primary_provider.currentText())
+        p_model = self.input_primary_model.text().strip() or "default"
+        s_prov = self._provider_from_text(self.combo_secondary_provider.currentText())
+        s_model = self.input_secondary_model.text().strip() or "default"
+        f_prov = self._provider_from_text(self.combo_final_provider.currentText())
+
+        self.router.primary = ModelTierConfig(provider=p_prov, model_name=p_model, timeout_seconds=15.0)
+        self.router.secondary = ModelTierConfig(provider=s_prov, model_name=s_model, timeout_seconds=15.0)
+        self.router.final_fallback = ModelTierConfig(provider=f_prov, model_name="offline-expert-rules", timeout_seconds=5.0)
+
+        self.lbl_fallback_status.setText("✓ Fallback chain saved: Primary -> Secondary -> Final Fallback.")
+        self.lbl_fallback_status.setStyleSheet("color: #4ade80; font-weight: bold;")
+
+    @Slot()
+    def _test_fallback_chain(self):
+        self.lbl_fallback_status.setText("Executing probe query through 3-tier fallback chain...")
+        self.lbl_fallback_status.setStyleSheet("color: #38bdf8;")
+
+        resp = self.router.route_completion(
+            prompt="Respond with 'PONG' to verify routing chain.",
+            system_prompt="Diagnostic probe.",
+            max_tokens=10,
+        )
+
+        if resp.success:
+            fb_note = " (Fell back from failed primary)" if resp.fallback_occurred else " (Primary succeeded directly)"
+            msg = f"✓ Chain verification success! Responded via {resp.provider_used.value} ({resp.model_used}) in {resp.duration_seconds:.2f}s{fb_note}."
+            self.lbl_fallback_status.setText(msg)
+            self.lbl_fallback_status.setStyleSheet("color: #4ade80; font-weight: bold;")
+        else:
+            self.lbl_fallback_status.setText(f"✗ All tiers failed: {resp.error_message}")
+            self.lbl_fallback_status.setStyleSheet("color: #f87171; font-weight: bold;")
+
+    # -------------------------------------------------------------
+    # Tab 9: Token & Cost Tracker
+    # -------------------------------------------------------------
+    def _create_usage_tracker_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(12)
+
+        lbl_info = QLabel("Session and cumulative token tracking across configured AI models with reference cost estimates.")
+        lbl_info.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        layout.addWidget(lbl_info)
+
+        # Metric Cards Row
+        cards_row = QHBoxLayout()
+        self.lbl_stat_requests = QLabel("Requests: 0")
+        self.lbl_stat_prompt = QLabel("Prompt Tokens: 0")
+        self.lbl_stat_completion = QLabel("Completion Tokens: 0")
+        self.lbl_stat_cost = QLabel("Estimated USD: $0.0000")
+
+        for lbl in (self.lbl_stat_requests, self.lbl_stat_prompt, self.lbl_stat_completion, self.lbl_stat_cost):
+            lbl.setStyleSheet("background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; font-weight: bold; color: #38bdf8;")
+            cards_row.addWidget(lbl)
+        layout.addLayout(cards_row)
+
+        # Log Table
+        self.table_usage_log = QTableWidget()
+        self.table_usage_log.setColumnCount(5)
+        self.table_usage_log.setHorizontalHeaderLabels(["Timestamp", "Provider", "Model", "Total Tokens", "Est. Cost (USD)"])
+        hdr = self.table_usage_log.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table_usage_log.setColumnWidth(0, 160)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table_usage_log.setColumnWidth(1, 140)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.table_usage_log.setColumnWidth(3, 110)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.table_usage_log.setColumnWidth(4, 110)
+        self.table_usage_log.setAlternatingRowColors(True)
+        self.table_usage_log.verticalHeader().setVisible(False)
+        layout.addWidget(self.table_usage_log)
+
+        # Buttons
+        b_row = QHBoxLayout()
+        btn_refresh = QPushButton("🔄 Refresh Statistics")
+        btn_refresh.clicked.connect(self._refresh_usage_stats)
+        b_row.addWidget(btn_refresh)
+
+        btn_clear = QPushButton("🗑️ Clear Session History")
+        btn_clear.clicked.connect(self._clear_usage_stats)
+        b_row.addWidget(btn_clear)
+        b_row.addStretch()
+        layout.addLayout(b_row)
+
+        self._refresh_usage_stats()
+        return tab
+
+    def _refresh_usage_stats(self):
+        summary = self.router.usage_tracker.get_summary()
+        self.lbl_stat_requests.setText(f"Requests: {summary['session_requests']}")
+        self.lbl_stat_prompt.setText(f"Prompt Tokens: {summary['session_prompt_tokens']:,}")
+        self.lbl_stat_completion.setText(f"Completion: {summary['session_completion_tokens']:,}")
+        self.lbl_stat_cost.setText(f"Est. USD: ${summary['session_cost_usd']:.4f}")
+
+        records = self.router.usage_tracker._session_records
+        self.table_usage_log.setRowCount(len(records))
+        for row, r in enumerate(reversed(records)):
+            self.table_usage_log.setItem(row, 0, QTableWidgetItem(r.get("timestamp", "")))
+            self.table_usage_log.setItem(row, 1, QTableWidgetItem(r.get("provider", "")))
+            self.table_usage_log.setItem(row, 2, QTableWidgetItem(r.get("model", "")))
+            self.table_usage_log.setItem(row, 3, QTableWidgetItem(f"{r.get('total_tokens', 0):,}"))
+            cost_val = r.get("cost_usd", 0.0)
+            self.table_usage_log.setItem(row, 4, QTableWidgetItem(f"${cost_val:.6f}"))
+
+    def _clear_usage_stats(self):
+        self.router.usage_tracker._session_records.clear()
+        self._refresh_usage_stats()

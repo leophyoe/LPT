@@ -34,8 +34,10 @@ from PySide6.QtWidgets import (
 
 from core.registry import ToolMetadata, ToolRegistry
 from desktop.theme import CPENTTheme, get_ui_font, ThemeManager, ThemeMode
+from desktop.widgets.tool_execution_center import ToolExecutionCenterWidget
 from modules.scanners_box.catalog import ScannersBoxCatalog, ScannersBoxItem
 from storage.db import Database
+from storage.models import Project
 
 
 class ToolTestWorker(QThread):
@@ -69,6 +71,7 @@ class ToolsDashboardView(QWidget):
         super().__init__(parent)
         self.db = db
         self.registry = registry or ToolRegistry()
+        self.active_project: Optional[Project] = None
         self.selected_tool: Optional[ToolMetadata] = None
         self.selected_sb_item: Optional[ScannersBoxItem] = None
         self._current_sb_items: List[ScannersBoxItem] = []
@@ -108,8 +111,16 @@ class ToolsDashboardView(QWidget):
         # Tab 1: Local Tool Integration Matrix
         tab_local = QWidget()
         tab_local_layout = QVBoxLayout(tab_local)
-        tab_local_layout.setContentsMargins(0, 8, 0, 0)
-        tab_local_layout.setSpacing(12)
+        tab_local_layout.setContentsMargins(0, 4, 0, 0)
+        tab_local_layout.setSpacing(6)
+
+        self.matrix_tabs = QTabWidget()
+
+        # Sub-tab A: Inventory & Matrix
+        matrix_subtab = QWidget()
+        matrix_subtab_layout = QVBoxLayout(matrix_subtab)
+        matrix_subtab_layout.setContentsMargins(0, 4, 0, 0)
+        matrix_subtab_layout.setSpacing(10)
 
         # 2. Metrics Cards Row
         metrics_row = QHBoxLayout()
@@ -124,7 +135,7 @@ class ToolsDashboardView(QWidget):
         metrics_row.addWidget(self.card_installed)
         metrics_row.addWidget(self.card_missing)
         metrics_row.addWidget(self.card_integrated)
-        tab_local_layout.addLayout(metrics_row)
+        matrix_subtab_layout.addLayout(metrics_row)
 
         # 3. Filter and Search Toolbar
         filter_row = QHBoxLayout()
@@ -145,12 +156,16 @@ class ToolsDashboardView(QWidget):
             "Vulnerability",
             "Cloud",
             "Mobile",
+            "OSINT",
+            "Forensics",
+            "Crypto",
+            "Identity",
         ])
         self.cat_filter.currentTextChanged.connect(self._apply_filters)
         filter_row.addWidget(self.cat_filter, 1)
 
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["All Statuses", "Installed", "Missing", "Error"])
+        self.status_filter.addItems(["All Statuses", "Installed", "Missing", "Available", "Update Available", "Error"])
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         filter_row.addWidget(self.status_filter, 1)
 
@@ -184,7 +199,7 @@ class ToolsDashboardView(QWidget):
         self.btn_filter_all.clicked.connect(lambda: self.status_filter.setCurrentText("All Statuses"))
         filter_row.addWidget(self.btn_filter_all)
 
-        tab_local_layout.addLayout(filter_row)
+        matrix_subtab_layout.addLayout(filter_row)
 
         # 4. Main Splitter (Left: Table, Right: Details & Safe Test)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -264,6 +279,12 @@ class ToolsDashboardView(QWidget):
         self.btn_test.clicked.connect(self._run_tool_test)
         action_row.addWidget(self.btn_test)
 
+        self.btn_open_execution = QPushButton("⚡ Launch Execution Center")
+        self.btn_open_execution.setProperty("class", "action-primary")
+        self.btn_open_execution.setEnabled(False)
+        self.btn_open_execution.clicked.connect(self._on_open_execution_clicked)
+        action_row.addWidget(self.btn_open_execution)
+
         self.btn_open_shell = QPushButton("⚡ Open in Shell")
         self.btn_open_shell.setProperty("class", "action-secondary")
         self.btn_open_shell.setEnabled(False)
@@ -312,7 +333,14 @@ class ToolsDashboardView(QWidget):
         # 60% Table, 40% Details
         splitter.setStretchFactor(0, 6)
         splitter.setStretchFactor(1, 4)
-        tab_local_layout.addWidget(splitter)
+        matrix_subtab_layout.addWidget(splitter)
+        self.matrix_tabs.addTab(matrix_subtab, "🛠️ Inventory & Diagnostics")
+
+        # Sub-tab B: Dedicated Tool Execution Center
+        self.execution_center_tab = ToolExecutionCenterWidget(db=self.db, project=self.active_project)
+        self.matrix_tabs.addTab(self.execution_center_tab, "⚡ Tool Execution Center")
+
+        tab_local_layout.addWidget(self.matrix_tabs)
         self.tabs.addTab(tab_local, "🛠️ Tools Matrix")
 
         # Tab 2: Scanners-Box (12 Primary Domains)
@@ -399,8 +427,13 @@ class ToolsDashboardView(QWidget):
 
             # Status match
             t_status = "installed" if t.is_installed else ("error" if t.error_message and "unbuilt" in t.error_message else "missing")
-            if status_sel != "all statuses" and t_status != status_sel:
-                continue
+            if status_sel != "all statuses":
+                if status_sel == "available" and not t.is_installed:
+                    continue
+                elif status_sel == "update available" and not (t.is_installed and t.version and "git" in str(t.version).lower()):
+                    continue
+                elif status_sel not in ("available", "update available") and t_status != status_sel:
+                    continue
 
             # Search text match
             if search:
@@ -494,10 +527,29 @@ class ToolsDashboardView(QWidget):
         self.lbl_tool_caps.setText(" | ".join(caps))
 
         self.btn_test.setEnabled(True)
+        self.btn_open_execution.setEnabled(True)
         self.btn_open_gui.setEnabled(tool.has_gui)
         self.btn_open_shell.setEnabled(True)
 
         self.txt_install.setPlainText(tool.install_guide or "No installation instructions needed.")
+
+    @Slot()
+    def _on_open_execution_clicked(self):
+        if self.selected_tool:
+            self.open_tool_in_execution_center(self.selected_tool.name)
+
+    def open_tool_in_execution_center(self, tool_name: str, preset_name: Optional[str] = None):
+        """Switches to the Execution Center tab and pre-selects the requested tool and profile."""
+        if hasattr(self, "execution_center_tab") and hasattr(self, "matrix_tabs"):
+            self.tabs.setCurrentIndex(0)
+            self.matrix_tabs.setCurrentWidget(self.execution_center_tab)
+            self.execution_center_tab.select_tool(tool_name, preset_name)
+
+    def set_active_project(self, project: Optional[Project]):
+        """Synchronizes project context with Execution Center."""
+        self.active_project = project
+        if hasattr(self, "execution_center_tab"):
+            self.execution_center_tab.set_active_project(project)
 
     @Slot()
     def _run_tool_test(self):
@@ -767,4 +819,6 @@ class ToolsDashboardView(QWidget):
                     "QTableWidget::item:selected { background-color: #1e3a8a; color: #ffffff; }"
                     "QHeaderView::section { background-color: #0f172a; color: #cbd5e1; font-weight: bold; padding: 6px; border: none; border-bottom: 2px solid #334155; }"
                 )
+        if hasattr(self, "execution_center_tab") and hasattr(self.execution_center_tab, "_on_theme_changed"):
+            self.execution_center_tab._on_theme_changed(mode)
 

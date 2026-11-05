@@ -87,7 +87,7 @@ class SidebarNavItem(QPushButton):
             self.setText(f"{self.icon_text}  {clean_label}{badge_suffix}")
             self.setToolTip(self.tooltip_text)
             self.setStyleSheet(
-                f"QPushButton {{ text-align: left; padding: 6px 10px; font-size: 12px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: {text_color}; }}"
+                f"QPushButton {{ text-align: left; padding: 6px 10px; font-size: 13px; font-weight: 500; border-radius: 4px; border: none; background: transparent; color: {text_color}; }}"
                 f"QPushButton:hover {{ background-color: {hover_bg}; color: {hover_text}; }}"
                 f"QPushButton:checked {{ background-color: {checked_bg}; color: {checked_text}; font-weight: bold; border-left: 3px solid {checked_border}; }}"
             )
@@ -158,7 +158,7 @@ class SidebarNavWidget(QWidget):
         self.lbl_brand.setStyleSheet("color: #f8fafc;")
 
         self.lbl_subtitle = QLabel("Professional Penetration Testing Platform")
-        self.lbl_subtitle.setStyleSheet("color: #64748b; font-size: 8px; font-weight: 600; letter-spacing: 0.1px;")
+        self.lbl_subtitle.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 500; letter-spacing: 0.2px;")
         brand_vbox.addWidget(self.lbl_brand)
         brand_vbox.addWidget(self.lbl_subtitle)
         header_layout.addLayout(brand_vbox, stretch=1)
@@ -278,40 +278,50 @@ class SidebarNavWidget(QWidget):
         # 1. [WORKSPACE]
         self.lbl_sec_workspace = self._add_section_header("WORKSPACE")
         self.item_dashboard = self._add_item("dashboard", "⌂", "Dashboard", "Executive security analytics, exposure score, and threat posture")
-        self.item_projects = self._add_item("projects", "◈", "Engagements & Scope", "Engagement portfolio, legal RoE, and authorized target scope")
+        self.item_projects = self._add_item("projects", "◈", "Engagements", "Engagement portfolio, legal RoE, and authorized target scope")
+        self.item_assets = self._add_item("assets", "🛰️", "Digital Assets", "Discovered hosts, services, cloud assets, and inventory")
 
-        # 2. [METHODOLOGY WORKFLOW] (INE / PTES Standard)
-        self.lbl_sec_workflow = self._add_section_header("METHODOLOGY WORKFLOW")
-        self.item_info_gathering = self._add_item("info_gathering", "🛰️", "1. Information Gathering", "OSINT, Passive Recon, Attack Surface & Behind24 Assets")
-        self.item_enumeration = self._add_item("enumeration", "🗺️", "2. Enumeration & Mapping", "Port discovery, service detection, attack surface & cyber terrain")
-        self.item_vulnerability = self._add_item("vulnerability", "🛡️", "3. Vulnerability & Access", "Web application testing, vulnerability scanning, and verified PoCs")
-        self.item_post_exploitation = self._add_item("post_exploitation", "🔀", "4. Post-Exploitation", "Active Directory audit, SSH/SOCKS pivoting & ProxyChains")
-        self.item_reporting = self._add_item("reporting", "📊", "5. Reporting & Evidence", "Executive reports, 5-pillar mitigation roadmap, findings & evidence")
+        # 2. [METHODOLOGY]
+        self.lbl_sec_workflow = self._add_section_header("METHODOLOGY")
+        self.item_info_gathering = self._add_item("info_gathering", "🔎", "Information Gathering", "OSINT, Passive Recon, attack surface & domain footprint")
+        self.item_enumeration = self._add_item("enumeration", "🗺️", "Enumeration & Mapping", "Port discovery, service detection, attack surface & cyber terrain")
+        self.item_vulnerability = self._add_item("vulnerability", "🛡️", "Vulnerability Assessment", "Web application testing, vulnerability scanning, and verified PoCs")
+        self.item_post_exploitation = self._add_item("post_exploitation", "🔀", "Exploitation", "Active Directory audit, SSH/SOCKS pivoting & ProxyChains")
+        self.item_reporting = self._add_item("reporting", "📊", "Reporting & Evidence", "Executive reports, 5-pillar mitigation roadmap, findings & evidence")
 
-        # 3. [OPERATIONS & LABS]
-        self.lbl_sec_operations = self._add_section_header("OPERATIONS & LABS")
-        self.item_terminal_tools = self._add_item("terminal_tools", "💻", "Terminal & Tools", "Integrated Linux terminal console and scanner tool integrations")
+        # 3. [TOOLS]
+        self.lbl_sec_tools = self._add_section_header("TOOLS")
+        self.item_tools = self._add_item("tools", "⚙️", "Tool Library", "Security tool matrix, scanner inventory, and Tool Execution Center")
+        self.item_terminal = self._add_item("terminal", "💻", "Terminal", "Integrated interactive Linux terminal console and PTY")
+
+        # 4. [INTELLIGENCE]
+        self.lbl_sec_intelligence = self._add_section_header("INTELLIGENCE")
+        self.item_ai_copilot = self._add_item("ai_copilot", "🤖", "AI Copilot", "Context-aware AI security copilot, triage assistance, and CPENT explanations")
         self.item_cpent_labs = self._add_item(
-            "cpent_labs", "🎓", "CPENT / Academy", "Hands-on training range, pivoting simulator, and student lab exercises", badge="Lab"
+            "cpent_labs", "🎓", "CPENT Academy", "Hands-on training range, pivoting simulator, and student lab exercises", badge="Lab"
         )
+
+        # 5. [SYSTEM]
+        self.lbl_sec_system = self._add_section_header("SYSTEM")
         self.btn_settings = self._add_item("settings", "⚙️", "Settings", "Configure API keys, AI model providers, and system preferences")
 
         # Legacy items & backward compatibility aliases mapped directly into nav_items dictionary
-        self.item_assets = self.item_info_gathering
+        self.item_terminal_tools = self.item_tools
         self.item_assessment = self.item_vulnerability
         self.item_visualization = self.item_enumeration
         self.item_findings = self.item_reporting
         self.item_reports = self.item_reporting
 
-        self.nav_items["assets"] = SidebarNavAliasItem("assets", self.item_info_gathering, self)
-        self.nav_items["discovery"] = SidebarNavAliasItem("discovery", self.item_info_gathering, self)
+        # Aliases for 100% routing and test suite compatibility
+        self.nav_items["terminal_tools"] = SidebarNavAliasItem("terminal_tools", self.item_tools, self)
+        self.nav_items["discovery"] = SidebarNavAliasItem("discovery", self.item_enumeration, self)
         self.nav_items["audit"] = SidebarNavAliasItem("audit", self.item_projects, self)
         self.nav_items["scope"] = SidebarNavAliasItem("scope", self.item_projects, self)
         self.nav_items["recon"] = SidebarNavAliasItem("recon", self.item_info_gathering, self)
         self.nav_items["footprint"] = SidebarNavAliasItem("footprint", self.item_info_gathering, self)
         self.nav_items["footprinting"] = SidebarNavAliasItem("footprinting", self.item_info_gathering, self)
         self.nav_items["osint"] = SidebarNavAliasItem("osint", self.item_info_gathering, self)
-        self.nav_items["pcap"] = SidebarNavAliasItem("pcap", self.item_info_gathering, self)
+        self.nav_items["pcap"] = SidebarNavAliasItem("pcap", self.item_enumeration, self)
 
         self.nav_items["enum"] = SidebarNavAliasItem("enum", self.item_enumeration, self)
         self.nav_items["ports"] = SidebarNavAliasItem("ports", self.item_enumeration, self)
@@ -319,7 +329,7 @@ class SidebarNavWidget(QWidget):
         self.nav_items["topology"] = SidebarNavAliasItem("topology", self.item_enumeration, self)
         self.nav_items["visualization"] = SidebarNavAliasItem("visualization", self.item_enumeration, self)
 
-        self.nav_items["vuln"] = SidebarNavAliasItem("vuln", self.item_vulnerability, self)
+        self.nav_items["vuln"] = SidebarNavAliasItem("vuln", self.item_enumeration, self)
         self.nav_items["web"] = SidebarNavAliasItem("web", self.item_vulnerability, self)
         self.nav_items["web_scan"] = SidebarNavAliasItem("web_scan", self.item_vulnerability, self)
         self.nav_items["assessment"] = SidebarNavAliasItem("assessment", self.item_vulnerability, self)
@@ -336,9 +346,7 @@ class SidebarNavWidget(QWidget):
         self.nav_items["evidence"] = SidebarNavAliasItem("evidence", self.item_reporting, self)
         self.nav_items["reports_evidence"] = SidebarNavAliasItem("reports_evidence", self.item_reporting, self)
 
-        self.nav_items["tools"] = SidebarNavAliasItem("tools", self.item_terminal_tools, self)
         self.nav_items["exploit_lab"] = SidebarNavAliasItem("exploit_lab", self.item_cpent_labs, self)
-        self.nav_items["ai_copilot"] = SidebarNavAliasItem("ai_copilot", self.item_vulnerability, self)
     def toggle_collapse(self):
         """Toggles between expanded (~220px) and collapsed (~58px) sidebar."""
         self.set_collapsed(not self.is_collapsed)

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from core.ai_model_router import AIModelRouter, AIResponse
 from core.credential_manager import CredentialManager
 from core.scope import ScopeAuthorizationService, ScopeCheckResult
 from storage.models import Finding, FindingSeverity, TargetScope, ValidationStatus
@@ -1967,6 +1968,59 @@ class AICopilotEngine:
             )
 
         return findings
+
+    def classify_finding_confidence(
+        self,
+        finding: Finding,
+        raw_evidence: str = "",
+        operator_confirmed: bool = False,
+    ) -> str:
+        """Classifies findings into Observed, Suspected, Confirmed, False Positive, or Needs Validation.
+
+        Strict Operational Rules:
+        - Never automatically promotes findings to 'Confirmed' without explicit operator verification.
+        - Direct telemetry is classified as 'Observed'.
+        - Potential vulnerabilities requiring proof are classified as 'Suspected' or 'Needs Validation'.
+        """
+        if operator_confirmed:
+            return "Confirmed"
+
+        if finding.validation_status == ValidationStatus.CONFIRMED:
+            return "Confirmed"
+        elif finding.validation_status == ValidationStatus.FALSE_POSITIVE:
+            return "False Positive"
+
+        text = f"{finding.title} {finding.description} {raw_evidence}".lower()
+
+        # Check for false positive markers
+        if any(fp in text for fp in ["mock", "dummy", "test banner", "self-test", "placeholder"]):
+            return "False Positive"
+
+        # Check for direct telemetry observations
+        if any(obs in text for obs in ["open port", "fingerprinted", "service banner", "http status", "traceroute", "dns record", "waf"]):
+            return "Observed"
+
+        # Check for suspected vulnerabilities
+        if any(sus in text for sus in ["injection", "vulnerable", "overflow", "path traversal", "unauthenticated", "sqli", "rce", "cve-"]):
+            return "Suspected"
+
+        return "Needs Validation"
+
+    def query_with_fallback(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.2,
+    ) -> AIResponse:
+        """Routes query through AIModelRouter 3-tier fallback chain (Primary -> Secondary -> Final)."""
+        router = getattr(self, "router", None) or AIModelRouter.get_instance()
+        return router.route_completion(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     # -----------------------------------------------------------------------
     # Internal HTTP Client Helpers

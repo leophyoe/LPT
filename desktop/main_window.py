@@ -713,14 +713,14 @@ class MainWindow(QMainWindow):
                 self.projects_view.tabs.setCurrentIndex(3)
             if hasattr(self, "sidebar_nav"):
                 self.sidebar_nav.select_item("audit")
-        elif item_id in ("footprint", "footprinting", "recon"):
+        elif item_id in ("info_gathering", "footprint", "footprinting", "recon"):
             self._navigate_to_workspace_subtab(1, 0)
             if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
                 self.security_tabs.tabBar().setVisible(True)
             if hasattr(self, "network_view") and hasattr(self.network_view, "tab_widget"):
                 self.network_view.tab_widget.setCurrentIndex(0)
             if hasattr(self, "sidebar_nav"):
-                self.sidebar_nav.select_item("recon")
+                self.sidebar_nav.select_item("info_gathering" if item_id == "info_gathering" else "recon")
         elif item_id == "osint":
             self.view_stack.setCurrentIndex(1)
             self.btn_security_workspace.setChecked(True)
@@ -730,7 +730,7 @@ class MainWindow(QMainWindow):
                     self.security_tabs.tabBar().setVisible(True)
             if hasattr(self, "sidebar_nav"):
                 self.sidebar_nav.select_item("osint")
-        elif item_id in ("info_gathering", "assets", "asset_discovery"):
+        elif item_id in ("assets", "asset_discovery"):
             self.view_stack.setCurrentIndex(0)
             self.btn_scope_projects.setChecked(True)
             if hasattr(self, "scope_tabs") and hasattr(self, "assets_view"):
@@ -740,7 +740,7 @@ class MainWindow(QMainWindow):
                 if hasattr(self.assets_view, "refresh"):
                     self.assets_view.refresh()
             if hasattr(self, "sidebar_nav"):
-                self.sidebar_nav.select_item("info_gathering" if item_id == "info_gathering" else "assets")
+                self.sidebar_nav.select_item("assets")
         elif item_id in ("discovery", "ports", "enum"):
             self._navigate_to_workspace_subtab(1, 0)
             if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
@@ -841,8 +841,18 @@ class MainWindow(QMainWindow):
                     self._toggle_terminal_visibility()
                 elif hasattr(self.terminal_widget, "cmd_input"):
                     self.terminal_widget.cmd_input.setFocus()
+        elif item_id == "terminal":
+            if hasattr(self, "content_splitter"):
+                if not getattr(self, "_terminal_visible", True):
+                    self._toggle_terminal_visibility()
+                elif hasattr(self.terminal_widget, "cmd_input"):
+                    self.terminal_widget.cmd_input.setFocus()
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("terminal")
         elif item_id == "ai_copilot":
             self._toggle_ai_panel()
+        elif item_id == "settings":
+            self._open_ai_settings()
         elif item_id in ("cpent_labs", "exploit_lab"):
             self.view_stack.setCurrentIndex(3)
             self.btn_cpent_labs.setChecked(True)
@@ -959,6 +969,8 @@ class MainWindow(QMainWindow):
                 self.assets_view.set_active_project(None)
             if hasattr(self, "visualization_workspace") and hasattr(self.visualization_workspace, "set_active_project"):
                 self.visualization_workspace.set_active_project(None)
+            if hasattr(self, "tools_view") and hasattr(self.tools_view, "set_active_project"):
+                self.tools_view.set_active_project(None)
             if hasattr(self, "terminal_widget"):
                 self.terminal_widget.set_active_project(None, self.db)
             if hasattr(self, "sidebar_nav"):
@@ -1004,6 +1016,8 @@ class MainWindow(QMainWindow):
             self.assets_view.set_active_project(project)
         if hasattr(self, "visualization_workspace") and hasattr(self.visualization_workspace, "set_active_project"):
             self.visualization_workspace.set_active_project(project)
+        if hasattr(self, "tools_view") and hasattr(self.tools_view, "set_active_project"):
+            self.tools_view.set_active_project(project)
         if hasattr(self, "terminal_widget"):
             self.terminal_widget.set_active_project(project, self.db)
             self.terminal_widget.append_system_msg(f"Active project switched to: '{project.name}'")

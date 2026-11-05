@@ -654,6 +654,7 @@ class AssetsView(QWidget):
 
         overview_container_layout.addLayout(overview_row)
         inv_layout.addWidget(self.overview_container)
+        self.overview_container.setVisible(False)
 
         # --------------------------------------------------------------------
         # 4. BOTTOM MASTER INVENTORY: FILTERS + DATA TABLE + INSPECTOR
@@ -749,7 +750,7 @@ class AssetsView(QWidget):
 
         self.btn_toggle_analytics = QPushButton("📊  Analytics Cards")
         self.btn_toggle_analytics.setCheckable(True)
-        self.btn_toggle_analytics.setChecked(True)
+        self.btn_toggle_analytics.setChecked(False)
         self.btn_toggle_analytics.setCursor(Qt.PointingHandCursor)
         self.btn_toggle_analytics.setStyleSheet(
             "QPushButton { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 500; }"
@@ -757,6 +758,17 @@ class AssetsView(QWidget):
         )
         self.btn_toggle_analytics.toggled.connect(self._toggle_analytics)
         t_bar.addWidget(self.btn_toggle_analytics)
+
+        self.btn_toggle_inspector = QPushButton("🔍  Inspector")
+        self.btn_toggle_inspector.setCheckable(True)
+        self.btn_toggle_inspector.setChecked(True)
+        self.btn_toggle_inspector.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_inspector.setStyleSheet(
+            "QPushButton { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 500; }"
+            "QPushButton:checked { background-color: #1e3a8a; color: #38bdf8; border-color: #2563eb; font-weight: bold; }"
+        )
+        self.btn_toggle_inspector.toggled.connect(self._toggle_inspector)
+        t_bar.addWidget(self.btn_toggle_inspector)
 
         t_bar.addStretch()
 
@@ -799,6 +811,38 @@ class AssetsView(QWidget):
         )
         self.asset_table.itemSelectionChanged.connect(self._on_table_selection_changed)
         t_layout.addWidget(self.asset_table)
+
+        # Empty state guidance container
+        self.empty_asset_frame = QFrame()
+        self.empty_asset_frame.setStyleSheet(
+            "QFrame { background-color: #0b0f19; border: 1px dashed #334155; border-radius: 8px; padding: 24px; margin: 10px; }"
+        )
+        empty_layout = QVBoxLayout(self.empty_asset_frame)
+        empty_layout.setAlignment(Qt.AlignCenter)
+        empty_layout.setSpacing(10)
+
+        lbl_empty_icon = QLabel("🛰️")
+        lbl_empty_icon.setFont(get_ui_font(28))
+        lbl_empty_icon.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(lbl_empty_icon)
+
+        lbl_empty_title = QLabel("No Digital Assets in this Engagement")
+        lbl_empty_title.setFont(get_ui_font(13, bold=True, heading=True))
+        lbl_empty_title.setAlignment(Qt.AlignCenter)
+        lbl_empty_title.setStyleSheet("color: #f8fafc;")
+        empty_layout.addWidget(lbl_empty_title)
+
+        lbl_empty_desc = QLabel(
+            "Run an Nmap network scan or define authorized target scopes in Project Management\n"
+            "to automatically populate and synchronize your digital asset attack surface."
+        )
+        lbl_empty_desc.setFont(get_ui_font(11))
+        lbl_empty_desc.setAlignment(Qt.AlignCenter)
+        lbl_empty_desc.setStyleSheet("color: #94a3b8; line-height: 1.4;")
+        empty_layout.addWidget(lbl_empty_desc)
+
+        self.empty_asset_frame.setVisible(False)
+        t_layout.addWidget(self.empty_asset_frame)
         splitter.addWidget(table_container)
 
         # --- C. Right Auspex Observatory Slide-out Inspector Drawer ---
@@ -826,6 +870,17 @@ class AssetsView(QWidget):
         )
         self.btn_copy_ip.clicked.connect(self._copy_ip)
         insp_hdr.addWidget(self.btn_copy_ip)
+
+        self.btn_close_insp = QPushButton("✕")
+        self.btn_close_insp.setFixedSize(24, 24)
+        self.btn_close_insp.setCursor(Qt.PointingHandCursor)
+        self.btn_close_insp.setToolTip("Collapse Inspector Panel")
+        self.btn_close_insp.setStyleSheet(
+            "QPushButton { background: #0f172a; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #dc2626; color: #ffffff; }"
+        )
+        self.btn_close_insp.clicked.connect(lambda: self.btn_toggle_inspector.setChecked(False))
+        insp_hdr.addWidget(self.btn_close_insp)
         insp_layout.addLayout(insp_hdr)
 
         # IP and Meta box
@@ -965,6 +1020,10 @@ class AssetsView(QWidget):
     def _toggle_analytics(self, checked: bool):
         if hasattr(self, "overview_container"):
             self.overview_container.setVisible(checked)
+
+    def _toggle_inspector(self, checked: bool):
+        if hasattr(self, "inspector_panel"):
+            self.inspector_panel.setVisible(checked)
 
     def _on_theme_changed(self, mode: Union[ThemeMode, str]):
         is_light = str(mode).strip().lower() == "light" or mode == ThemeMode.LIGHT
@@ -1516,6 +1575,8 @@ class AssetsView(QWidget):
             row_idx += 1
 
         if self.asset_table.rowCount() > 0:
+            if hasattr(self, "empty_asset_frame"):
+                self.empty_asset_frame.setVisible(False)
             if self._selected_node is None:
                 first_item = self.asset_table.item(0, 0)
                 if first_item:
@@ -1523,6 +1584,8 @@ class AssetsView(QWidget):
                     if node:
                         self._update_inspector(node)
         else:
+            if hasattr(self, "empty_asset_frame"):
+                self.empty_asset_frame.setVisible(True)
             self._clear_inspector()
 
     def _filter_assets_table(self):

@@ -267,13 +267,13 @@ class DashboardView(QWidget):
             icon_tint="rgba(56, 189, 248, 0.12)", icon_border="#38bdf8",
         )
         self.metric_assets = self._metric_card(
-            "🛰️", "Attack Surface", "0", "0 Domains · 0 IPs",
-            tooltip="Click to manage authorized targets in Project Management",
+            "🛰️", "Total Assets", "0", "0 Live Hosts · 0 Open Ports",
+            tooltip="Click to manage authorized targets and asset inventory",
             bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
             icon_tint="rgba(6, 182, 212, 0.12)", icon_border="#06b6d4",
         )
         self.metric_findings = self._metric_card(
-            "🚨", "Open Risks", "0", "0 Crit · 0 High",
+            "🚨", "Vulnerabilities", "0", "0 Critical · 0 High",
             tooltip="Click to view open security findings and evidence",
             bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
             icon_tint="rgba(239, 68, 68, 0.12)", icon_border="#ef4444",
@@ -683,7 +683,7 @@ class DashboardView(QWidget):
 
         project = self.active_project
         if project and project.id is not None:
-            self.project_badge.setText(f"◉  {project.name}")
+            self.project_badge.setText(f"◉ Active Engagement: {project.name}")
             scopes = [s for s in self.db.list_scopes(project.id) if s.is_authorized]
             findings = self.db.list_findings(project.id)
             executions = self.db.list_executions(project.id)
@@ -736,8 +736,8 @@ class DashboardView(QWidget):
 
         # Update top metric cards
         self._set_metrics(len(all_assets), domains, ips, total_open)
-        self.metric_assets.hint_label.setText(f"{domains} FQDNs · {ips} IPs · {len(observed_services)} Services · {urls} URLs")
-        self.metric_findings.hint_label.setText(f"{crit_count} Crit · {high_count} High · {med_count} Med · {low_count} Low")
+        self.metric_assets.hint_label.setText(f"{domains} FQDNs · {ips} IPs · {len(observed_services)} Open Services · {urls} URLs")
+        self.metric_findings.hint_label.setText(f"{crit_count} Critical · {high_count} High · {med_count} Med · {low_count} Low")
         self.card_arsenal.value_label.setText(str(len(executions)))
         self.card_arsenal.hint_label.setText("Saved terminal and scanner runs")
 

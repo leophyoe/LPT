@@ -61,6 +61,7 @@ class FindingSeverity(str, Enum):
 class ValidationStatus(str, Enum):
     NEW = "new"
     CONFIRMED = "confirmed"
+    SUSPECTED = "suspected"
     FALSE_POSITIVE = "false_positive"
     REMEDIATION_IN_PROGRESS = "remediation_in_progress"
     RESOLVED = "resolved"

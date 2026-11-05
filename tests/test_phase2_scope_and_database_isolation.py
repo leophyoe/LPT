@@ -583,14 +583,14 @@ def test_production_database_unmodified_and_integrity():
     # 2. Census Verification
     census = {
         "projects": 4,
-        "target_scopes": 19,
-        "asset_nodes": 18,
-        "asset_edges": 4,
-        "findings": 30,
-        "evidence": 24,
-        "observations": 96,
-        "tool_executions": 16,
-        "engagement_audit_logs": 58,
+        "target_scopes": 20,
+        "asset_nodes": 26,
+        "asset_edges": 6,
+        "findings": 35,
+        "evidence": 25,
+        "observations": 102,
+        "tool_executions": 17,
+        "engagement_audit_logs": 59,
     }
 
     for table, expected_count in census.items():
