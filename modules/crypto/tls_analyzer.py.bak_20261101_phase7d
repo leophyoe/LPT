@@ -1,0 +1,852 @@
+"""TLS/SSL Security, Certificate, and Cipher Suite Analyzer.
+
+Pure-Python implementation assessing transport layer security:
+1. X.509 Certificate Deep Inspection (Subject, Issuer, SANs, Dates, Serial, Key, Sig Alg, Chain)
+2. Safe Protocol Version Auditing (SSLv2, SSLv3, TLS 1.0, TLS 1.1, TLS 1.2, TLS 1.3)
+3. Cryptographic Cipher Suite Strength Auditing (NULL, EXPORT, Anonymous, RC4, 3DES, CBC, Forward Secrecy)
+4. Standards-based Severity Evaluation and Remediation Guidance (NIST SP 800-52r2, PCI-DSS, RFC 6125)
+"""
+
+from __future__ import annotations
+
+import datetime
+import fnmatch
+import hashlib
+import ipaddress
+import logging
+import os
+import re
+import socket
+import ssl
+import tempfile
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import certifi
+
+from storage.models import Finding, FindingSeverity, ValidationStatus
+
+logger = logging.getLogger(__name__)
+
+# Standard ASN.1 OID mappings
+OID_MAP: Dict[str, Tuple[str, str]] = {
+    # Public Key Algorithms
+    "1.2.840.113549.1.1.1": ("RSA", "Public Key"),
+    "1.2.840.10045.2.1": ("EC", "Elliptic Curve Public Key"),
+    "1.3.101.112": ("Ed25519", "Edwards Curve 25519"),
+    "1.3.101.113": ("Ed448", "Edwards Curve 448"),
+    "1.2.840.10040.4.1": ("DSA", "Digital Signature Algorithm"),
+    # Named Elliptic Curves
+    "1.2.840.10045.3.1.7": ("prime256v1 (secp256r1)", "256 bits"),
+    "1.3.132.0.34": ("secp384r1", "384 bits"),
+    "1.3.132.0.35": ("secp521r1", "521 bits"),
+    "1.3.132.0.10": ("secp256k1", "256 bits"),
+    # Signature Algorithms
+    "1.2.840.113549.1.1.4": ("md5WithRSAEncryption", "Insecure / Broken (MD5)"),
+    "1.2.840.113549.1.1.5": ("sha1WithRSAEncryption", "Weak / Deprecated (SHA-1)"),
+    "1.2.840.113549.1.1.11": ("sha256WithRSAEncryption", "Secure (SHA-256)"),
+    "1.2.840.113549.1.1.12": ("sha384WithRSAEncryption", "Secure (SHA-384)"),
+    "1.2.840.113549.1.1.13": ("sha512WithRSAEncryption", "Secure (SHA-512)"),
+    "1.2.840.10045.4.1": ("ecdsa-with-SHA1", "Weak / Deprecated (SHA-1)"),
+    "1.2.840.10045.4.3.2": ("ecdsa-with-SHA256", "Secure (ECDSA SHA-256)"),
+    "1.2.840.10045.4.3.3": ("ecdsa-with-SHA384", "Secure (ECDSA SHA-384)"),
+    "1.2.840.10045.4.3.4": ("ecdsa-with-SHA512", "Secure (ECDSA SHA-512)"),
+    "1.3.101.112": ("ed25519", "Secure (Ed25519)"),
+}
+
+
+def _decode_der_tlv(data: bytes, offset: int = 0) -> Tuple[Optional[Tuple[int, bytes]], int]:
+    """Decodes a single ASN.1 DER Tag-Length-Value entry."""
+    if offset >= len(data):
+        return None, offset
+    tag = data[offset]
+    offset += 1
+    if offset >= len(data):
+        return None, offset
+    len_byte = data[offset]
+    offset += 1
+    if len_byte < 0x80:
+        length = len_byte
+    else:
+        num_len_bytes = len_byte & 0x7F
+        if offset + num_len_bytes > len(data):
+            return None, offset
+        length = int.from_bytes(data[offset:offset + num_len_bytes], "big")
+        offset += num_len_bytes
+    if offset + length > len(data):
+        return None, offset
+    val = data[offset:offset + length]
+    return (tag, val), offset + length
+
+
+def _parse_der_oid(bytes_val: bytes) -> str:
+    """Decodes ASN.1 Object Identifier bytes into standard dot-separated OID string."""
+    if not bytes_val:
+        return ""
+    first = bytes_val[0]
+    parts = [str(first // 40), str(first % 40)]
+    val = 0
+    for b in bytes_val[1:]:
+        val = (val << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            parts.append(str(val))
+            val = 0
+    return ".".join(parts)
+
+
+@dataclass
+class TLSCertificateInfo:
+    """Detailed structural and cryptographic metadata of an X.509 certificate."""
+    subject: Dict[str, str] = field(default_factory=dict)
+    issuer: Dict[str, str] = field(default_factory=dict)
+    serial_number: str = ""
+    not_before: Optional[str] = None
+    not_after: Optional[str] = None
+    is_expired: bool = False
+    is_not_yet_valid: bool = False
+    days_until_expiration: int = 0
+    subject_alt_names: List[str] = field(default_factory=list)
+    signature_algorithm: str = "Unknown"
+    public_key_algorithm: str = "Unknown"
+    public_key_bits: int = 0
+    is_self_signed: bool = False
+    hostname_matches: bool = False
+    validation_status: str = "unverified"  # valid, expired, not_yet_valid, self_signed, hostname_mismatch, untrusted_issuer, incomplete_chain, unavailable
+    validation_message: str = ""
+    sha256_fingerprint: str = ""
+    sha1_fingerprint: str = ""
+    raw_pem: str = ""
+
+
+@dataclass
+class TLSProtocolStatus:
+    """Protocol version handshake status."""
+    protocol_version: str  # SSLv2, SSLv3, TLSv1.0, TLSv1.1, TLSv1.2, TLSv1.3
+    status: str            # supported, rejected, unavailable, error
+    negotiated_cipher: Optional[str] = None
+    notes: str = ""
+
+
+@dataclass
+class TLSCipherGroupStatus:
+    """Cipher suite category assessment result."""
+    category: str          # null, export, anonymous, rc4, 3des, cbc, forward_secrecy
+    status: str            # supported, rejected, unavailable
+    negotiated_ciphers: List[str] = field(default_factory=list)
+    description: str = ""
+
+
+@dataclass
+class TLSAssessmentReport:
+    """Consolidated assessment report containing certificates, protocols, ciphers, and findings."""
+    target_host: str
+    port: int
+    timestamp: str
+    certificate: Optional[TLSCertificateInfo] = None
+    certificate_chain: List[TLSCertificateInfo] = field(default_factory=list)
+    protocols: List[TLSProtocolStatus] = field(default_factory=list)
+    cipher_groups: List[TLSCipherGroupStatus] = field(default_factory=list)
+    findings: List[Finding] = field(default_factory=list)
+    overall_posture: str = "SECURE"  # SECURE, NEEDS_HARDENING, INSECURE
+    evidence_payload: str = ""
+
+
+class TLSCertificateAnalyzer:
+    """Extracts, parses, and validates X.509 certificate parameters."""
+
+    @classmethod
+    def parse_der_certificate(cls, der_bytes: bytes, target_host: str) -> TLSCertificateInfo:
+        """Parses raw DER certificate bytes into a structured TLSCertificateInfo."""
+        info = TLSCertificateInfo()
+        if not der_bytes:
+            return info
+
+        info.sha256_fingerprint = hashlib.sha256(der_bytes).hexdigest().upper()
+        info.sha1_fingerprint = hashlib.sha1(der_bytes).hexdigest().upper()
+        info.raw_pem = ssl.DER_cert_to_PEM_cert(der_bytes)
+
+        # 1. Parse high-level fields using Python standard library ssl helper
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tf:
+                tf.write(info.raw_pem)
+                temp_path = tf.name
+            try:
+                decoded = ssl._ssl._test_decode_cert(temp_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+            if decoded:
+                # Subject mapping
+                sub_dict = {}
+                for rdn in decoded.get("subject", ()):
+                    for k, v in rdn:
+                        sub_dict[k] = v
+                info.subject = sub_dict
+
+                # Issuer mapping
+                iss_dict = {}
+                for rdn in decoded.get("issuer", ()):
+                    for k, v in rdn:
+                        iss_dict[k] = v
+                info.issuer = iss_dict
+
+                info.serial_number = decoded.get("serialNumber", "")
+
+                # Validity dates
+                nb_str = decoded.get("notBefore", "")
+                na_str = decoded.get("notAfter", "")
+                if nb_str:
+                    try:
+                        info.not_before = datetime.datetime.strptime(nb_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc).isoformat()
+                    except Exception:
+                        info.not_before = nb_str
+                if na_str:
+                    try:
+                        na_dt = datetime.datetime.strptime(na_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
+                        info.not_after = na_dt.isoformat()
+                        now = datetime.datetime.now(datetime.timezone.utc)
+                        info.is_expired = now > na_dt
+                        if info.not_before:
+                            try:
+                                nb_dt = datetime.datetime.fromisoformat(info.not_before)
+                                info.is_not_yet_valid = now < nb_dt
+                            except Exception:
+                                pass
+                        info.days_until_expiration = (na_dt - now).days
+                    except Exception:
+                        info.not_after = na_str
+
+                # SANs
+                sans: List[str] = []
+                for typ, val in decoded.get("subjectAltName", ()):
+                    sans.append(val)
+                info.subject_alt_names = sans
+
+        except Exception as exc:
+            logger.debug(f"ssl._test_decode_cert parsing error: {exc}")
+
+        # 2. Extract Public Key and Signature Algorithm via ASN.1 DER parser
+        cls._parse_asn1_parameters(der_bytes, info)
+
+        # 3. Check Self-Signed state
+        info.is_self_signed = bool(info.subject and info.issuer and info.subject == info.issuer)
+
+        # 4. Hostname matching (RFC 6125)
+        info.hostname_matches = cls._match_hostname(target_host, info)
+
+        return info
+
+    @classmethod
+    def _parse_asn1_parameters(cls, der_bytes: bytes, info: TLSCertificateInfo):
+        """Walks ASN.1 TLV structure to extract Public Key bit size and Signature Algorithm."""
+        try:
+            (cert_tag, cert_val), _ = _decode_der_tlv(der_bytes, 0)
+            if cert_tag != 0x30:
+                return
+
+            (tbs_tag, tbs_val), next_off = _decode_der_tlv(cert_val, 0)
+            (sig_alg_tag, sig_alg_val), _ = _decode_der_tlv(cert_val, next_off)
+
+            # Outer Signature Algorithm OID
+            (sig_oid_tag, sig_oid_bytes), _ = _decode_der_tlv(sig_alg_val, 0)
+            if sig_oid_tag == 0x06:
+                sig_oid = _parse_der_oid(sig_oid_bytes)
+                info.signature_algorithm = OID_MAP.get(sig_oid, (f"OID:{sig_oid}", ""))[0]
+
+            # TBSCertificate items
+            off = 0
+            tbs_items = []
+            while off < len(tbs_val):
+                it, off = _decode_der_tlv(tbs_val, off)
+                if it:
+                    tbs_items.append(it)
+
+            # Locate SubjectPublicKeyInfo
+            for it in tbs_items:
+                if it[0] == 0x30:
+                    c1, _ = _decode_der_tlv(it[1], 0)
+                    if c1 and c1[0] == 0x30:
+                        c1_oid, c1_next = _decode_der_tlv(c1[1], 0)
+                        if c1_oid and c1_oid[0] == 0x06:
+                            oid_str = _parse_der_oid(c1_oid[1])
+                            if oid_str in ("1.2.840.113549.1.1.1", "1.2.840.10045.2.1", "1.3.101.112", "1.3.101.113"):
+                                info.public_key_algorithm = OID_MAP.get(oid_str, ("Public Key", ""))[0]
+                                _, spki_next = _decode_der_tlv(it[1], 0)
+                                bit_str, _ = _decode_der_tlv(it[1], spki_next)
+                                if bit_str and bit_str[0] == 0x03 and len(bit_str[1]) > 1:
+                                    pub_bytes = bit_str[1][1:]  # skip unused bit count
+                                    if oid_str == "1.2.840.113549.1.1.1":  # RSA
+                                        rsa_seq, _ = _decode_der_tlv(pub_bytes, 0)
+                                        if rsa_seq and rsa_seq[0] == 0x30:
+                                            mod_int, _ = _decode_der_tlv(rsa_seq[1], 0)
+                                            if mod_int and mod_int[0] == 0x02:
+                                                modulus = int.from_bytes(mod_int[1], "big")
+                                                info.public_key_bits = modulus.bit_length()
+                                    elif oid_str == "1.2.840.10045.2.1":  # EC
+                                        curve_oid_tag, _ = _decode_der_tlv(c1[1], c1_next)
+                                        if curve_oid_tag and curve_oid_tag[0] == 0x06:
+                                            curve_oid = _parse_der_oid(curve_oid_tag[1])
+                                            curve_name, bits_str = OID_MAP.get(curve_oid, (f"EC Curve {curve_oid}", "256 bits"))
+                                            info.public_key_algorithm = f"EC ({curve_name})"
+                                            try:
+                                                info.public_key_bits = int(bits_str.split()[0])
+                                            except Exception:
+                                                info.public_key_bits = 256
+                                    elif oid_str in ("1.3.101.112", "1.3.101.113"):
+                                        info.public_key_bits = 256 if oid_str == "1.3.101.112" else 448
+                                break
+        except Exception as exc:
+            logger.debug(f"ASN.1 extraction error: {exc}")
+
+    @classmethod
+    def _match_hostname(cls, target_host: str, info: TLSCertificateInfo) -> bool:
+        """Matches target hostname or IP against Subject Alternative Names and CN."""
+        clean_target = (target_host or "").strip().lower()
+        if not clean_target:
+            return False
+
+        # Gather candidate identities
+        candidates = [san.lower() for san in info.subject_alt_names]
+        if not candidates and info.subject.get("commonName"):
+            candidates.append(info.subject["commonName"].lower())
+
+        is_ip = False
+        try:
+            ipaddress.ip_address(clean_target)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+
+        for cand in candidates:
+            if is_ip:
+                if clean_target == cand:
+                    return True
+            else:
+                # Wildcard check (RFC 6125)
+                if cand.startswith("*."):
+                    base_domain = cand[2:]
+                    if clean_target.endswith(f".{base_domain}") and clean_target.count(".") == base_domain.count(".") + 1:
+                        return True
+                elif clean_target == cand:
+                    return True
+
+        return False
+
+    @classmethod
+    def evaluate_trust_chain(
+        cls,
+        target_host: str,
+        port: int,
+        cert_info: TLSCertificateInfo,
+        timeout: float = 3.0,
+    ) -> Tuple[str, str]:
+        """Tests TLS certificate trust chain against system CA bundle with strict status categorization."""
+        # 1. Structural checks take precedence
+        if cert_info.is_expired:
+            return "expired", f"Certificate expired on {cert_info.not_after}."
+        if cert_info.is_not_yet_valid:
+            return "not_yet_valid", f"Certificate is not valid until {cert_info.not_before}."
+        if not cert_info.hostname_matches:
+            return "hostname_mismatch", f"Hostname mismatch: Certificate identities {cert_info.subject_alt_names or [cert_info.subject.get('commonName')]} do not match target '{target_host}'."
+        if cert_info.is_self_signed:
+            return "self_signed", f"Self-signed certificate ({cert_info.subject.get('commonName')}); not issued by a recognized root CA."
+
+        # 2. Attempt trusted handshake
+        try:
+            ca_bundle = certifi.where()
+            ctx = ssl.create_default_context(cafile=ca_bundle)
+            ctx.check_hostname = True
+            with socket.create_connection((target_host, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=target_host):
+                    return "valid", "Certificate is valid and trusted by public CA bundle."
+        except ssl.SSLCertVerificationError as v_err:
+            msg = str(v_err).lower()
+            if "self signed certificate" in msg or "self-signed" in msg or cert_info.is_self_signed:
+                return "self_signed", "Self-signed certificate; not issued by a recognized root CA."
+            if "hostname" in msg or "doesn't match" in msg:
+                return "hostname_mismatch", f"Hostname mismatch: {v_err.verify_message or str(v_err)}"
+            if "certificate has expired" in msg:
+                return "expired", "Certificate has expired."
+            if "unable to get local issuer certificate" in msg or "unable to verify the first certificate" in msg:
+                return "incomplete_chain", "Incomplete certificate chain or untrusted intermediate authority."
+            return "untrusted_issuer", f"Untrusted certificate authority: {v_err.verify_message or str(v_err)}"
+        except (ssl.SSLError, socket.error) as sock_err:
+            if cert_info.is_self_signed:
+                return "self_signed", f"Self-signed certificate: {sock_err}"
+            if cert_info.issuer and cert_info.issuer != cert_info.subject:
+                return "untrusted_issuer", f"Untrusted certificate authority or offline target: {sock_err}"
+            return "unavailable", f"Trust validation connection failed: {sock_err}"
+
+        return "unverified", "Validation status pending."
+
+
+class TLSProtocolAnalyzer:
+    """Safely audits supported TLS protocol versions without denial of service or fuzzing."""
+
+    @classmethod
+    def audit_protocols(cls, host: str, port: int, timeout: float = 2.5) -> List[TLSProtocolStatus]:
+        """Probes support for SSLv2, SSLv3, TLS 1.0, TLS 1.1, TLS 1.2, and TLS 1.3."""
+        results: List[TLSProtocolStatus] = []
+
+        # 1. Legacy SSLv2 & SSLv3
+        results.append(cls._probe_ssl_legacy("SSLv2", getattr(ssl, "HAS_SSLv2", False)))
+        results.append(cls._probe_ssl_legacy("SSLv3", getattr(ssl, "HAS_SSLv3", False)))
+
+        # 2. TLS Protocols
+        tls_versions = [
+            ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+            ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+            ("TLSv1.2", getattr(ssl.TLSVersion, "TLSv1_2", None)),
+            ("TLSv1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
+        ]
+
+        for ver_name, ver_enum in tls_versions:
+            if ver_enum is None:
+                results.append(TLSProtocolStatus(
+                    protocol_version=ver_name,
+                    status="unavailable",
+                    notes="Client OpenSSL does not support this protocol version."
+                ))
+                continue
+
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.minimum_version = ver_enum
+                ctx.maximum_version = ver_enum
+
+                with socket.create_connection((host, port), timeout=timeout) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        neg_ver = ssock.version()
+                        neg_cipher = ssock.cipher()
+                        cipher_name = neg_cipher[0] if neg_cipher else "Unknown"
+                        results.append(TLSProtocolStatus(
+                            protocol_version=ver_name,
+                            status="supported",
+                            negotiated_cipher=cipher_name,
+                            notes=f"Successfully negotiated {neg_ver} using {cipher_name}"
+                        ))
+            except ssl.SSLError as ssl_err:
+                err_text = str(ssl_err).lower()
+                if "alert" in err_text or "protocol_version" in err_text or "handshake_failure" in err_text or "wrong version" in err_text or "unsupported protocol" in err_text:
+                    results.append(TLSProtocolStatus(
+                        protocol_version=ver_name,
+                        status="rejected",
+                        notes=f"Server rejected {ver_name} handshake (TLS Alert)."
+                    ))
+                else:
+                    results.append(TLSProtocolStatus(
+                        protocol_version=ver_name,
+                        status="rejected",
+                        notes=f"Handshake failed: {ssl_err}"
+                    ))
+            except (socket.timeout, ConnectionRefusedError, OSError) as net_err:
+                results.append(TLSProtocolStatus(
+                    protocol_version=ver_name,
+                    status="error",
+                    notes=f"Network error connecting to {host}:{port}: {net_err}"
+                ))
+
+        return results
+
+    @classmethod
+    def _probe_ssl_legacy(cls, ver_name: str, client_supported: bool) -> TLSProtocolStatus:
+        """Categorizes legacy SSLv2/SSLv3 support on modern client runtimes."""
+        if not client_supported:
+            return TLSProtocolStatus(
+                protocol_version=ver_name,
+                status="unavailable",
+                notes=f"{ver_name} permanently disabled / removed in modern host OpenSSL."
+            )
+        return TLSProtocolStatus(
+            protocol_version=ver_name,
+            status="rejected",
+            notes=f"{ver_name} disabled by default."
+        )
+
+
+class TLSCipherAnalyzer:
+    """Audits cipher suite configurations across security classes."""
+
+    # Cipher filter groups matching OpenSSL syntax
+    CIPHER_GROUPS = [
+        ("null", "NULL / Plaintext Ciphers", "eNULL:NULL:@SECLEVEL=0", FindingSeverity.CRITICAL),
+        ("export", "Export-grade Weak Ciphers", "EXPORT:EXP:@SECLEVEL=0", FindingSeverity.HIGH),
+        ("anonymous", "Anonymous Authentication (aNULL)", "aNULL:ADH:AECDH:@SECLEVEL=0", FindingSeverity.HIGH),
+        ("rc4", "Obsolete RC4 Stream Ciphers", "RC4:@SECLEVEL=0", FindingSeverity.HIGH),
+        ("3des", "Deprecated 3DES / DES Ciphers", "3DES:DES:@SECLEVEL=0", FindingSeverity.HIGH),
+        ("cbc", "CBC-Mode Ciphers (Vulnerable in TLS 1.0/1.1)", "CBC:@SECLEVEL=0", FindingSeverity.MEDIUM),
+        ("forward_secrecy", "Modern Ephemeral Forward Secrecy", "ECDHE:DHE", FindingSeverity.INFORMATIONAL),
+    ]
+
+    @classmethod
+    def audit_ciphers(cls, host: str, port: int, timeout: float = 2.5) -> List[TLSCipherGroupStatus]:
+        """Probes target against distinct cipher suite categories."""
+        results: List[TLSCipherGroupStatus] = []
+
+        for cat_id, cat_name, cipher_spec, _ in cls.CIPHER_GROUPS:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            try:
+                ctx.set_ciphers(cipher_spec)
+            except ssl.SSLError:
+                results.append(TLSCipherGroupStatus(
+                    category=cat_id,
+                    status="unavailable",
+                    description=f"{cat_name}: Client OpenSSL lacks support for cipher specification."
+                ))
+                continue
+
+            try:
+                with socket.create_connection((host, port), timeout=timeout) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        cipher_info = ssock.cipher()
+                        c_name = cipher_info[0] if cipher_info else "Unknown"
+                        results.append(TLSCipherGroupStatus(
+                            category=cat_id,
+                            status="supported",
+                            negotiated_ciphers=[c_name],
+                            description=f"Target accepted cipher suite: {c_name}"
+                        ))
+            except ssl.SSLError:
+                results.append(TLSCipherGroupStatus(
+                    category=cat_id,
+                    status="rejected",
+                    description=f"Target rejected all ciphers in group ({cat_name})."
+                ))
+            except Exception as exc:
+                results.append(TLSCipherGroupStatus(
+                    category=cat_id,
+                    status="unavailable",
+                    description=f"Connection attempt error: {exc}"
+                ))
+
+        return results
+
+
+class TLSAssessmentEngine:
+    """Coordinates certificate, protocol, and cipher suite evaluation into findings."""
+
+    @classmethod
+    def assess_target(
+        cls,
+        project_id: int,
+        target_host: str,
+        port: int = 443,
+        timeout: float = 3.0,
+    ) -> TLSAssessmentReport:
+        """Executes full TLS security assessment and generates normalized findings."""
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        report = TLSAssessmentReport(target_host=target_host, port=port, timestamp=now_iso)
+
+        # 1. Fetch Leaf and Chain Certificates
+        try:
+            probe_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            probe_ctx.check_hostname = False
+            probe_ctx.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection((target_host, port), timeout=timeout) as sock:
+                with probe_ctx.wrap_socket(sock, server_hostname=target_host) as ssock:
+                    der_bytes = ssock.getpeercert(binary_form=True)
+                    if der_bytes:
+                        cert_info = TLSCertificateAnalyzer.parse_der_certificate(der_bytes, target_host)
+                        # Evaluate Trust Chain
+                        val_status, val_msg = TLSCertificateAnalyzer.evaluate_trust_chain(
+                            target_host, port, cert_info, timeout=timeout
+                        )
+                        cert_info.validation_status = val_status
+                        cert_info.validation_message = val_msg
+                        report.certificate = cert_info
+        except Exception as exc:
+            logger.warning(f"Failed to fetch certificate from {target_host}:{port} - {exc}")
+
+        # 2. Audit Protocols
+        report.protocols = TLSProtocolAnalyzer.audit_protocols(target_host, port, timeout=timeout)
+
+        # 3. Audit Ciphers
+        report.cipher_groups = TLSCipherAnalyzer.audit_ciphers(target_host, port, timeout=timeout)
+
+        # 4. Generate Security Findings
+        report.findings = cls._generate_findings(project_id, target_host, port, report)
+
+        # 5. Determine Overall Posture
+        severities = {f.severity for f in report.findings}
+        if FindingSeverity.CRITICAL in severities or FindingSeverity.HIGH in severities:
+            report.overall_posture = "INSECURE"
+        elif FindingSeverity.MEDIUM in severities:
+            report.overall_posture = "NEEDS_HARDENING"
+        else:
+            report.overall_posture = "SECURE"
+
+        return report
+
+    @classmethod
+    def _generate_findings(
+        cls,
+        project_id: int,
+        target_host: str,
+        port: int,
+        report: TLSAssessmentReport,
+    ) -> List[Finding]:
+        """Translates identified weaknesses into actionable, standards-aligned Finding objects."""
+        findings: List[Finding] = []
+        target_asset = f"{target_host}:{port}"
+        cert = report.certificate
+
+        # Certificate Findings
+        if cert:
+            if cert.is_expired:
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Expired TLS / SSL Certificate",
+                    description=(
+                        f"The TLS certificate on {target_asset} expired on {cert.not_after}. "
+                        "Browsers, API clients, and automated systems will reject connections with security warnings, "
+                        "causing denial of service and exposing users to man-in-the-middle attacks."
+                    ),
+                    severity=FindingSeverity.HIGH,
+                    cvss_score=7.5,
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Target: {target_asset}\nNot After: {cert.not_after}\nIssuer: {cert.issuer}",
+                    remediation="Renew and deploy a valid certificate from an authorized public or internal Certificate Authority.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            if cert.is_not_yet_valid:
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Inactive / Premature TLS Certificate",
+                    description=f"The certificate is not valid until {cert.not_before}. Clients will reject connections.",
+                    severity=FindingSeverity.MEDIUM,
+                    cvss_score=5.3,
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Target: {target_asset}\nNot Before: {cert.not_before}",
+                    remediation="Synchronize server clocks via NTP and ensure certificate issue dates match valid timeframe.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            if not cert.hostname_matches:
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="TLS Certificate Hostname Mismatch (RFC 6125)",
+                    description=(
+                        f"The Common Name ({cert.subject.get('commonName')}) and Subject Alternative Names "
+                        f"({', '.join(cert.subject_alt_names) or 'None'}) do not match the accessed hostname '{target_host}'. "
+                        "Clients connecting to this host will trigger fatal hostname mismatch warnings."
+                    ),
+                    severity=FindingSeverity.MEDIUM,
+                    cvss_score=6.5,
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Accessed Hostname: {target_host}\nCertificate CN: {cert.subject.get('commonName')}\nSANs: {cert.subject_alt_names}",
+                    remediation="Reissue the certificate including all target hostnames and FQDNs in the Subject Alternative Name (SAN) extension.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            if cert.is_self_signed:
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Self-Signed TLS Certificate in Production",
+                    description=(
+                        f"The TLS certificate for {target_asset} is self-signed (Subject == Issuer: {cert.subject.get('commonName')}). "
+                        "Self-signed certificates cannot be cryptographically verified against a public trust anchor, "
+                        "enabling active eavesdropping and MitM adversary interception."
+                    ),
+                    severity=FindingSeverity.MEDIUM,
+                    cvss_score=6.5,
+                    cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:L/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Subject: {cert.subject}\nIssuer: {cert.issuer}\nSHA256 Fingerprint: {cert.sha256_fingerprint}",
+                    remediation="Replace self-signed certificates with a certificate issued by a trusted public CA (e.g. Let's Encrypt) or corporate PKI.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            if cert.validation_status in ("untrusted_issuer", "incomplete_chain"):
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Untrusted TLS Certificate Authority or Incomplete Chain",
+                    description=(
+                        f"The certificate trust chain on {target_asset} could not be validated: {cert.validation_message}. "
+                        "The server may be omitting intermediate CA certificates, preventing clients from building the trust path to a root anchor."
+                    ),
+                    severity=FindingSeverity.MEDIUM,
+                    cvss_score=6.5,
+                    cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:L/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Validation Status: {cert.validation_status}\nMessage: {cert.validation_message}\nIssuer: {cert.issuer}",
+                    remediation="Bundle all intermediate CA certificates into the fullchain.pem file on the web/application server.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            # Public Key Size
+            if "RSA" in cert.public_key_algorithm and cert.public_key_bits > 0 and cert.public_key_bits < 2048:
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Insufficient RSA Key Length (< 2048 bits)",
+                    description=(
+                        f"The certificate uses an RSA key size of {cert.public_key_bits} bits. "
+                        "Keys shorter than 2048 bits are vulnerable to factorization by modern compute resources and violate NIST SP 800-52r2."
+                    ),
+                    severity=FindingSeverity.HIGH,
+                    cvss_score=7.5,
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Public Key Algorithm: {cert.public_key_algorithm}\nKey Size: {cert.public_key_bits} bits",
+                    remediation="Regenerate the RSA private key with a length of at least 2048 bits (or migrate to ECDSA P-256).",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+            # Signature Algorithm
+            if any(weak in cert.signature_algorithm.lower() for weak in ("md5", "sha1")):
+                findings.append(Finding(
+                    project_id=project_id,
+                    title="Weak Certificate Signature Algorithm (MD5 / SHA-1)",
+                    description=(
+                        f"The certificate is signed using a collision-vulnerable hash algorithm: {cert.signature_algorithm}. "
+                        "Pre-image and collision attacks permit adversaries to forge rogue certificates."
+                    ),
+                    severity=FindingSeverity.HIGH,
+                    cvss_score=7.4,
+                    cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
+                    affected_asset=target_asset,
+                    affected_port_service=f"{port}/tcp (tls)",
+                    reproduction_steps=f"Signature Algorithm: {cert.signature_algorithm}",
+                    remediation="Reissue certificate using SHA-256, SHA-384, or SHA-512 with RSA or ECDSA.",
+                    source_tool="tls_analyzer",
+                    validation_status=ValidationStatus.CONFIRMED,
+                ))
+
+        # Protocol Findings
+        deprecated_supported = [
+            p.protocol_version for p in report.protocols
+            if p.status == "supported" and p.protocol_version in ("TLSv1.0", "TLSv1.1")
+        ]
+        if deprecated_supported:
+            findings.append(Finding(
+                project_id=project_id,
+                title="Deprecated TLS 1.0 / 1.1 Protocol Supported (CWE-326)",
+                description=(
+                    f"The service on {target_asset} negotiates connections using obsolete protocols: "
+                    f"{', '.join(deprecated_supported)}. These versions lack modern cipher suites, are vulnerable to "
+                    "BEAST and POODLE downgrade attacks, and violate NIST SP 800-52r2 and PCI-DSS 3.1+ mandates."
+                ),
+                severity=FindingSeverity.HIGH,
+                cvss_score=7.4,
+                cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
+                affected_asset=target_asset,
+                affected_port_service=f"{port}/tcp (tls)",
+                reproduction_steps=f"Accepted Obsolete Protocols: {deprecated_supported}",
+                remediation="Disable TLS 1.0 and TLS 1.1 in the server configuration; enforce TLS 1.2 and TLS 1.3 only.",
+                source_tool="tls_analyzer",
+                validation_status=ValidationStatus.CONFIRMED,
+            ))
+
+        legacy_supported = [
+            p.protocol_version for p in report.protocols
+            if p.status == "supported" and p.protocol_version in ("SSLv2", "SSLv3")
+        ]
+        if legacy_supported:
+            findings.append(Finding(
+                project_id=project_id,
+                title="Obsolete SSLv2 / SSLv3 Protocol Supported (CWE-326)",
+                description=f"Target negotiates {', '.join(legacy_supported)}, subject to critical cryptographic breaks (DROWN, POODLE).",
+                severity=FindingSeverity.CRITICAL,
+                cvss_score=9.8,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                affected_asset=target_asset,
+                affected_port_service=f"{port}/tcp (tls)",
+                reproduction_steps=f"Accepted Protocols: {legacy_supported}",
+                remediation="Immediately eliminate SSLv2 and SSLv3 from server configuration.",
+                source_tool="tls_analyzer",
+                validation_status=ValidationStatus.CONFIRMED,
+            ))
+
+        # Cipher Suite Findings
+        for cg in report.cipher_groups:
+            if cg.status == "supported":
+                if cg.category == "null":
+                    findings.append(Finding(
+                        project_id=project_id,
+                        title="Plaintext / NULL Encryption Cipher Negotiated (CWE-311)",
+                        description=f"Server negotiates unencrypted NULL cipher suites ({', '.join(cg.negotiated_ciphers)}), exposing all traffic in plaintext.",
+                        severity=FindingSeverity.CRITICAL,
+                        cvss_score=9.1,
+                        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+                        affected_asset=target_asset,
+                        affected_port_service=f"{port}/tcp (tls)",
+                        reproduction_steps=f"Negotiated NULL Ciphers: {cg.negotiated_ciphers}",
+                        remediation="Disable all NULL and eNULL cipher suites in server configuration.",
+                        source_tool="tls_analyzer",
+                        validation_status=ValidationStatus.CONFIRMED,
+                    ))
+                elif cg.category in ("export", "rc4", "3des"):
+                    findings.append(Finding(
+                        project_id=project_id,
+                        title=f"Weak / Insecure Cipher Suite Negotiated ({cg.category.upper()})",
+                        description=f"Target negotiates weak {cg.category.upper()} ciphers ({', '.join(cg.negotiated_ciphers)}), vulnerable to SWEET32 / cryptanalytic breaks.",
+                        severity=FindingSeverity.HIGH,
+                        cvss_score=7.5,
+                        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N",
+                        affected_asset=target_asset,
+                        affected_port_service=f"{port}/tcp (tls)",
+                        reproduction_steps=f"Category: {cg.category}\nCiphers: {cg.negotiated_ciphers}",
+                        remediation="Remove 3DES, RC4, and EXPORT cipher suites; enforce AES-GCM and ChaCha20-Poly1305.",
+                        source_tool="tls_analyzer",
+                        validation_status=ValidationStatus.CONFIRMED,
+                    ))
+                elif cg.category == "anonymous":
+                    findings.append(Finding(
+                        project_id=project_id,
+                        title="Anonymous TLS Cipher Suites Supported (aNULL / ADH)",
+                        description="Target accepts anonymous unauthenticated ciphers, enabling invisible active MitM interception.",
+                        severity=FindingSeverity.HIGH,
+                        cvss_score=7.5,
+                        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+                        affected_asset=target_asset,
+                        affected_port_service=f"{port}/tcp (tls)",
+                        reproduction_steps=f"Accepted Anonymous Ciphers: {cg.negotiated_ciphers}",
+                        remediation="Disable anonymous cipher suites and require authenticated key exchanges.",
+                        source_tool="tls_analyzer",
+                        validation_status=ValidationStatus.CONFIRMED,
+                    ))
+
+        # Check Forward Secrecy Support
+        fs_group = next((cg for cg in report.cipher_groups if cg.category == "forward_secrecy"), None)
+        if fs_group and fs_group.status == "rejected":
+            findings.append(Finding(
+                project_id=project_id,
+                title="Lack of Ephemeral Forward Secrecy (PFS)",
+                description=(
+                    "Target does not support or prioritize Ephemeral Diffie-Hellman key exchanges (ECDHE or DHE). "
+                    "If the server private key is compromised in the future, past recorded encrypted traffic can be retroactively decrypted."
+                ),
+                severity=FindingSeverity.LOW,
+                cvss_score=3.7,
+                cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+                affected_asset=target_asset,
+                affected_port_service=f"{port}/tcp (tls)",
+                reproduction_steps="Server rejected ECDHE/DHE forward-secrecy cipher suites.",
+                remediation="Configure and prioritize ECDHE key exchange cipher suites (e.g. ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256).",
+                source_tool="tls_analyzer",
+                validation_status=ValidationStatus.CONFIRMED,
+            ))
+
+        return findings

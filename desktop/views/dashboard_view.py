@@ -1,0 +1,1241 @@
+"""Executive Security Analytics & Attack Surface Dashboard for CyberSecuritySuite.
+
+Enterprise cybersecurity console styling:
+- Dark Navy foundation (#0B1120 / #101827 / #151F30)
+- Primary Blue actions & active navigation (#2680FF)
+- Deep Navy accents (#00148F)
+- Restrained Red (#EF4444) for critical vulnerabilities & exposure
+- Amber (#FFBF00) for warnings & pending validation
+- Success Green (#22C55E) for verified security posture
+- Unified threat posture gauges, telemetry distributions, compromise matrix table,
+  and real-time execution feeds powered strictly by persisted SQLite models.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QProgressBar,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.preflight import PreflightChecker, VerificationCheckStatus
+from core.strix_triage import StrixTriageEngine
+from desktop.dialogs.strix_triage_dialog import StrixTriageDialog
+from desktop.theme import CPENTTheme, SEVERITY_QCOLORS, ThemeManager, get_badge_qss
+from storage.db import Database
+from storage.models import (
+    AssetNode,
+    Finding,
+    FindingSeverity,
+    Project,
+    TargetScope,
+    ToolExecution,
+    ValidationStatus,
+)
+
+
+class ClickableMetricCard(QFrame):
+    """Interactive metric card with subtle hover highlight and native navigation."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("metricCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._pressed = False
+        self.value_label: Optional[QLabel] = None
+        self.hint_label: Optional[QLabel] = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = self.rect().contains(event.position().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            should_click = self._pressed and self.rect().contains(event.position().toPoint())
+            self._pressed = False
+            if should_click:
+                self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class RiskGauge(QWidget):
+    """Circular severity-weighted exposure gauge drawn with antialiased Qt primitives."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.score = 0
+        self.level = "Not assessed"
+        self.grade = "—"
+        self.setMinimumSize(130, 130)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_risk(self, score: int, level: str, grade: str = ""):
+        self.score = max(0, min(100, int(score)))
+        self.level = level
+        if grade:
+            self.grade = grade
+        else:
+            if self.score >= 80:
+                self.grade = "F"
+            elif self.score >= 60:
+                self.grade = "D"
+            elif self.score >= 40:
+                self.grade = "C"
+            elif self.score >= 20:
+                self.grade = "B"
+            else:
+                self.grade = "A" if self.score > 0 else "—"
+        self.update()
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        side = min(self.width(), self.height()) - 28
+        rect = self.rect().adjusted(
+            (self.width() - side) // 2,
+            (self.height() - side) // 2,
+            -(self.width() - side) // 2,
+            -(self.height() - side) // 2,
+        )
+
+        # Track background ring
+        painter.setPen(QPen(QColor(CPENTTheme.BORDER), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(rect, 0, 360 * 16)
+
+        # Progress Arc based on score
+        if self.score >= 70:
+            arc_color = QColor(CPENTTheme.ERROR_RED)  # Red
+        elif self.score >= 40:
+            arc_color = QColor("#F97316")  # Orange
+        elif self.score >= 20:
+            arc_color = QColor(CPENTTheme.AMBER_ACCENT)  # Yellow
+        elif self.score > 0:
+            arc_color = QColor(CPENTTheme.SUCCESS_GREEN)  # Green
+        else:
+            arc_color = QColor(CPENTTheme.MUTED_TEXT)  # Muted
+
+        if self.score > 0:
+            painter.setPen(QPen(arc_color, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            span_angle = -int(360 * (self.score / 100)) * 16
+            painter.drawArc(rect, 90 * 16, span_angle)
+
+        # Inner text: Grade & Score
+        painter.setPen(QColor(CPENTTheme.PRIMARY_TEXT))
+        grade_font = QFont()
+        grade_font.setPointSize(28)
+        grade_font.setBold(True)
+        painter.setFont(grade_font)
+
+        grade_rect = rect.adjusted(0, -18, 0, -18)
+        painter.drawText(grade_rect, Qt.AlignmentFlag.AlignCenter, self.grade)
+
+        sub_font = QFont()
+        sub_font.setPointSize(10)
+        sub_font.setBold(False)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(CPENTTheme.SECONDARY_TEXT))
+        score_rect = rect.adjusted(0, 26, 0, 26)
+        painter.drawText(score_rect, Qt.AlignmentFlag.AlignCenter, f"{self.score}/100\n{self.level}")
+        painter.end()
+
+
+class DashboardView(QWidget):
+    """Executive Security Analytics & Attack Surface Dashboard."""
+
+    navigate_requested = Signal(int)
+    project_selected = Signal(object)
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.active_project: Optional[Project] = None
+        self.triage_engine = StrixTriageEngine()
+        self.findings_cache: List[Finding] = []
+        self.scopes_cache: List[TargetScope] = []
+        self.executions_cache: List[ToolExecution] = []
+        self.setObjectName("dashboardView")
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Scroll area container for fluid responsiveness
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        container = QWidget()
+        container.setObjectName("dashboardContainer")
+        container.setStyleSheet("QWidget#dashboardContainer { background-color: #0b0f19; }")
+        root = QVBoxLayout(container)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(14)
+
+        # 1. Header Toolbar & Project Context
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+        self.title = QLabel("Executive Security Analytics")
+        self.title.setObjectName("dashTitle")
+        self.title.setStyleSheet("font-size: 18px; font-weight: 700; color: #f8fafc;")
+        self.subtitle = QLabel(
+            "Continuous Attack Surface Management · Compromise Paths · Real-time Vulnerability Telemetry"
+        )
+        self.subtitle.setObjectName("dashSubtitle")
+        self.subtitle.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        title_box.addWidget(self.title)
+        title_box.addWidget(self.subtitle)
+        header.addLayout(title_box)
+        header.addStretch()
+
+        # Scope selector combo
+        self.project_combo = QComboBox()
+        self.project_combo.setMinimumWidth(180)
+        self.project_combo.currentIndexChanged.connect(self._on_combo_project_changed)
+        header.addWidget(self.project_combo)
+
+        # Project badge label for backwards compatibility with tests
+        self.project_badge = QLabel("No project selected")
+        self.project_badge.setObjectName("projectBadge")
+        header.addWidget(self.project_badge)
+
+        self.btn_quick_scan = QPushButton("⚡  Scan Pipeline")
+        self.btn_quick_scan.setProperty("class", "action-primary")
+        self.btn_quick_scan.setToolTip("Navigate to Web & API Assessment Scanner (Pipeline)")
+        self.btn_quick_scan.clicked.connect(lambda: self.navigate_requested.emit(3))
+        header.addWidget(self.btn_quick_scan)
+
+        self.refresh_btn = QPushButton("↻  Refresh")
+        self.refresh_btn.setProperty("class", "action-secondary")
+        self.refresh_btn.setToolTip("Refresh all telemetry metrics and database caches")
+        self.refresh_btn.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_btn)
+        root.addLayout(header)
+
+        # 2. Top Metrics Row (5 Interactive Clickable Cards — Behind24 Style)
+        metrics_layout = QHBoxLayout()
+        metrics_layout.setSpacing(10)
+
+        self.card_threat = self._metric_card(
+            "🛡️", "Threat Level", "LOW RISK", "Active exposure index",
+            tooltip="Click to view all prioritized findings in the Evidence Repository",
+            bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
+            icon_tint="rgba(56, 189, 248, 0.12)", icon_border="#38bdf8",
+        )
+        self.metric_assets = self._metric_card(
+            "🛰️", "Attack Surface", "0", "0 Domains · 0 IPs",
+            tooltip="Click to manage authorized targets in Project Management",
+            bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
+            icon_tint="rgba(6, 182, 212, 0.12)", icon_border="#06b6d4",
+        )
+        self.metric_findings = self._metric_card(
+            "🚨", "Open Risks", "0", "0 Crit · 0 High",
+            tooltip="Click to view open security findings and evidence",
+            bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
+            icon_tint="rgba(239, 68, 68, 0.12)", icon_border="#ef4444",
+        )
+        self.card_arsenal = self._metric_card(
+            "⚙️", "Tool Runs", "0", "Saved terminal and scanner runs",
+            tooltip="Click to open Tools & Integrations",
+            bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
+            icon_tint="rgba(37, 99, 235, 0.12)", icon_border="#2563eb",
+        )
+        self.card_remediation = self._metric_card(
+            "⏱", "Remediation Rate", "—", "No remediation data yet",
+            tooltip="Click to audit remediated and open findings",
+            bg_dark="#111827", border_dark="#1e293b", text_dark="#f8fafc",
+            icon_tint="rgba(16, 185, 129, 0.12)", icon_border="#10b981",
+        )
+
+        # Wire clicks to real navigation destinations
+        self.card_threat.clicked.connect(lambda: self.navigate_requested.emit(4))
+        self.metric_assets.clicked.connect(lambda: self.navigate_requested.emit(1))
+        self.metric_findings.clicked.connect(lambda: self.navigate_requested.emit(4))
+        self.card_arsenal.clicked.connect(lambda: self.navigate_requested.emit(5))
+        self.card_remediation.clicked.connect(lambda: self.navigate_requested.emit(4))
+
+        # Backwards compatible aliases for existing code/tests
+        self.metric_domains = self._metric_card("◎", "Domains", "0", "In scope")
+        self.metric_ips = self._metric_card("◈", "IPs", "0", "In scope")
+        self.metric_domains.hide()
+        self.metric_ips.hide()
+
+        for card in (self.card_threat, self.metric_assets, self.metric_findings, self.card_arsenal, self.card_remediation):
+            metrics_layout.addWidget(card, 1)
+        root.addLayout(metrics_layout)
+
+        # 3. Visual Telemetry Row (3 Panels)
+        visual_row = QHBoxLayout()
+        visual_row.setSpacing(14)
+
+        # 3A. Severity-weighted Exposure Risk Score Gauge
+        gauge_panel = self._panel(
+            "Exposure Risk Score",
+            "Severity-weighted heuristic from recorded open findings · higher means greater known exposure",
+        )
+        gauge_body = QHBoxLayout()
+        self.gauge = RiskGauge()
+        gauge_body.addWidget(self.gauge, 1)
+
+        sev_vbox = QVBoxLayout()
+        sev_vbox.setSpacing(8)
+        self.severity_labels: Dict[str, QLabel] = {}
+        for key, color, name in (
+            ("critical", CPENTTheme.ERROR_RED, "Critical"),
+            ("high", "#F97316", "High"),
+            ("medium", CPENTTheme.AMBER_ACCENT, "Medium"),
+            ("low", CPENTTheme.INFO_CYAN, "Low / Info"),
+        ):
+            row = QHBoxLayout()
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {color}; font-size: 15px; margin-right: 4px;")
+            lbl = QLabel(f"{name}  0")
+            lbl.setObjectName("severityLabel")
+            row.addWidget(dot)
+            row.addWidget(lbl)
+            row.addStretch()
+            sev_vbox.addLayout(row)
+            self.severity_labels[key] = lbl
+        sev_vbox.addStretch()
+        gauge_body.addLayout(sev_vbox, 1)
+        gauge_panel.layout().addLayout(gauge_body)
+        visual_row.addWidget(gauge_panel, 1)
+
+        # 3B. Attack Paths by Impact Type
+        impact_panel = self._panel("Attack Paths by Impact Type", "Simulated threat pathways & compromise vectors")
+        self.impact_bars_layout = QVBoxLayout()
+        self.impact_bars_layout.setSpacing(8)
+        self.impact_bars: Dict[str, tuple[QProgressBar, QLabel]] = {}
+        for key, title, color in (
+            ("domain", "Domain & Perimeter Compromise", CPENTTheme.ERROR_RED),
+            ("infra", "Critical Infrastructure Exposure", CPENTTheme.RED_ACCENT),
+            ("host", "Host Compromise & Privilege Escalation", "#F97316"),
+            ("data", "Data Exfiltration & Credentials", CPENTTheme.AMBER_ACCENT),
+            ("api", "Unauthenticated API Access", CPENTTheme.PRIMARY_BLUE),
+        ):
+            bar, count_lbl = self._create_distribution_row(title, color, self.impact_bars_layout)
+            self.impact_bars[key] = (bar, count_lbl)
+        impact_panel.layout().addLayout(self.impact_bars_layout)
+        visual_row.addWidget(impact_panel, 1)
+
+        # 3C. Attack Paths by Weakness / OWASP Top 10
+        weakness_panel = self._panel("Attack Paths by Weakness", "OWASP Top 10 vulnerability classification")
+        self.weakness_bars_layout = QVBoxLayout()
+        self.weakness_bars_layout.setSpacing(8)
+        self.weakness_bars: Dict[str, tuple[QProgressBar, QLabel]] = {}
+        for key, title, color in (
+            ("injection", "A03:2021 - Injection (SQLi / Command)", CPENTTheme.ERROR_RED),
+            ("access", "A01:2021 - Broken Access Control & IDOR", "#F97316"),
+            ("config", "A05:2021 - Security Misconfiguration", CPENTTheme.AMBER_ACCENT),
+            ("auth", "A07:2021 - Auth Failures / Weak JWT", CPENTTheme.PRIMARY_BLUE),
+            ("crypto", "A02:2021 - Cryptographic & Secrets", CPENTTheme.INFO_CYAN),
+        ):
+            bar, count_lbl = self._create_distribution_row(title, color, self.weakness_bars_layout)
+            self.weakness_bars[key] = (bar, count_lbl)
+        weakness_panel.layout().addLayout(self.weakness_bars_layout)
+        visual_row.addWidget(weakness_panel, 1)
+
+        root.addLayout(visual_row)
+
+        # 4. Main Body: Compromise Matrix Table & Telemetry Feeds
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet(f"QSplitter::handle {{ background-color: {CPENTTheme.BORDER}; width: 2px; }}")
+
+        # 4A. Left: Highest Risk Vulnerabilities & Compromise Matrix
+        findings_panel = self._panel("Highest Risk Vulnerabilities & Compromise Matrix", "Prioritized findings requiring remediation")
+        findings_layout = findings_panel.layout()
+
+        # Filter bar
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍  Filter vulnerabilities by title, asset, weakness...")
+        self.search_input.textChanged.connect(self._filter_table)
+        filter_row.addWidget(self.search_input, 2)
+
+        self.sev_filter_combo = QComboBox()
+        self.sev_filter_combo.addItems(["All Severities", "Critical", "High", "Medium", "Low"])
+        self.sev_filter_combo.currentIndexChanged.connect(self._filter_table)
+        filter_row.addWidget(self.sev_filter_combo, 1)
+
+        self.status_filter_combo = QComboBox()
+        self.status_filter_combo.addItems(["Open Vulnerabilities", "All Statuses", "Confirmed", "Unverified", "Remediated", "False Positive"])
+        self.status_filter_combo.currentIndexChanged.connect(self._filter_table)
+        filter_row.addWidget(self.status_filter_combo, 1)
+        findings_layout.addLayout(filter_row)
+
+        # Findings Table
+        self.findings_table = QTableWidget()
+        self.findings_table.setColumnCount(5)
+        self.findings_table.setHorizontalHeaderLabels([
+            "Severity / CVSS", "Vulnerability & Weakness", "Target Asset", "Status", "Action"
+        ])
+        header_view = self.findings_table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.findings_table.verticalHeader().setVisible(False)
+        self.findings_table.verticalHeader().setDefaultSectionSize(38)
+        self.findings_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.findings_table.setAlternatingRowColors(True)
+        self.findings_table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        self.findings_table.setMinimumHeight(240)
+        findings_layout.addWidget(self.findings_table)
+
+        # Backwards compatible findings_list layout for existing tests (hidden container prevents visual collision)
+        self.findings_list = QVBoxLayout()
+        self._hidden_findings_container = QWidget()
+        self._hidden_findings_container.setLayout(self.findings_list)
+        self._hidden_findings_container.hide()
+
+        btn_view_findings = QPushButton("Open Evidence Repository  →")
+        btn_view_findings.setProperty("class", "link-button")
+        btn_view_findings.clicked.connect(lambda: self.navigate_requested.emit(4))
+        findings_layout.addWidget(btn_view_findings, alignment=Qt.AlignmentFlag.AlignRight)
+        splitter.addWidget(findings_panel)
+
+        # 4B. Right: Tabbed Assessment Activity & Discovered Assets
+        right_panel = self._panel("Telemetry & Surface Inventory", "Real-time execution logs and perimeter assets")
+        right_tabs = QTabWidget()
+
+        # Tab 1: Activity Feed
+        tab_activity = QWidget()
+        tab_activity.setStyleSheet("background: transparent;")
+        tab_activity_l = QVBoxLayout(tab_activity)
+        tab_activity_l.setContentsMargins(12, 12, 12, 12)
+        self.activity_scroll = QScrollArea()
+        self.activity_scroll.setWidgetResizable(True)
+        self.activity_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.activity_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        if self.activity_scroll.viewport():
+            self.activity_scroll.viewport().setStyleSheet("background: transparent;")
+        self.activity_container = QWidget()
+        self.activity_container.setStyleSheet("background: transparent;")
+        self.activity_list = QVBoxLayout(self.activity_container)
+        self.activity_list.setContentsMargins(0, 0, 0, 0)
+        self.activity_list.setSpacing(8)
+        self.activity_scroll.setWidget(self.activity_container)
+        tab_activity_l.addWidget(self.activity_scroll)
+
+        btn_pipeline = QPushButton("⚡  Launch Automated Assessment  →")
+        btn_pipeline.setProperty("class", "link-button")
+        btn_pipeline.clicked.connect(lambda: self.navigate_requested.emit(3))
+        tab_activity_l.addWidget(btn_pipeline, alignment=Qt.AlignmentFlag.AlignRight)
+        right_tabs.addTab(tab_activity, "Activity Timeline")
+
+        # Tab 2: Discovered Assets
+        tab_assets = QWidget()
+        tab_assets.setStyleSheet("background: transparent;")
+        tab_assets_l = QVBoxLayout(tab_assets)
+        tab_assets_l.setContentsMargins(12, 12, 12, 12)
+        self.assets_scroll = QScrollArea()
+        self.assets_scroll.setWidgetResizable(True)
+        self.assets_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.assets_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        if self.assets_scroll.viewport():
+            self.assets_scroll.viewport().setStyleSheet("background: transparent;")
+        self.assets_container = QWidget()
+        self.assets_container.setStyleSheet("background: transparent;")
+        self.assets_list = QVBoxLayout(self.assets_container)
+        self.assets_list.setContentsMargins(0, 0, 0, 0)
+        self.assets_list.setSpacing(8)
+        self.assets_scroll.setWidget(self.assets_container)
+        tab_assets_l.addWidget(self.assets_scroll)
+
+        btn_scope = QPushButton("Manage Authorized Scope  →")
+        btn_scope.setProperty("class", "link-button")
+        btn_scope.clicked.connect(lambda: self.navigate_requested.emit(1))
+        tab_assets_l.addWidget(btn_scope, alignment=Qt.AlignmentFlag.AlignRight)
+        right_tabs.addTab(tab_assets, "Authorized Assets")
+
+        # Tab 3: Verification & Preflight
+        self.tab_verification = self._create_verification_tab()
+        right_tabs.addTab(self.tab_verification, "🛡️ Preflight")
+
+        right_panel.layout().addWidget(right_tabs)
+        splitter.addWidget(right_panel)
+
+        # 60% Findings Table, 40% Telemetry
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 4)
+        root.addWidget(splitter, 1)
+
+        scroll.setWidget(container)
+        main_layout.addWidget(scroll)
+
+    def _metric_card(
+        self,
+        icon: str,
+        name: str,
+        value: str,
+        hint: str,
+        tooltip: str = "",
+        bg_dark: str = "#111827",
+        border_dark: str = "#1e293b",
+        text_dark: str = "#f8fafc",
+        bg_light: str = "#FFFFFF",
+        border_light: str = "#C7D0DA",
+        text_light: str = "#182230",
+        icon_tint: str = "rgba(37, 99, 235, 0.12)",
+        icon_border: str = "#2563eb",
+    ) -> ClickableMetricCard:
+        card = ClickableMetricCard()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        if tooltip:
+            card.setToolTip(tooltip)
+
+        is_light = ThemeManager.instance().is_light
+        bg = bg_light if is_light else bg_dark
+        border = border_light if is_light else border_dark
+        text_color = text_light if is_light else text_dark
+
+        card.setStyleSheet(
+            f"QFrame#metricCard {{ background-color: {bg}; border: 1px solid {border}; border-radius: 8px; }} "
+            f"QFrame#metricCard:hover {{ border-color: {border_dark if is_light else '#334155'}; }}"
+        )
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        # Behind24 style: icon in rounded tinted container
+        ico_box = QLabel(icon)
+        ico_box.setFixedSize(32, 32)
+        ico_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ico_box.setStyleSheet(
+            f"background-color: {icon_tint}; border: 1px solid {icon_border}; border-radius: 6px; font-size: 14px;"
+        )
+        ico_box.setObjectName("metricIcon")
+        layout.addWidget(ico_box)
+
+        # Text column
+        vbox = QVBoxLayout()
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(1)
+
+        value_lbl = QLabel(value)
+        value_lbl.setObjectName("metricValue")
+        value_lbl.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {text_color};")
+
+        lbl = QLabel(name.upper())
+        lbl.setObjectName("metricName")
+        lbl.setStyleSheet(f"font-size: 9px; font-weight: bold; color: {'#475569' if is_light else '#94a3b8'}; letter-spacing: 0.5px;")
+
+        hint_lbl = QLabel(hint)
+        hint_lbl.setObjectName("dashSubtitle")
+        hint_lbl.setWordWrap(True)
+        hint_lbl.setStyleSheet(f"font-size: 10px; color: {'#64748b' if is_light else '#64748b'};")
+
+        vbox.addWidget(value_lbl)
+        vbox.addWidget(lbl)
+        vbox.addWidget(hint_lbl)
+        layout.addLayout(vbox)
+
+        card.value_label = value_lbl
+        card.hint_label = hint_lbl
+        card.icon_box = ico_box
+        return card
+
+    def _panel(self, title: str, subtitle: str) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("dashboardPanel")
+        panel.setStyleSheet(
+            "QFrame#dashboardPanel { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; }"
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        heading = QHBoxLayout()
+        labels = QVBoxLayout()
+        labels.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("panelTitle")
+        title_label.setStyleSheet("color: #f8fafc; font-size: 13px; font-weight: 700;")
+        sub_label = QLabel(subtitle)
+        sub_label.setObjectName("dashSubtitle")
+        sub_label.setWordWrap(True)
+        sub_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        labels.addWidget(title_label)
+        labels.addWidget(sub_label)
+        heading.addLayout(labels)
+        heading.addStretch()
+        layout.addLayout(heading)
+        return panel
+
+    def _create_distribution_row(self, title: str, color: str, parent_layout: QVBoxLayout) -> tuple[QProgressBar, QLabel]:
+        row = QVBoxLayout()
+        row.setSpacing(4)
+
+        label_row = QHBoxLayout()
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(f"color: {CPENTTheme.PRIMARY_TEXT}; font-size: 11px; font-weight: 500;")
+        count_lbl = QLabel("0 (0%)")
+        count_lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold;")
+        label_row.addWidget(title_lbl)
+        label_row.addStretch()
+        label_row.addWidget(count_lbl)
+        row.addLayout(label_row)
+
+        bar = QProgressBar()
+        bar.setProperty("class", "attack-bar")
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(6)
+        bar.setStyleSheet(
+            f"QProgressBar {{ background-color: {CPENTTheme.INPUT_BG}; border: 1px solid {CPENTTheme.BORDER}; border-radius: 3px; }} "
+            f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}"
+        )
+        row.addWidget(bar)
+
+        parent_layout.addLayout(row)
+        return bar, count_lbl
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            elif item.layout():
+                DashboardView._clear_layout(item.layout())
+
+    def set_active_project(self, project: Optional[Project]):
+        self.active_project = project
+        self._update_combo_selection()
+        self.refresh()
+
+    def _update_combo_selection(self):
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        projects = self.db.list_projects()
+        self.project_combo.addItem("🌐  All Authorized Projects (Dashboard)", None)
+        selected_index = 0
+        for idx, p in enumerate(projects):
+            self.project_combo.addItem(f"📁  {p.name}", p.id)
+            if self.active_project and p.id == self.active_project.id:
+                selected_index = idx + 1
+        self.project_combo.setCurrentIndex(selected_index)
+        self.project_combo.blockSignals(False)
+
+    def _on_combo_project_changed(self, index: int):
+        proj_id = self.project_combo.itemData(index)
+        if proj_id is None:
+            self.active_project = None
+        else:
+            self.active_project = self.db.get_project(proj_id)
+            if self.active_project:
+                self.project_selected.emit(self.active_project)
+        self.refresh()
+
+    def refresh(self):
+        # Update combo list if needed
+        if self.project_combo.count() == 0:
+            self._update_combo_selection()
+
+        project = self.active_project
+        if project and project.id is not None:
+            self.project_badge.setText(f"◉  {project.name}")
+            scopes = [s for s in self.db.list_scopes(project.id) if s.is_authorized]
+            findings = self.db.list_findings(project.id)
+            executions = self.db.list_executions(project.id)
+            nodes = self.db.list_asset_nodes(project.id)
+        else:
+            self.project_badge.setText("Global Attack Surface")
+            projects = self.db.list_projects()
+            scopes = []
+            findings = []
+            executions = []
+            nodes = []
+            for p in projects:
+                if p.id is not None:
+                    scopes.extend([s for s in self.db.list_scopes(p.id) if s.is_authorized])
+                    findings.extend(self.db.list_findings(p.id))
+                    executions.extend(self.db.list_executions(p.id))
+                    nodes.extend(self.db.list_asset_nodes(p.id))
+
+        self.findings_cache = findings
+        self.scopes_cache = scopes
+        self.executions_cache = executions
+
+        # Unique asset derivation without double-counting
+        scope_targets: Set[str] = {s.target.strip() for s in scopes if s.target and s.target.strip()}
+        node_values: Set[str] = {n.value.strip() for n in nodes if n.value and n.value.strip()}
+        observed_assets: Set[str] = {f.affected_asset.strip() for f in findings if f.affected_asset and f.affected_asset.strip()}
+        all_assets = scope_targets | node_values | observed_assets
+
+        # Asset classification
+        ips = sum(1 for asset in all_assets if self._looks_like_ip(asset))
+        urls = sum(1 for asset in all_assets if asset.startswith("http://") or asset.startswith("https://"))
+        domains = sum(
+            1 for asset in all_assets
+            if not self._looks_like_ip(asset) and not asset.startswith("http://") and not asset.startswith("https://") and ("." in asset)
+        )
+        observed_services = {f.affected_port_service.strip() for f in findings if f.affected_port_service and f.affected_port_service.strip()}
+
+        # Finding validation status breakdown
+        open_findings = [f for f in findings if f.validation_status.value not in ("false_positive", "remediated")]
+        remediated = [f for f in findings if f.validation_status.value == "remediated"]
+        confirmed = [f for f in open_findings if f.validation_status.value == "confirmed"]
+        unverified = [f for f in open_findings if f.validation_status.value in ("unverified", "observed")]
+
+        counts = Counter(f.severity.value for f in open_findings)
+        total_open = len(open_findings)
+        crit_count = counts.get("critical", 0)
+        high_count = counts.get("high", 0)
+        med_count = counts.get("medium", 0)
+        low_count = counts.get("low", 0)
+
+        # Update top metric cards
+        self._set_metrics(len(all_assets), domains, ips, total_open)
+        self.metric_assets.hint_label.setText(f"{domains} FQDNs · {ips} IPs · {len(observed_services)} Services · {urls} URLs")
+        self.metric_findings.hint_label.setText(f"{crit_count} Crit · {high_count} High · {med_count} Med · {low_count} Low")
+        self.card_arsenal.value_label.setText(str(len(executions)))
+        self.card_arsenal.hint_label.setText("Saved terminal and scanner runs")
+
+        # Threat Level Card
+        if crit_count > 0:
+            self.card_threat.value_label.setText("CRITICAL RISK")
+            self.card_threat.value_label.setStyleSheet("color: #ef4444; font-size: 16px; font-weight: 800;")
+            self.card_threat.setStyleSheet("QFrame#metricCard { background-color: #111827; border: 1px solid #dc2626; border-radius: 8px; } QFrame#metricCard:hover { border-color: #ef4444; }")
+            if hasattr(self.card_threat, "icon_box"):
+                self.card_threat.icon_box.setStyleSheet("background-color: #3d1014; border: 1px solid #ef4444; border-radius: 6px; font-size: 14px;")
+            self.card_threat.hint_label.setText(f"{crit_count} critical CVEs require immediate patch")
+        elif high_count > 0:
+            self.card_threat.value_label.setText("HIGH RISK")
+            self.card_threat.value_label.setStyleSheet("color: #f97316; font-size: 16px; font-weight: 800;")
+            self.card_threat.setStyleSheet("QFrame#metricCard { background-color: #111827; border: 1px solid #ea580c; border-radius: 8px; } QFrame#metricCard:hover { border-color: #f97316; }")
+            if hasattr(self.card_threat, "icon_box"):
+                self.card_threat.icon_box.setStyleSheet("background-color: #382010; border: 1px solid #f97316; border-radius: 6px; font-size: 14px;")
+            self.card_threat.hint_label.setText(f"{high_count} high-severity flaws detected")
+        elif total_open > 0:
+            self.card_threat.value_label.setText("ELEVATED")
+            self.card_threat.value_label.setStyleSheet("color: #eab308; font-size: 16px; font-weight: 800;")
+            self.card_threat.setStyleSheet("QFrame#metricCard { background-color: #111827; border: 1px solid #ca8a04; border-radius: 8px; } QFrame#metricCard:hover { border-color: #eab308; }")
+            if hasattr(self.card_threat, "icon_box"):
+                self.card_threat.icon_box.setStyleSheet("background-color: #383010; border: 1px solid #eab308; border-radius: 6px; font-size: 14px;")
+            self.card_threat.hint_label.setText(f"{total_open} open finding(s) need review")
+        elif not findings:
+            self.card_threat.value_label.setText("NOT ASSESSED")
+            self.card_threat.value_label.setStyleSheet("color: #94a3b8; font-size: 16px; font-weight: 800;")
+            self.card_threat.setStyleSheet("QFrame#metricCard { background-color: #111827; border: 1px solid #1e293b; border-radius: 8px; } QFrame#metricCard:hover { border-color: #334155; }")
+            if hasattr(self.card_threat, "icon_box"):
+                self.card_threat.icon_box.setStyleSheet("background-color: rgba(56, 189, 248, 0.12); border: 1px solid #38bdf8; border-radius: 6px; font-size: 14px;")
+            if scopes or nodes or executions:
+                self.card_threat.value_label.setText("NO FINDINGS")
+                self.card_threat.hint_label.setText("No findings recorded; this is not proof of security")
+            else:
+                self.card_threat.hint_label.setText("Add authorized scope and run an assessment")
+        else:
+            self.card_threat.value_label.setText("NO OPEN FINDINGS")
+            self.card_threat.value_label.setStyleSheet("color: #10b981; font-size: 16px; font-weight: 800;")
+            self.card_threat.setStyleSheet("QFrame#metricCard { background-color: #111827; border: 1px solid #059669; border-radius: 8px; } QFrame#metricCard:hover { border-color: #10b981; }")
+            if hasattr(self.card_threat, "icon_box"):
+                self.card_threat.icon_box.setStyleSheet("background-color: #064e3b; border: 1px solid #10b981; border-radius: 6px; font-size: 14px;")
+            self.card_threat.hint_label.setText("Recorded findings are remediated or marked false positive")
+
+        # Cyber Hygiene / Remediation Rate Card
+        total_all_findings = len(findings)
+        if total_all_findings > 0:
+            rem_pct = int((len(remediated) / total_all_findings) * 100)
+            self.card_remediation.value_label.setText(f"{rem_pct}%")
+            self.card_remediation.hint_label.setText(
+                f"{len(remediated)} of {total_all_findings} remediated ({len(confirmed)} confirmed open)"
+            )
+        else:
+            self.card_remediation.value_label.setText("—")
+            self.card_remediation.hint_label.setText("No remediation data yet")
+
+        # Severity labels in gauge card
+        for key in self.severity_labels:
+            self.severity_labels[key].setText(f"{key.title()}  {counts.get(key, 0)}")
+
+        # Severity-weighted exposure heuristic; this is not a CVSS aggregate.
+        exposure_points = crit_count * 25 + high_count * 12 + med_count * 5 + low_count * 2
+        score = min(100, exposure_points)
+        if crit_count > 0 or score >= 70:
+            level = "Very High Risk"
+            grade = "F"
+        elif high_count > 0 or score >= 45:
+            level = "High Exposure"
+            grade = "D"
+        elif med_count > 0 or score >= 25:
+            level = "Elevated"
+            grade = "C"
+        elif score > 0:
+            level = "Moderate"
+            grade = "B"
+        elif not findings:
+            level = "Not assessed"
+            grade = "—"
+        else:
+            level = "No open findings"
+            grade = "—"
+
+        self.gauge.set_risk(score, level, grade)
+
+        # Update attack paths telemetry strictly from real data
+        self._update_attack_paths(open_findings)
+
+        # Update Tables & Feeds
+        self._render_findings_table()
+        self._render_assets(scopes, findings)
+        self._render_activity(executions)
+
+    def _set_metrics(self, assets, domains, ips, risks):
+        for card, value in zip(
+            (self.metric_assets, self.metric_domains, self.metric_ips, self.metric_findings),
+            (assets, domains, ips, risks),
+        ):
+            card.value_label.setText(str(value))
+
+    def _update_attack_paths(self, open_findings: List[Finding]):
+        """Categorizes findings strictly based on actual data without simulated fake boosts."""
+        impact_counts = {"domain": 0, "infra": 0, "host": 0, "data": 0, "api": 0}
+        weakness_counts = {"injection": 0, "access": 0, "config": 0, "auth": 0, "crypto": 0}
+
+        for f in open_findings:
+            title_lower = f.title.lower()
+            asset_lower = f.affected_asset.lower()
+
+            # Categorize impact
+            if any(k in title_lower for k in ("subdomain", "dns", "zone", "perimeter", "takeover", "hsts", "header")) or any(s in asset_lower for s in ("domain", ".com", ".net", ".corp", ".org", ".local", ".io")):
+                impact_counts["domain"] += 1
+            if any(k in title_lower for k in ("rce", "remote code", "command", "log4j", "privilege", "smb", "shell")):
+                impact_counts["host"] += 1
+            if any(k in title_lower for k in ("sqli", "sql", "database", "credential", "password", "dump", "leak")):
+                impact_counts["data"] += 1
+            if any(k in title_lower for k in ("api", "endpoint", "graphql", "rest", "swagger", "json", "post")):
+                impact_counts["api"] += 1
+            if any(k in title_lower for k in ("port", "firewall", "router", "ssh", "rdp", "infra", "telnet", "tcp", "udp")):
+                impact_counts["infra"] += 1
+
+            # Categorize weakness / OWASP Top 10 strictly based on real finding data
+            triaged = self.triage_engine.triage(f)
+            cat_lower = triaged.owasp_category.lower()
+            if any(k in title_lower for k in ("sql", "sqli", "command", "xss", "inject")) or "injection" in cat_lower:
+                weakness_counts["injection"] += 1
+            elif any(k in title_lower for k in ("auth", "jwt", "login", "password", "token")) or "authentication" in cat_lower:
+                weakness_counts["auth"] += 1
+            elif any(k in title_lower for k in ("cors", "idor", "traversal", "access")) or "access control" in cat_lower:
+                weakness_counts["access"] += 1
+            elif any(k in title_lower for k in ("secret", "key", "cert", "ssl", "crypto", "entropy")) or "cryptographic" in cat_lower:
+                weakness_counts["crypto"] += 1
+            else:
+                weakness_counts["config"] += 1
+
+        total = max(1, len(open_findings))
+        for key, (bar, count_lbl) in self.impact_bars.items():
+            cnt = impact_counts[key]
+            pct = min(100, int((cnt / total) * 100)) if len(open_findings) > 0 else 0
+            bar.setValue(pct)
+            count_lbl.setText(f"{cnt} ({pct}%)")
+
+        for key, (bar, count_lbl) in self.weakness_bars.items():
+            cnt = weakness_counts[key]
+            pct = min(100, int((cnt / total) * 100)) if len(open_findings) > 0 else 0
+            bar.setValue(pct)
+            count_lbl.setText(f"{cnt} ({pct}%)")
+
+    def _render_findings_table(self, findings: Optional[List[Finding]] = None):
+        self.findings_table.setRowCount(0)
+        target_list = findings if findings is not None else self.findings_cache
+        search_term = self.search_input.text().strip().lower()
+        sev_filter = self.sev_filter_combo.currentText()
+        status_filter = self.status_filter_combo.currentText()
+
+        filtered = []
+        for f in target_list:
+            if search_term and (search_term not in f.title.lower() and search_term not in f.affected_asset.lower()):
+                continue
+            if sev_filter != "All Severities" and f.severity.value.lower() != sev_filter.lower():
+                continue
+            if status_filter == "Open Vulnerabilities":
+                if f.validation_status.value in ("remediated", "false_positive"):
+                    continue
+            elif status_filter != "All Statuses" and f.validation_status.value.lower() != status_filter.lower():
+                continue
+            filtered.append(f)
+
+        self.findings_table.setRowCount(len(filtered))
+        for row, f in enumerate(filtered):
+            # 1. Severity Badge with CVSS
+            triaged = self.triage_engine.triage(f)
+            sev_str = f.severity.value.upper()
+            cvss_str = f"{triaged.cvss_score:.1f}" if triaged.cvss_score is not None else "—"
+            sev_item = QTableWidgetItem(f"[{sev_str} {cvss_str}]")
+            sev_colors = {
+                "CRITICAL": QColor(CPENTTheme.ERROR_RED),
+                "HIGH": QColor("#F97316"),
+                "MEDIUM": QColor(CPENTTheme.AMBER_ACCENT),
+                "LOW": QColor(CPENTTheme.INFO_CYAN),
+                "INFORMATIONAL": QColor(CPENTTheme.SECONDARY_TEXT),
+            }
+            sev_item.setForeground(sev_colors.get(sev_str, QColor(CPENTTheme.SECONDARY_TEXT)))
+            sev_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            sev_item.setData(Qt.ItemDataRole.UserRole, f)
+            self.findings_table.setItem(row, 0, sev_item)
+
+            # 2. Title & Weakness
+            weakness_tag = triaged.owasp_category.split(" - ")[0] if " - " in triaged.owasp_category else "CWE"
+            title_item = QTableWidgetItem(f"{f.title}  ·  ({weakness_tag})")
+            title_item.setData(Qt.ItemDataRole.UserRole, f)
+            self.findings_table.setItem(row, 1, title_item)
+
+            # 3. Target Asset
+            asset_text = f.affected_asset or "Target Asset"
+            if f.affected_port_service:
+                asset_text += f":{f.affected_port_service}"
+            asset_item = QTableWidgetItem(asset_text)
+            asset_item.setForeground(QColor(CPENTTheme.INFO_CYAN))
+            self.findings_table.setItem(row, 2, asset_item)
+
+            # 4. Status with clear visual styling
+            status_val = f.validation_status.value
+            status_item = QTableWidgetItem(status_val.replace("_", " ").title())
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if status_val == "confirmed":
+                status_item.setForeground(QColor(CPENTTheme.SUCCESS_GREEN))
+            elif status_val in ("unverified", "observed"):
+                status_item.setForeground(QColor(CPENTTheme.PRIMARY_BLUE))
+            elif status_val == "needs_validation":
+                status_item.setForeground(QColor(CPENTTheme.AMBER_ACCENT))
+            elif status_val == "remediated":
+                status_item.setForeground(QColor(CPENTTheme.SECONDARY_TEXT))
+            self.findings_table.setItem(row, 3, status_item)
+
+            # 5. Triage Action Button
+            btn_triage = QPushButton("🔍 Triage & Fix")
+            btn_triage.setProperty("class", "action-secondary")
+            btn_triage.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_triage.setStyleSheet(
+                f"background-color: {CPENTTheme.ELEVATED_PANEL}; color: {CPENTTheme.PRIMARY_TEXT}; "
+                f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 4px 8px; font-size: 11px; font-weight: 500;"
+            )
+            btn_triage.clicked.connect(lambda checked, finding=f: self._open_triage_dialog(finding))
+            self.findings_table.setCellWidget(row, 4, btn_triage)
+
+        # Legacy findings_list layout for backwards compatibility with tests
+        self._clear_layout(self.findings_list)
+        open_items = [f for f in target_list if f.validation_status.value not in ("remediated", "false_positive")]
+        if not open_items:
+            self.findings_list.addWidget(self._empty("No open vulnerabilities recorded. Run an authorized scan to populate."))
+        else:
+            for finding in open_items[:5]:
+                item_row = QFrame()
+                item_row.setObjectName("listRow")
+                l = QHBoxLayout(item_row)
+                l.setContentsMargins(6, 6, 6, 6)
+                marker = QLabel("◆")
+                marker.setStyleSheet("color: #ff3158; font-size: 15px;")
+                txt = QLabel(f"{finding.title}\n{finding.affected_asset or 'Asset not specified'} · {finding.severity.value.title()}")
+                txt.setObjectName("rowText")
+                txt.setWordWrap(True)
+                l.addWidget(marker)
+                l.addWidget(txt, 1)
+                self.findings_list.addWidget(item_row)
+
+    def _filter_table(self):
+        self._render_findings_table(self.findings_cache)
+
+    def _on_table_double_clicked(self, row: int, column: int):
+        del column
+        item = self.findings_table.item(row, 0)
+        if item:
+            finding = item.data(Qt.ItemDataRole.UserRole)
+            if finding:
+                self._open_triage_dialog(finding)
+
+    def _open_triage_dialog(self, finding: Finding):
+        dlg = StrixTriageDialog(finding=finding, db=self.db, parent=self)
+        if dlg.exec():
+            self.refresh()
+
+    def _render_assets(self, scopes: List[TargetScope], findings: Optional[List[Finding]] = None):
+        self._clear_layout(self.assets_list)
+        assets = {s.target: f"Authorized · {s.target_type.value.replace('_', ' ').title()}" for s in scopes}
+        for finding in findings or []:
+            asset = finding.affected_asset.strip()
+            if asset and asset not in assets:
+                assets[asset] = f"Observed · {finding.source_tool or 'assessment'}"
+        if not assets:
+            self.assets_list.addWidget(self._empty("No assets or scan results yet. Add an authorized target, then run a tool in the terminal."))
+            return
+        for target, description in list(assets.items())[:8]:
+            row = QFrame()
+            row.setObjectName("listRow")
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(8, 8, 8, 8)
+            is_auth = description.startswith("Authorized")
+            icon = QLabel("◎")
+            icon.setStyleSheet(f"color: {CPENTTheme.SUCCESS_GREEN if is_auth else CPENTTheme.PRIMARY_BLUE}; font-size: 17px;")
+            text = QLabel(f"{target}\n{description}")
+            text.setObjectName("rowText")
+            layout.addWidget(icon)
+            layout.addWidget(text, 1)
+            self.assets_list.addWidget(row)
+
+    def _render_activity(self, executions: List[ToolExecution]):
+        self._clear_layout(self.activity_list)
+        if not executions:
+            self.activity_list.addWidget(self._empty("No assessment runs recorded yet. Launch a pipeline to begin."))
+            return
+        for execution in executions[:6]:
+            status = execution.status.value.title()
+            status_color = (
+                CPENTTheme.SUCCESS_GREEN if execution.status.value == "completed"
+                else CPENTTheme.ERROR_RED if execution.status.value == "failed"
+                else CPENTTheme.PRIMARY_BLUE
+            )
+            output_preview = ""
+            if execution.raw_output_path:
+                try:
+                    output_preview = Path(execution.raw_output_path).read_text(encoding="utf-8", errors="replace")
+                    output_preview = " ".join(output_preview.split())[:180]
+                except OSError:
+                    output_preview = "Output evidence file is unavailable"
+            row = QFrame()
+            row.setObjectName("listRow")
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(8, 8, 8, 8)
+            dot = QLabel("⚡")
+            dot.setStyleSheet(f"color: {status_color}; font-size: 14px;")
+            time_str = execution.created_at[:16].replace("T", " ") if execution.created_at else "Unknown time"
+            label = QLabel(
+                f"{execution.tool_name.title()}  ·  {status}\n"
+                f"{execution.command[:72]}\n"
+                f"{output_preview or 'No output captured'}\n"
+                f"{time_str}"
+            )
+            label.setObjectName("rowText")
+            layout.addWidget(dot)
+            layout.addWidget(label, 1)
+            self.activity_list.addWidget(row)
+
+    @staticmethod
+    def _empty(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("emptyState")
+        label.setWordWrap(True)
+        return label
+
+    @staticmethod
+    def _looks_like_ip(value: str) -> bool:
+        try:
+            clean = value.split("/")[0] if "/" in value else value
+            ipaddress.ip_address(clean)
+            return True
+        except ValueError:
+            try:
+                ipaddress.ip_network(value, strict=False)
+                return True
+            except ValueError:
+                return False
+
+    def _create_status_badge(self, text: str, color: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            f"background-color: rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.15); "
+            f"color: {color}; border: 1px solid {color}; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;"
+        )
+        return lbl
+
+    def _create_verification_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Verification Status Counters Row (Passed / Failed / Blocked / Error / Needs Review)
+        counters_layout = QHBoxLayout()
+        self.lbl_v_passed = self._create_status_badge("PASSED: 0", CPENTTheme.SUCCESS_GREEN)
+        self.lbl_v_failed = self._create_status_badge("FAILED: 0", CPENTTheme.ERROR_RED)
+        self.lbl_v_blocked = self._create_status_badge("BLOCKED: 0", "#F87171")
+        self.lbl_v_error = self._create_status_badge("ERROR: 0", CPENTTheme.RED_ACCENT)
+        self.lbl_v_review = self._create_status_badge("REVIEW: 0", CPENTTheme.AMBER_ACCENT)
+
+        counters_layout.addWidget(self.lbl_v_passed)
+        counters_layout.addWidget(self.lbl_v_failed)
+        counters_layout.addWidget(self.lbl_v_blocked)
+        counters_layout.addWidget(self.lbl_v_error)
+        counters_layout.addWidget(self.lbl_v_review)
+        layout.addLayout(counters_layout)
+
+        # Verification Details Text / Summary
+        self.txt_verification_summary = QTextEdit()
+        self.txt_verification_summary.setReadOnly(True)
+        self.txt_verification_summary.setFont(QFont("Monospace", 9))
+        self.txt_verification_summary.setStyleSheet(
+            f"background-color: {CPENTTheme.TERMINAL_BG}; color: {CPENTTheme.PRIMARY_TEXT}; "
+            f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; min-height: 180px;"
+        )
+        self.txt_verification_summary.setPlaceholderText("Click 'Run Preflight Verification' to inspect authorization, tools, and evidence...")
+        layout.addWidget(self.txt_verification_summary)
+
+        # Bottom Button Bar
+        btn_bar = QHBoxLayout()
+        self.btn_run_preflight = QPushButton("🛡️ Run Preflight Verification")
+        self.btn_run_preflight.setProperty("class", "action-primary")
+        self.btn_run_preflight.clicked.connect(self._run_preflight_verification)
+        btn_bar.addWidget(self.btn_run_preflight)
+
+        btn_evidence_check = QPushButton("🔍 Check Evidence Hashes")
+        btn_evidence_check.setProperty("class", "action-secondary")
+        btn_evidence_check.clicked.connect(self._verify_evidence_hashes)
+        btn_bar.addWidget(btn_evidence_check)
+
+        layout.addLayout(btn_bar)
+        return tab
+
+    def _run_preflight_verification(self):
+        """Runs preflight checks across project targets, tools, and authorization."""
+        if not self.active_project or not self.active_project.id:
+            self.lbl_v_blocked.setText("BLOCKED: 1")
+            self.txt_verification_summary.setPlainText(
+                "❌ PREFLIGHT BLOCKED: No active project selected.\n"
+                "Please select an active project from the dropdown or Project Management."
+            )
+            return
+
+        checker = PreflightChecker(self.db)
+        scopes = self.db.list_scopes(self.active_project.id)
+
+        target = scopes[0].target if scopes else ""
+        res = checker.run_preflight(target=target, project=self.active_project, scopes=scopes)
+
+        passed = 0
+        failed = 0
+        blocked = len(res.blockers)
+        errors = 0
+        review = len(res.warnings)
+
+        if res.is_ready:
+            passed += 1
+        else:
+            failed += 1
+
+        for tool_name, tinfo in res.tool_readiness.items():
+            if tinfo.get("installed"):
+                passed += 1
+            else:
+                failed += 1
+
+        self.lbl_v_passed.setText(f"PASSED: {passed}")
+        self.lbl_v_failed.setText(f"FAILED: {failed}")
+        self.lbl_v_blocked.setText(f"BLOCKED: {blocked}")
+        self.lbl_v_error.setText(f"ERROR: {errors}")
+        self.lbl_v_review.setText(f"REVIEW: {review}")
+
+        report_lines = [
+            "=== PREFLIGHT & ASSESSMENT VERIFICATION REPORT ===",
+            f"Project: {self.active_project.name} (ID: {self.active_project.id})",
+            f"Overall Status: {res.status.value.upper()}",
+            f"Assessment Ready: {'YES' if res.is_ready else 'NO (Blocked)'}",
+            "",
+            "--- TARGET SCOPE AUTHORIZATION ---",
+            f"Scope Status: {res.scope_details.get('reason', 'No targets analyzed')}",
+            f"Authorized Targets Count: {len(scopes)}",
+            "",
+            "--- TOOL READINESS ---",
+        ]
+        for tname, tinfo in res.tool_readiness.items():
+            status_str = f"INSTALLED (v{tinfo.get('version')})" if tinfo.get("installed") else f"MISSING ({tinfo.get('error')})"
+            report_lines.append(f"• {tname}: {status_str}")
+
+        if res.blockers:
+            report_lines.append("\n--- EXECUTION BLOCKERS ---")
+            for b in res.blockers:
+                report_lines.append(f"⛔ {b}")
+
+        if res.warnings:
+            report_lines.append("\n--- ROE & COMPLIANCE NOTICES ---")
+            for w in res.warnings:
+                report_lines.append(f"⚠️ {w}")
+
+        self.txt_verification_summary.setPlainText("\n".join(report_lines))
+
+    def _verify_evidence_hashes(self):
+        """Verifies on-disk SHA-256 hashes of all evidence for the active project."""
+        if not self.active_project or not self.active_project.id:
+            self.txt_verification_summary.setPlainText("No active project selected to verify evidence.")
+            return
+
+        evidence_list = self.db.list_evidence(self.active_project.id)
+        if not evidence_list:
+            self.txt_verification_summary.setPlainText(
+                f"No evidence files found in SQLite vault for Project #{self.active_project.id}."
+            )
+            return
+
+        valid_count = 0
+        invalid_count = 0
+        missing_count = 0
+        lines = [
+            "=== CRYPTOGRAPHIC EVIDENCE INTEGRITY AUDIT ===",
+            f"Project: {self.active_project.name}",
+            f"Total Evidence Records: {len(evidence_list)}",
+            "",
+        ]
+
+        for ev in evidence_list:
+            is_valid, msg = self.db.verify_evidence_integrity(ev)
+            if is_valid:
+                valid_count += 1
+                lines.append(f"✅ Evidence #{ev.id} ({ev.file_path}): {msg}")
+            elif "does not exist on disk" in msg:
+                missing_count += 1
+                lines.append(f"⚠️ Evidence #{ev.id} ({ev.file_path}): Missing artifact file")
+            else:
+                invalid_count += 1
+                lines.append(f"❌ Evidence #{ev.id} ({ev.file_path}): {msg}")
+
+        lines.append("")
+        lines.append(f"Summary: {valid_count} Valid, {invalid_count} Tampered/Mismatch, {missing_count} Missing on disk.")
+        self.txt_verification_summary.setPlainText("\n".join(lines))

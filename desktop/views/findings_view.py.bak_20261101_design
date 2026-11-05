@@ -1,0 +1,872 @@
+"""Security Findings and Evidence view with Report Generation.
+
+Phase 7 Enhancement: Comprehensive Findings Lifecycle Management,
+Assessment-scoped filtering, deduplication, secret scrubbing, and multi-format report export.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.activity_logger import sanitize_text
+from desktop.theme import CPENTTheme, VALIDATION_COLORS_HEX
+from reports.builder import ReportBuilder
+from storage.db import Database
+from storage.models import Assessment, Finding, FindingSeverity, ValidationStatus
+
+
+class FindingEditDialog(QDialog):
+    """Dialog for creating or editing a Security Finding (Phase 7)."""
+
+    def __init__(self, finding: Optional[Finding] = None, assessments: list[Assessment] = None, parent=None):
+        super().__init__(parent)
+        self.finding = finding
+        self.assessments = assessments or []
+        self.setWindowTitle("Edit Finding" if finding else "New Security Finding")
+        self.setMinimumWidth(580)
+
+        layout = QFormLayout(self)
+        layout.setSpacing(10)
+
+        self.title_input = QLineEdit(finding.title if finding else "")
+        self.title_input.setPlaceholderText("e.g. Unauthenticated Remote Code Execution via Log4j")
+        layout.addRow("Finding Title *:", self.title_input)
+
+        row_meta = QHBoxLayout()
+        self.severity_combo = QComboBox()
+        for sev in FindingSeverity:
+            self.severity_combo.addItem(sev.value.upper(), sev)
+        if finding:
+            idx = self.severity_combo.findData(finding.severity)
+            if idx >= 0:
+                self.severity_combo.setCurrentIndex(idx)
+        else:
+            self.severity_combo.setCurrentIndex(2)  # Medium default
+
+        self.status_combo = QComboBox()
+        statuses = [
+            ("New", ValidationStatus.NEW),
+            ("Confirmed", ValidationStatus.CONFIRMED),
+            ("False Positive", ValidationStatus.FALSE_POSITIVE),
+            ("Remediation in Progress", ValidationStatus.REMEDIATION_IN_PROGRESS),
+            ("Resolved", ValidationStatus.RESOLVED),
+            ("Accepted Risk", ValidationStatus.ACCEPTED_RISK),
+            ("Unverified", ValidationStatus.UNVERIFIED),
+        ]
+        for label, st in statuses:
+            self.status_combo.addItem(label, st)
+        if finding:
+            idx = self.status_combo.findData(finding.validation_status)
+            if idx >= 0:
+                self.status_combo.setCurrentIndex(idx)
+
+        row_meta.addWidget(QLabel("Severity:"))
+        row_meta.addWidget(self.severity_combo)
+        row_meta.addWidget(QLabel("Status:"))
+        row_meta.addWidget(self.status_combo)
+        layout.addRow("Classification:", row_meta)
+
+        row_target = QHBoxLayout()
+        self.asset_input = QLineEdit(finding.affected_asset if finding else "")
+        self.asset_input.setPlaceholderText("IP / Hostname (e.g. 192.168.1.10)")
+        self.port_input = QLineEdit(finding.affected_port_service if finding else "")
+        self.port_input.setPlaceholderText("Port / Service (e.g. 443/https)")
+        self.port_input.setMaximumWidth(140)
+        row_target.addWidget(self.asset_input)
+        row_target.addWidget(self.port_input)
+        layout.addRow("Target Asset & Service:", row_target)
+
+        row_assess = QHBoxLayout()
+        self.assess_combo = QComboBox()
+        self.assess_combo.addItem("None / Global", None)
+        for a in self.assessments:
+            self.assess_combo.addItem(f"#{a.id} - {a.name}", a.id)
+        if finding and finding.assessment_id:
+            idx = self.assess_combo.findData(finding.assessment_id)
+            if idx >= 0:
+                self.assess_combo.setCurrentIndex(idx)
+        row_assess.addWidget(self.assess_combo)
+
+        self.confidence_spin = QDoubleSpinBox()
+        self.confidence_spin.setRange(0.0, 1.0)
+        self.confidence_spin.setSingleStep(0.1)
+        self.confidence_spin.setValue(getattr(finding, "confidence", 1.0) if finding else 1.0)
+        row_assess.addWidget(QLabel("Confidence:"))
+        row_assess.addWidget(self.confidence_spin)
+        layout.addRow("Assessment & Confidence:", row_assess)
+
+        self.desc_input = QTextEdit()
+        self.desc_input.setPlaceholderText("Detailed technical description of vulnerability...")
+        self.desc_input.setText(finding.description if finding else "")
+        self.desc_input.setMaximumHeight(80)
+        layout.addRow("Description:", self.desc_input)
+
+        self.repro_input = QTextEdit()
+        self.repro_input.setPlaceholderText("Step-by-step reproduction instructions...")
+        self.repro_input.setText(finding.reproduction_steps if finding else "")
+        self.repro_input.setMaximumHeight(70)
+        layout.addRow("Reproduction Steps:", self.repro_input)
+
+        self.remed_input = QTextEdit()
+        self.remed_input.setPlaceholderText("Actionable remediation guidance and patching instructions...")
+        self.remed_input.setText(finding.remediation if finding else "")
+        self.remed_input.setMaximumHeight(70)
+        layout.addRow("Remediation Guidance:", self.remed_input)
+
+        btn_box = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("Save Finding" if finding else "Create Finding")
+        btn_ok.setProperty("class", "action-primary")
+        btn_ok.clicked.connect(self._validate_and_accept)
+
+        btn_box.addStretch()
+        btn_box.addWidget(btn_cancel)
+        btn_box.addWidget(btn_ok)
+        layout.addRow(btn_box)
+
+    def _validate_and_accept(self):
+        if not self.title_input.text().strip():
+            QMessageBox.warning(self, "Validation Error", "Finding title is required.")
+            return
+        self.accept()
+
+    def get_data(self) -> dict:
+        return {
+            "title": self.title_input.text().strip(),
+            "severity": self.severity_combo.currentData(),
+            "validation_status": self.status_combo.currentData(),
+            "affected_asset": self.asset_input.text().strip(),
+            "affected_port_service": self.port_input.text().strip(),
+            "assessment_id": self.assess_combo.currentData(),
+            "confidence": self.confidence_spin.value(),
+            "description": sanitize_text(self.desc_input.toPlainText().strip()),
+            "reproduction_steps": sanitize_text(self.repro_input.toPlainText().strip()),
+            "remediation": sanitize_text(self.remed_input.toPlainText().strip()),
+        }
+
+
+class FindingsView(QWidget):
+    """Displays triageable security findings, remediation guidance, and report export."""
+
+    SEVERITY_COLORS = {
+        FindingSeverity.CRITICAL: QColor(CPENTTheme.ERROR_RED),
+        FindingSeverity.HIGH: QColor("#F97316"),
+        FindingSeverity.MEDIUM: QColor(CPENTTheme.AMBER_ACCENT),
+        FindingSeverity.LOW: QColor(CPENTTheme.INFO_CYAN),
+        FindingSeverity.INFORMATIONAL: QColor(CPENTTheme.SECONDARY_TEXT),
+    }
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.report_builder = ReportBuilder(db)
+        self.active_project_id: Optional[int] = None
+        self.findings_cache: list[Finding] = []
+        self.visible_findings: list[Finding] = []
+        self.assessments_cache: list[Assessment] = []
+        self._auto_report_signature = None
+        self._auto_report_pending_project: Optional[int] = None
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Header and Report Export Toolbar
+        header_row = QHBoxLayout()
+        header = QLabel("Findings & Report Generator")
+        header.setObjectName("viewHeader")
+        header_row.addWidget(header)
+        header_row.addStretch()
+
+        # Action Buttons
+        self.btn_export_pdf = QPushButton("📕 Export PDF")
+        self.btn_export_pdf.setToolTip("Export Assessment Report in PDF format")
+        self.btn_export_pdf.setProperty("class", "action-primary")
+        self.btn_export_pdf.clicked.connect(lambda: self._export_report("pdf"))
+        header_row.addWidget(self.btn_export_pdf)
+
+        self.btn_export_html = QPushButton("📄 HTML")
+        self.btn_export_html.setToolTip("Export Assessment Report in self-contained interactive HTML format")
+        self.btn_export_html.setProperty("class", "action-secondary")
+        self.btn_export_html.clicked.connect(lambda: self._export_report("html"))
+        header_row.addWidget(self.btn_export_html)
+
+        self.btn_export_md = QPushButton("📝 Markdown")
+        self.btn_export_md.setToolTip("Export Assessment Report in portable GitHub-flavored Markdown")
+        self.btn_export_md.setProperty("class", "action-secondary")
+        self.btn_export_md.clicked.connect(lambda: self._export_report("markdown"))
+        header_row.addWidget(self.btn_export_md)
+
+        self.btn_export_json = QPushButton("⚙️ JSON")
+        self.btn_export_json.setToolTip("Export Assessment Report in machine-readable JSON format")
+        self.btn_export_json.setProperty("class", "action-secondary")
+        self.btn_export_json.clicked.connect(lambda: self._export_report("json"))
+        header_row.addWidget(self.btn_export_json)
+
+        self.btn_export_all = QPushButton("📚 All Formats")
+        self.btn_export_all.setToolTip("Generate all report formats (PDF, HTML, MD, JSON)")
+        self.btn_export_all.clicked.connect(self._export_all_reports)
+        header_row.addWidget(self.btn_export_all)
+
+        self.btn_export_cpent = QPushButton("💼 CPENT Pack")
+        self.btn_export_cpent.setProperty("class", "action-secondary")
+        self.btn_export_cpent.setToolTip("Export complete CPENT master engagement directory structure and evidence manifest in a ZIP archive")
+        self.btn_export_cpent.clicked.connect(self._export_cpent_pack)
+        header_row.addWidget(self.btn_export_cpent)
+
+        self.auto_report_checkbox = QCheckBox("Auto-update reports")
+        self.auto_report_checkbox.setToolTip(
+            "Refresh PDF, HTML, Markdown, and JSON snapshots when this project's assessment data changes."
+        )
+        self.auto_report_checkbox.setChecked(
+            QSettings("CyberSecuritySuite", "CyberSecuritySuite").value(
+                "reports/auto_enabled", False, type=bool
+            )
+        )
+        self.auto_report_checkbox.toggled.connect(self._set_auto_reports_enabled)
+        header_row.addWidget(self.auto_report_checkbox)
+
+        layout.addLayout(header_row)
+
+        # Finding Management and Filter Toolbar
+        mgmt_row = QHBoxLayout()
+        self.btn_new_finding = QPushButton("➕ New")
+        self.btn_new_finding.setToolTip("Create a new security finding")
+        self.btn_new_finding.setProperty("class", "action-primary")
+        self.btn_new_finding.clicked.connect(self._on_new_finding)
+        mgmt_row.addWidget(self.btn_new_finding)
+
+        self.btn_edit_finding = QPushButton("✏️ Edit")
+        self.btn_edit_finding.setToolTip("Edit the selected finding")
+        self.btn_edit_finding.clicked.connect(self._on_edit_finding)
+        mgmt_row.addWidget(self.btn_edit_finding)
+
+        self.btn_delete_finding = QPushButton("🗑️ Delete")
+        self.btn_delete_finding.setToolTip("Delete the selected finding")
+        self.btn_delete_finding.clicked.connect(self._on_delete_finding)
+        mgmt_row.addWidget(self.btn_delete_finding)
+
+        self.btn_status_finding = QPushButton("🛡️ Status")
+        self.btn_status_finding.setToolTip("Quick update validation status (Confirmed, Unverified, Remediated, False Positive)")
+        self.btn_status_finding.clicked.connect(self._on_quick_status)
+        mgmt_row.addWidget(self.btn_status_finding)
+
+        self.btn_attach_poc = QPushButton("📷 Attach POC")
+        self.btn_attach_poc.setProperty("class", "action-secondary")
+        self.btn_attach_poc.setToolTip("Attach a screenshot or image Proof-of-Concept to the selected finding")
+        self.btn_attach_poc.clicked.connect(self._on_attach_screenshot_poc)
+        mgmt_row.addWidget(self.btn_attach_poc)
+
+        mgmt_row.addSpacing(16)
+        mgmt_row.addWidget(QLabel("Assessment:"))
+        self.combo_filter_assessment = QComboBox()
+        self.combo_filter_assessment.addItem("All Assessments", None)
+        self.combo_filter_assessment.currentIndexChanged.connect(self._apply_filters)
+        mgmt_row.addWidget(self.combo_filter_assessment)
+
+        mgmt_row.addWidget(QLabel("Severity:"))
+        self.combo_filter_severity = QComboBox()
+        self.combo_filter_severity.addItem("All Severities", None)
+        for sev in FindingSeverity:
+            self.combo_filter_severity.addItem(sev.value.upper(), sev)
+        self.combo_filter_severity.currentIndexChanged.connect(self._apply_filters)
+        mgmt_row.addWidget(self.combo_filter_severity)
+
+        mgmt_row.addWidget(QLabel("Status:"))
+        self.combo_filter_status = QComboBox()
+        self.combo_filter_status.addItem("All Statuses", None)
+        for st in [
+            ValidationStatus.NEW,
+            ValidationStatus.CONFIRMED,
+            ValidationStatus.FALSE_POSITIVE,
+            ValidationStatus.REMEDIATION_IN_PROGRESS,
+            ValidationStatus.RESOLVED,
+            ValidationStatus.ACCEPTED_RISK,
+            ValidationStatus.UNVERIFIED,
+        ]:
+            self.combo_filter_status.addItem(st.value.replace("_", " ").title(), st)
+        self.combo_filter_status.currentIndexChanged.connect(self._apply_filters)
+        mgmt_row.addWidget(self.combo_filter_status)
+
+        mgmt_row.addStretch()
+        layout.addLayout(mgmt_row)
+
+        self.export_status = QLabel("")
+        self.export_status.setStyleSheet(f"color: {CPENTTheme.SUCCESS_GREEN}; font-size: 12px; font-weight: 500;")
+        layout.addWidget(self.export_status)
+
+        # Splitter between findings table and details panel
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Severity", "Finding Title", "Affected Asset", "Status", "Confidence", "Assessment"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        splitter.addWidget(self.table)
+
+        # Details Panel
+        details_widget = QWidget()
+        details_layout = QVBoxLayout(details_widget)
+        details_layout.setContentsMargins(0, 8, 0, 0)
+
+        details_title = QLabel("Finding Details & Remediation Guidance")
+        details_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #38bdf8;")
+        details_layout.addWidget(details_title)
+
+        self.details_edit = QTextEdit()
+        self.details_edit.setReadOnly(True)
+        details_layout.addWidget(self.details_edit)
+
+        splitter.addWidget(details_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        layout.addWidget(splitter)
+
+    def load_findings(self, project_id: Optional[int]):
+        self.active_project_id = project_id
+        self.export_status.setText("")
+
+        if project_id is None:
+            self._auto_report_signature = None
+            self._auto_report_pending_project = None
+            self.findings_cache = []
+            self.visible_findings = []
+            self.assessments_cache = []
+            self.combo_filter_assessment.clear()
+            self.combo_filter_assessment.addItem("All Assessments", None)
+            self.table.setRowCount(0)
+            self.details_edit.clear()
+            return
+
+        # Load assessments for combo filter
+        self.assessments_cache = self.db.list_assessments(project_id)
+        current_data = self.combo_filter_assessment.currentData()
+        self.combo_filter_assessment.blockSignals(True)
+        self.combo_filter_assessment.clear()
+        self.combo_filter_assessment.addItem("All Assessments", None)
+        for a in self.assessments_cache:
+            self.combo_filter_assessment.addItem(f"#{a.id} - {a.name}", a.id)
+        if current_data is not None:
+            idx = self.combo_filter_assessment.findData(current_data)
+            if idx >= 0:
+                self.combo_filter_assessment.setCurrentIndex(idx)
+        self.combo_filter_assessment.blockSignals(False)
+
+        # Query all findings for project
+        self.findings_cache = self.db.list_findings(project_id)
+        self._apply_filters()
+
+        if self.auto_report_checkbox.isChecked():
+            self._schedule_auto_report(project_id)
+
+    def _apply_filters(self):
+        """Filters cached findings by assessment, severity, and status."""
+        assessment_id = self.combo_filter_assessment.currentData()
+        sev_filter = self.combo_filter_severity.currentData()
+        status_filter = self.combo_filter_status.currentData()
+
+        filtered = []
+        for f in self.findings_cache:
+            if assessment_id is not None and getattr(f, "assessment_id", None) != assessment_id:
+                continue
+            if sev_filter is not None and f.severity != sev_filter:
+                continue
+            if status_filter is not None and f.validation_status != status_filter:
+                continue
+            filtered.append(f)
+
+        self.visible_findings = filtered
+        self.table.setRowCount(len(filtered))
+
+        for row, f in enumerate(filtered):
+            self.table.setItem(row, 0, QTableWidgetItem(str(f.id)))
+
+            sev_item = QTableWidgetItem(f.severity.value.upper())
+            color = self.SEVERITY_COLORS.get(f.severity, QColor("#94a3b8"))
+            sev_item.setForeground(color)
+            self.table.setItem(row, 1, sev_item)
+
+            self.table.setItem(row, 2, QTableWidgetItem(f.title))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{f.affected_asset} ({f.affected_port_service})"))
+
+            raw_stat = f.validation_status.value if hasattr(f.validation_status, "value") else str(f.validation_status)
+            val_item = QTableWidgetItem(raw_stat.replace("_", " ").upper())
+            val_color_hex = VALIDATION_COLORS_HEX.get(raw_stat.upper(), CPENTTheme.SECONDARY_TEXT)
+            val_item.setForeground(QColor(val_color_hex))
+            self.table.setItem(row, 4, val_item)
+
+            conf_val = getattr(f, "confidence", 1.0) or 1.0
+            self.table.setItem(row, 5, QTableWidgetItem(f"{conf_val:.1f}"))
+
+            assess_label = f"#{f.assessment_id}" if getattr(f, "assessment_id", None) else "Global"
+            self.table.setItem(row, 6, QTableWidgetItem(assess_label))
+
+        if filtered:
+            self.table.selectRow(0)
+            self._on_selection_changed()
+        else:
+            self.details_edit.clear()
+
+    def _on_new_finding(self):
+        if self.active_project_id is None:
+            QMessageBox.warning(self, "No Project Selected", "Select an active project first.")
+            return
+
+        dlg = FindingEditDialog(assessments=self.assessments_cache, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            data = dlg.get_data()
+            finding = Finding(
+                project_id=self.active_project_id,
+                title=data["title"],
+                severity=data["severity"],
+                validation_status=data["validation_status"],
+                affected_asset=data["affected_asset"],
+                affected_port_service=data["affected_port_service"],
+                assessment_id=data["assessment_id"],
+                confidence=data["confidence"],
+                description=data["description"],
+                reproduction_steps=data["reproduction_steps"],
+                remediation=data["remediation"],
+            )
+            # Deduplicate on repeated creations / imports
+            created = self.db.upsert_finding_deduplicated(finding)
+            self.load_findings(self.active_project_id)
+            self.export_status.setText(f"✓ Saved finding #{created.id} '{created.title}'")
+
+    def _on_edit_finding(self):
+        if self.active_project_id is None:
+            return
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a finding to edit.")
+            return
+        row = selected[0].row()
+        if row >= len(self.visible_findings):
+            return
+        finding = self.visible_findings[row]
+
+        dlg = FindingEditDialog(finding=finding, assessments=self.assessments_cache, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            data = dlg.get_data()
+            finding.title = data["title"]
+            finding.severity = data["severity"]
+            finding.validation_status = data["validation_status"]
+            finding.affected_asset = data["affected_asset"]
+            finding.affected_port_service = data["affected_port_service"]
+            finding.assessment_id = data["assessment_id"]
+            finding.confidence = data["confidence"]
+            finding.description = data["description"]
+            finding.reproduction_steps = data["reproduction_steps"]
+            finding.remediation = data["remediation"]
+            self.db.update_finding(finding)
+            self.load_findings(self.active_project_id)
+            self.export_status.setText(f"✓ Updated finding #{finding.id}")
+
+    def _on_delete_finding(self):
+        if self.active_project_id is None:
+            return
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a finding to delete.")
+            return
+        row = selected[0].row()
+        if row >= len(self.visible_findings):
+            return
+        finding = self.visible_findings[row]
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete finding #{finding.id} '{finding.title}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm == QMessageBox.Yes:
+            self.db.delete_finding(finding.id)
+            self.load_findings(self.active_project_id)
+            self.export_status.setText(f"✓ Deleted finding #{finding.id}")
+
+    def _on_quick_status(self):
+        if self.active_project_id is None:
+            return
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a finding to update status.")
+            return
+        row = selected[0].row()
+        if row >= len(self.visible_findings):
+            return
+        finding = self.visible_findings[row]
+
+        # Status transition dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Update Status — #{finding.id}")
+        dlg.setMinimumWidth(320)
+        d_layout = QVBoxLayout(dlg)
+        d_layout.addWidget(QLabel(f"Update status for: <b>{finding.title}</b>"))
+
+        combo = QComboBox()
+        statuses = [
+            ("New", ValidationStatus.NEW),
+            ("Confirmed", ValidationStatus.CONFIRMED),
+            ("False Positive", ValidationStatus.FALSE_POSITIVE),
+            ("Remediation in Progress", ValidationStatus.REMEDIATION_IN_PROGRESS),
+            ("Resolved", ValidationStatus.RESOLVED),
+            ("Accepted Risk", ValidationStatus.ACCEPTED_RISK),
+            ("Unverified", ValidationStatus.UNVERIFIED),
+        ]
+        for label, st in statuses:
+            combo.addItem(label, st)
+        idx = combo.findData(finding.validation_status)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        d_layout.addWidget(combo)
+
+        btn_row = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_save = QPushButton("Apply Status")
+        btn_save.setProperty("class", "action-primary")
+        btn_save.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        d_layout.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.Accepted:
+            new_st = combo.currentData()
+            self.db.update_finding_status(finding.id, new_st)
+            self.load_findings(self.active_project_id)
+            self.export_status.setText(f"✓ Finding #{finding.id} marked as {new_st.value.upper()}")
+
+    def _set_auto_reports_enabled(self, enabled: bool):
+        QSettings("CyberSecuritySuite", "CyberSecuritySuite").setValue(
+            "reports/auto_enabled", enabled
+        )
+        if not enabled:
+            self.export_status.setText("Automatic report updates are off.")
+            return
+        if self.active_project_id is not None:
+            self._schedule_auto_report(self.active_project_id, force=True)
+
+    def _schedule_auto_report(self, project_id: int, force: bool = False):
+        """Debounce report refreshes after scan, terminal, or finding updates."""
+        signature = self._report_data_signature(project_id)
+        if not force and signature == self._auto_report_signature:
+            return
+        self._auto_report_pending_project = project_id
+        QTimer.singleShot(700, lambda pid=project_id: self._write_auto_report(pid))
+
+    def _report_data_signature(self, project_id: int):
+        project = self.db.get_project(project_id)
+        scopes = self.db.list_scopes(project_id)
+        findings = self.db.list_findings(project_id)
+        executions = self.db.list_executions(project_id)
+        evidence = self.db.list_evidence(project_id)
+        asset_nodes = self.db.list_asset_nodes(project_id)
+        asset_edges = self.db.list_asset_edges(project_id)
+        return (
+            project_id,
+            (project.name, project.client_name, project.description, project.status.value,
+             project.start_date, project.end_date, project.authorization_doc, project.sow_reference)
+            if project else None,
+            tuple((s.id, s.target, s.rule_type.value, s.is_authorized, s.ports_allowed,
+                   s.expires_at, s.environment, s.notes) for s in scopes),
+            tuple((f.id, f.title, f.severity.value, f.validation_status.value, f.description,
+                   f.remediation, f.affected_asset, f.cvss_score) for f in findings),
+            tuple((e.id, e.tool_name, e.command, e.status.value, e.exit_code, e.finished_at)
+                  for e in executions),
+            tuple((e.id, e.sha256_hash, e.file_path, e.description) for e in evidence),
+            tuple((node.id, node.node_type, node.value, node.label, node.source_tool)
+                  for node in asset_nodes),
+            tuple((edge.id, edge.source_node_id, edge.target_node_id, edge.relation_type)
+                  for edge in asset_edges),
+        )
+
+    def _write_auto_report(self, project_id: int):
+        if (not self.auto_report_checkbox.isChecked()
+                or self._auto_report_pending_project != project_id
+                or self.active_project_id != project_id):
+            return
+        try:
+            project = self.db.get_project(project_id)
+            if not project:
+                return
+            output_dir = Path(__file__).resolve().parents[2] / "reports" / "output" / "auto" / f"project_{project_id}"
+            paths = self.report_builder.generate_all(project_id, output_dir, stable_names=True)
+            self._auto_report_signature = self._report_data_signature(project_id)
+            self.export_status.setText(
+                "✓ Auto-updated PDF, HTML, Markdown, and JSON reports: "
+                + ", ".join(path.name for path in paths.values())
+            )
+        except Exception as exc:
+            self.export_status.setText(f"Automatic report update failed: {exc}")
+
+    def _export_all_reports(self):
+        if self.active_project_id is None:
+            QMessageBox.warning(
+                self, "No Project Selected",
+                "Select a project in Projects before generating reports.",
+            )
+            return
+        output_dir = Path(__file__).resolve().parents[2] / "reports" / "output"
+        selected_assessment = self.combo_filter_assessment.currentData()
+        try:
+            paths = self.report_builder.generate_all(
+                self.active_project_id, output_dir, assessment_id=selected_assessment
+            )
+            self.export_status.setText("✓ Generated PDF, HTML, Markdown, and JSON reports.")
+            QMessageBox.information(
+                self, "Reports Generated",
+                "Generated all report formats:\n\n" + "\n".join(str(p) for p in paths.values()),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Failed to generate reports: {exc}")
+
+    def _on_selection_changed(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            self.details_edit.clear()
+            return
+        row = selected[0].row()
+        if row < len(self.visible_findings):
+            f = self.visible_findings[row]
+            conf_val = getattr(f, "confidence", 1.0) or 1.0
+            assess_text = f"#{f.assessment_id}" if getattr(f, "assessment_id", None) else "Global Project"
+            raw_val = f.validation_status.value if hasattr(f.validation_status, "value") else str(f.validation_status)
+            unverified_tag = " `[UNVERIFIED - PENDING EVIDENCE]`" if raw_val in ("unverified", "needs_validation") else ""
+
+            text = (
+                f"### {sanitize_text(f.title)}{unverified_tag}\n\n"
+                f"**Severity:** {f.severity.value.upper()} | **Validation Status:** {raw_val.upper()} | **Confidence:** {conf_val:.1f}\n"
+                f"**Target Asset:** {f.affected_asset} | **Service:** {f.affected_port_service}\n"
+                f"**Assessment:** {assess_text} | **Source Tool:** {f.source_tool or 'Manual'} | **Execution ID:** #{f.execution_id or 'N/A'}\n\n"
+                f"#### Description:\n{sanitize_text(f.description) or 'No description provided.'}\n\n"
+                f"#### Reproduction Steps:\n{sanitize_text(f.reproduction_steps) or 'N/A'}\n\n"
+                f"#### Recommended Remediation:\n{sanitize_text(f.remediation) or 'N/A'}\n"
+            )
+
+            # Query and verify cryptographic evidence records
+            if self.active_project_id is not None:
+                all_ev = self.db.list_evidence(self.active_project_id)
+                evidence_records = [
+                    ev for ev in all_ev
+                    if ev.finding_id == f.id or (f.execution_id and ev.execution_id == f.execution_id)
+                ]
+                text += "\n#### Cryptographic Evidence & Integrity Verification:\n"
+                if evidence_records:
+                    for ev in evidence_records:
+                        is_valid, msg = self.db.verify_evidence_integrity(ev)
+                        badge = "✅ Verified" if is_valid else "⚠️ Unverified / Warning"
+                        text += (
+                            f"- **Evidence #{ev.id}** — `{ev.file_path}` ({badge})\n"
+                            f"  - **SHA-256:** `{ev.sha256_hash}`\n"
+                            f"  - **Integrity Status:** {msg}\n"
+                            f"  - **Description:** {sanitize_text(ev.description) or 'Assessment artifact'}\n"
+                        )
+                        if (ev.mime_type and ev.mime_type.startswith("image/")) or Path(ev.file_path).suffix.lower() in (".png", ".jpg", ".jpeg"):
+                            text += f"  - **Figure:** 🖼️ Screenshot POC attached: [{Path(ev.file_path).name}](file://{Path(ev.file_path).resolve()})\n"
+                else:
+                    text += "_No standalone cryptographic evidence records attached to this finding._\n"
+
+            self.details_edit.setMarkdown(text)
+
+    def _export_cpent_pack(self):
+        """Generates and archives the official CPENT Master Engagement Pack (ZIP)."""
+        if self.active_project_id is None:
+            QMessageBox.warning(self, "No Project Selected", "Select an active project first.")
+            return
+
+        from reports.cpent_engagement_pack import CPENTEngagementPackGenerator
+
+        project = self.db.get_project(self.active_project_id)
+        if not project:
+            return
+
+        clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project.name)
+        default_filename = f"CPENT_ENGAGEMENT_{project.engagement_id or clean_name}.zip"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export CPENT Master Engagement Pack (ZIP)",
+            default_filename,
+            "ZIP Archives (*.zip)",
+        )
+        if not file_path:
+            return
+
+        try:
+            generator = CPENTEngagementPackGenerator(self.db)
+            out_zip = generator.generate_pack_zip(self.active_project_id, Path(file_path))
+            self.export_status.setText(f"✓ Exported CPENT Engagement Pack: {out_zip.name}")
+            QMessageBox.information(
+                self,
+                "CPENT Pack Exported",
+                f"Successfully exported official CPENT Master Engagement Pack:\n\n{out_zip.resolve()}\n\n"
+                f"Contains standard 16-folder hierarchy:\n"
+                f"• 00_Administration/ (Engagement Letter, RoE, NDAs, Test Plans)\n"
+                f"• 01_SISGCA/ (OSINT logs, Evidence Manifest, Scans)\n"
+                f"• 02_SEVA_Tools/ (Tool execution records & scripts)",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Failed to export CPENT Engagement Pack: {exc}")
+
+    def _on_attach_screenshot_poc(self):
+        """Attaches an image or screenshot Proof-of-Concept to the selected finding."""
+        if self.active_project_id is None:
+            QMessageBox.warning(self, "No Project Selected", "Select an active project first.")
+            return
+
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a finding to attach proof-of-concept screenshot to.")
+            return
+
+        row = selected[0].row()
+        if row >= len(self.visible_findings):
+            return
+        finding = self.visible_findings[row]
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Screenshot POC Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        src_path = Path(file_path)
+        if not src_path.exists():
+            return
+
+        import hashlib
+        import shutil
+        import time
+
+        data = src_path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+
+        # Destination in evidence vault
+        vault_dir = Path("evidence") / f"project_{self.active_project_id}"
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        dest_filename = f"poc_f{finding.id}_{int(time.time())}_{src_path.name}"
+        dest_path = vault_dir / dest_filename
+        shutil.copy2(src_path, dest_path)
+
+        suffix = src_path.suffix.lower().replace(".", "")
+        mime = f"image/{suffix}" if suffix in ("png", "jpeg", "gif", "bmp") else "image/png"
+        if suffix == "jpg":
+            mime = "image/jpeg"
+
+        from storage.models import Evidence
+
+        ev = Evidence(
+            project_id=self.active_project_id,
+            finding_id=finding.id,
+            file_path=str(dest_path.resolve()),
+            sha256_hash=sha256,
+            mime_type=mime,
+            description=f"Screenshot Proof of Concept for Finding #{finding.id}: {finding.title}",
+        )
+        self.db.add_evidence(ev)
+
+        self.export_status.setText(f"✓ Attached Screenshot POC to finding #{finding.id}")
+        self._on_selection_changed()
+        QMessageBox.information(
+            self,
+            "POC Attached",
+            f"Successfully vaulted screenshot POC for Finding #{finding.id}:\n\n"
+            f"File: {dest_path.name}\n"
+            f"SHA-256: {sha256}\n\n"
+            f"This proof will automatically be embedded in generated CPENT reports.",
+        )
+
+    def _export_report(self, fmt: str):
+        if self.active_project_id is None:
+            QMessageBox.warning(
+                self,
+                "No Project Selected",
+                "Please select an active project in 'Projects' before exporting assessment reports.",
+            )
+            return
+
+        project = self.db.get_project(self.active_project_id)
+        if not project:
+            QMessageBox.critical(self, "Error", f"Project #{self.active_project_id} not found.")
+            return
+
+        out_dir = Path("reports/output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        clean_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in project.name.lower())
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+        selected_assessment = self.combo_filter_assessment.currentData()
+        if selected_assessment:
+            clean_name += f"_assessment_{selected_assessment}"
+
+        try:
+            if fmt == "pdf":
+                file_path = out_dir / f"{clean_name}_report_{stamp}.pdf"
+                self.report_builder.generate_pdf(
+                    self.active_project_id, output_path=file_path, assessment_id=selected_assessment
+                )
+            elif fmt == "html":
+                file_path = out_dir / f"{clean_name}_report_{stamp}.html"
+                self.report_builder.generate_html(
+                    self.active_project_id, output_path=file_path, assessment_id=selected_assessment
+                )
+            elif fmt == "markdown":
+                file_path = out_dir / f"{clean_name}_report_{stamp}.md"
+                self.report_builder.generate_markdown(
+                    self.active_project_id, output_path=file_path, assessment_id=selected_assessment
+                )
+            elif fmt == "json":
+                file_path = out_dir / f"{clean_name}_report_{stamp}.json"
+                self.report_builder.generate_json(
+                    self.active_project_id, output_path=file_path, assessment_id=selected_assessment
+                )
+            else:
+                return
+
+            self.export_status.setText(f"✓ Generated {fmt.upper()} report: {file_path.name}")
+            QMessageBox.information(
+                self,
+                "Report Generated Successfully",
+                f"Assessment report exported in {fmt.upper()} format to:\n\n{file_path.resolve()}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to generate report: {e}")

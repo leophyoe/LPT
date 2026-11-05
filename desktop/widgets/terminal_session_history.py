@@ -1,0 +1,551 @@
+"""Terminal Session History & Evidence Vault Widget for CyberSecuritySuite.
+
+Displays vaulted terminal sessions with cryptographic SHA-256 hashes, recorded
+commands, working directories, and execution exit statuses. Supports inspection of
+raw ANSI, clean plain text, and redacted report-ready outputs.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import List, Optional
+
+from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from desktop.theme import CPENTTheme
+from storage.db import Database
+from storage.models import Project, TerminalSessionRecord
+from terminal.recorder import redact_sensitive_text
+
+
+class SessionViewerDialog(QDialog):
+    """Dialog showing detailed session logs with tabs for Plain Text, Redacted, Raw, and JSON."""
+
+    def __init__(self, session: TerminalSessionRecord, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.setWindowTitle(f"Terminal Session Vault — {session.session_id}")
+        self.resize(850, 550)
+
+        layout = QVBoxLayout(self)
+
+        # Header Info Banner
+        header = QVBoxLayout()
+        title = QLabel(f"🖥️ Terminal Session: {session.session_id}")
+        title.setStyleSheet(f"font-weight: bold; font-size: 14px; color: {CPENTTheme.PRIMARY_BLUE}; font-family: {CPENTTheme.FONT_FAMILY_HEADING};")
+        header.addWidget(title)
+
+        time_range = f"{session.started_at} to {session.ended_at or 'Incomplete'}"
+        meta = QLabel(
+            f"Directory: {session.working_directory} | Exit: {session.exit_status} | Commands: {session.command_count}\n"
+            f"Recorded: {time_range}\n"
+            f"SHA-256: {session.sha256_hash}"
+        )
+        meta.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-family: {CPENTTheme.FONT_FAMILY_MONO}; font-size: 11px;")
+        header.addWidget(meta)
+        layout.addLayout(header)
+
+        # Tabs for different representations
+        tabs = QTabWidget()
+
+        # 1. Clean Plain Text
+        self.txt_plain = QPlainTextEdit()
+        self.txt_plain.setReadOnly(True)
+        if session.plain_text_path and os.path.exists(session.plain_text_path):
+            try:
+                plain_content = Path(session.plain_text_path).read_text(encoding="utf-8", errors="replace")
+                self.txt_plain.setPlainText(plain_content)
+            except Exception as e:
+                self.txt_plain.setPlainText(f"Error loading plain text log: {e}")
+        else:
+            self.txt_plain.setPlainText("Plain text log file not found on disk.")
+        tabs.addTab(self.txt_plain, "📄 Clean Plain Text")
+
+        # 2. Redacted Report View
+        self.txt_redacted = QPlainTextEdit()
+        self.txt_redacted.setReadOnly(True)
+        redacted_content = redact_sensitive_text(self.txt_plain.toPlainText())
+        self.txt_redacted.setPlainText(redacted_content)
+        tabs.addTab(self.txt_redacted, "🛡️ Redacted Report Preview")
+
+        # 3. Raw ANSI Log
+        self.txt_raw = QPlainTextEdit()
+        self.txt_raw.setReadOnly(True)
+        if session.raw_output_path and os.path.exists(session.raw_output_path):
+            try:
+                raw_content = Path(session.raw_output_path).read_text(encoding="utf-8", errors="replace")
+                self.txt_raw.setPlainText(raw_content)
+            except Exception as e:
+                self.txt_raw.setPlainText(f"Error loading raw ANSI log: {e}")
+        else:
+            self.txt_raw.setPlainText("Raw ANSI log file not found on disk.")
+        tabs.addTab(self.txt_raw, "🖥️ Raw ANSI Stream")
+
+        # 4. JSON Events & Commands
+        self.txt_json = QPlainTextEdit()
+        self.txt_json.setReadOnly(True)
+        events_json_path = (
+            Path(session.plain_text_path).with_suffix(".json")
+            if session.plain_text_path
+            else None
+        )
+        if events_json_path and events_json_path.exists():
+            try:
+                json_content = events_json_path.read_text(encoding="utf-8", errors="replace")
+                self.txt_json.setPlainText(json_content)
+            except Exception:
+                self.txt_json.setPlainText(session.commands_json or "[]")
+        else:
+            self.txt_json.setPlainText(session.commands_json or "[]")
+        tabs.addTab(self.txt_json, "📊 Structured JSON Events")
+
+        layout.addWidget(tabs)
+
+        # Bottom Buttons
+        btn_bar = QHBoxLayout()
+        btn_bar.addStretch()
+
+        btn_copy = QPushButton("📋 Copy Current View")
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(tabs.currentWidget().toPlainText()))
+        btn_bar.addWidget(btn_copy)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        btn_bar.addWidget(btn_close)
+
+        layout.addLayout(btn_bar)
+
+
+class TerminalSessionHistoryWidget(QWidget):
+    """Vault and management interface for recorded terminal sessions."""
+
+    project_data_updated = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.active_project: Optional[Project] = None
+        self.db: Optional[Database] = None
+        self._sessions: List[TerminalSessionRecord] = []
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # Top Control Bar in horizontal scroll area for responsive fitting
+        top_bar_scroll = QScrollArea()
+        top_bar_scroll.setWidgetResizable(True)
+        top_bar_scroll.setFixedHeight(38)
+        top_bar_scroll.setFrameShape(QFrame.NoFrame)
+        top_bar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        top_bar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        top_container = QWidget()
+        top_bar = QHBoxLayout(top_container)
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(6)
+
+        self.lbl_title = QLabel("🔒 Recorded Sessions & Vault")
+        self.lbl_title.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {CPENTTheme.PRIMARY_BLUE};")
+        top_bar.addWidget(self.lbl_title)
+        top_bar.addStretch()
+
+        self.btn_refresh = QPushButton("🔄 Refresh")
+        self.btn_refresh.setFixedHeight(24)
+        self.btn_refresh.clicked.connect(self.load_sessions)
+        top_bar.addWidget(self.btn_refresh)
+
+        self.btn_view = QPushButton("👁️ View Content")
+        self.btn_view.setFixedHeight(24)
+        self.btn_view.setEnabled(False)
+        self.btn_view.clicked.connect(self._on_view_clicked)
+        top_bar.addWidget(self.btn_view)
+
+        self.btn_export = QPushButton("📤 Export")
+        self.btn_export.setFixedHeight(24)
+        self.btn_export.setEnabled(False)
+        self.btn_export.clicked.connect(self._on_export_clicked)
+        top_bar.addWidget(self.btn_export)
+
+        self.btn_copy_hash = QPushButton("📋 Copy Hash")
+        self.btn_copy_hash.setFixedHeight(24)
+        self.btn_copy_hash.setEnabled(False)
+        self.btn_copy_hash.clicked.connect(self._on_copy_hash_clicked)
+        top_bar.addWidget(self.btn_copy_hash)
+
+        self.btn_verify_integrity = QPushButton("🔍 Verify Integrity")
+        self.btn_verify_integrity.setFixedHeight(24)
+        self.btn_verify_integrity.setEnabled(False)
+        self.btn_verify_integrity.clicked.connect(self._on_verify_integrity_clicked)
+        top_bar.addWidget(self.btn_verify_integrity)
+
+        self.btn_ingest = QPushButton("📥 Ingest Session Assets")
+        self.btn_ingest.setFixedHeight(24)
+        self.btn_ingest.setEnabled(False)
+        self.btn_ingest.setToolTip("Extract and synchronize discovered hosts, ports, and findings into Project Assets")
+        self.btn_ingest.setStyleSheet(
+            "QPushButton { background-color: #0284c7; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 2px 8px; }"
+            "QPushButton:hover { background-color: #0369a1; }"
+            "QPushButton:disabled { background-color: #1e293b; color: #64748b; }"
+        )
+        self.btn_ingest.clicked.connect(self._on_ingest_clicked)
+        top_bar.addWidget(self.btn_ingest)
+
+        top_bar_scroll.setWidget(top_container)
+        layout.addWidget(top_bar_scroll)
+
+        # Sessions Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "Session ID",
+            "Recorded At",
+            "Directory",
+            "Exit",
+            "Commands",
+            "SHA-256 Hash",
+            "Evidence Link",
+        ])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.itemDoubleClicked.connect(self._on_view_clicked)
+        layout.addWidget(self.table)
+
+    def set_context(self, project: Optional[Project], db: Optional[Database]):
+        """Sets current active project and database instance."""
+        self.active_project = project
+        self.db = db
+        self.load_sessions()
+
+    def load_sessions(self):
+        """Loads and displays all sessions for the active project from SQLite."""
+        self.table.setRowCount(0)
+        self._sessions.clear()
+        self.btn_view.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_copy_hash.setEnabled(False)
+        self.btn_verify_integrity.setEnabled(False)
+        self.btn_ingest.setEnabled(False)
+
+        if not self.active_project or not self.db:
+            return
+
+        try:
+            self._sessions = self.db.list_terminal_sessions(self.active_project.id)
+            self.table.setRowCount(len(self._sessions))
+
+            for row_idx, s in enumerate(self._sessions):
+                item_id = QTableWidgetItem(s.session_id)
+                item_id.setFlags(item_id.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                item_time = QTableWidgetItem(s.started_at[:19].replace("T", " "))
+                item_time.setFlags(item_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                item_cwd = QTableWidgetItem(s.working_directory)
+                item_cwd.setFlags(item_cwd.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                exit_str = str(s.exit_status) if s.exit_status is not None else "0"
+                item_exit = QTableWidgetItem(exit_str)
+                item_exit.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_exit.setFlags(item_exit.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                item_cmds = QTableWidgetItem(str(s.command_count))
+                item_cmds.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_cmds.setFlags(item_cmds.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                hash_str = s.sha256_hash or "-"
+                item_hash = QTableWidgetItem(hash_str)
+                item_hash.setToolTip(s.sha256_hash)
+                item_hash.setFlags(item_hash.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                ev_str = f"Evidence #{s.evidence_id}" if s.evidence_id else "Not Vaulted"
+                item_ev = QTableWidgetItem(ev_str)
+                item_ev.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_ev.setFlags(item_ev.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                self.table.setItem(row_idx, 0, item_id)
+                self.table.setItem(row_idx, 1, item_time)
+                self.table.setItem(row_idx, 2, item_cwd)
+                self.table.setItem(row_idx, 3, item_exit)
+                self.table.setItem(row_idx, 4, item_cmds)
+                self.table.setItem(row_idx, 5, item_hash)
+                self.table.setItem(row_idx, 6, item_ev)
+        except Exception:
+            pass
+
+    @Slot()
+    def _on_selection_changed(self):
+        has_sel = len(self.table.selectedItems()) > 0
+        self.btn_view.setEnabled(has_sel)
+        self.btn_export.setEnabled(has_sel)
+        self.btn_copy_hash.setEnabled(has_sel)
+        self.btn_verify_integrity.setEnabled(has_sel)
+        self.btn_ingest.setEnabled(has_sel)
+
+    def _get_selected_session(self) -> Optional[TerminalSessionRecord]:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._sessions):
+            return self._sessions[row]
+        return None
+
+    @Slot()
+    def _on_verify_integrity_clicked(self):
+        sess = self._get_selected_session()
+        if not sess:
+            return
+
+        # 1. Check via DB evidence record if linked
+        if sess.evidence_id and self.db:
+            is_valid, msg = self.db.verify_evidence_integrity(sess.evidence_id)
+            if is_valid:
+                QMessageBox.information(
+                    self,
+                    "Cryptographic Hash Verified",
+                    f"Session: {sess.session_id}\nEvidence #{sess.evidence_id}\n\n✅ {msg}",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Integrity Verification Alert",
+                    f"Session: {sess.session_id}\nEvidence #{sess.evidence_id}\n\n⚠️ {msg}",
+                )
+            return
+
+        # 2. Direct session file cryptographic hash verification
+        target_path = Path(sess.raw_output_path) if sess.raw_output_path and Path(sess.raw_output_path).exists() else (
+            Path(sess.plain_text_path) if sess.plain_text_path and Path(sess.plain_text_path).exists() else None
+        )
+        if not target_path or not target_path.exists():
+            QMessageBox.warning(
+                self,
+                "Artifact Not Found",
+                f"Session: {sess.session_id}\n\n⚠️ Session log file is not found on disk:\n{sess.raw_output_path or sess.plain_text_path}",
+            )
+            return
+
+        import hashlib
+        hasher = hashlib.sha256()
+        try:
+            with open(target_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
+            computed = hasher.hexdigest().lower()
+            expected = (sess.sha256_hash or "").strip().lower()
+
+            if not expected:
+                QMessageBox.warning(
+                    self,
+                    "No Reference Hash",
+                    f"Session: {sess.session_id}\n\nComputed SHA-256: {computed}\n(No expected hash recorded in session metadata)",
+                )
+            elif computed == expected:
+                QMessageBox.information(
+                    self,
+                    "Cryptographic Integrity Confirmed",
+                    f"Session: {sess.session_id}\nFile: {target_path.name}\n\n✅ SHA-256 cryptographic match confirmed:\n{computed}",
+                )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Integrity Violation Detected!",
+                    f"Session: {sess.session_id}\n\n⚠️ Cryptographic hash mismatch!\nExpected: {expected}\nComputed: {computed}",
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Verification Error", f"Failed computing file hash: {exc}")
+
+    @Slot()
+    def _on_view_clicked(self):
+        sess = self._get_selected_session()
+        if not sess:
+            return
+        dlg = SessionViewerDialog(sess, parent=self)
+        dlg.exec()
+
+    @Slot()
+    def _on_export_clicked(self):
+        sess = self._get_selected_session()
+        if not sess or not sess.plain_text_path or not os.path.exists(sess.plain_text_path):
+            QMessageBox.warning(self, "Export Failed", "Plain text session file is not available on disk.")
+            return
+
+        default_name = f"export_{sess.session_id}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Session Plain Text",
+            default_name,
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if file_path:
+            try:
+                content = Path(sess.plain_text_path).read_text(encoding="utf-8")
+                Path(file_path).write_text(content, encoding="utf-8")
+                QMessageBox.information(self, "Export Complete", f"Session log exported successfully to:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export session log: {e}")
+
+    @Slot()
+    def _on_copy_hash_clicked(self):
+        sess = self._get_selected_session()
+        if sess and sess.sha256_hash:
+            QApplication.clipboard().setText(sess.sha256_hash)
+            QMessageBox.information(self, "Hash Copied", f"SHA-256 Hash copied to clipboard:\n\n{sess.sha256_hash}")
+
+    @Slot()
+    def _on_ingest_clicked(self):
+        """Retroactively parses and synchronizes scanner results from the selected session."""
+        sess = self._get_selected_session()
+        if not sess:
+            return
+
+        if not self.active_project or not self.db:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project in Projects & Scope before ingesting session assets.",
+            )
+            return
+
+        # Load session plain text content
+        content = ""
+        if sess.plain_text_path and os.path.exists(sess.plain_text_path):
+            try:
+                content = Path(sess.plain_text_path).read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                QMessageBox.critical(self, "Read Error", f"Failed reading session log: {e}")
+                return
+        elif sess.raw_output_path and os.path.exists(sess.raw_output_path):
+            try:
+                from terminal.recorder import strip_ansi
+                raw_bytes = Path(sess.raw_output_path).read_text(encoding="utf-8", errors="replace")
+                content = strip_ansi(raw_bytes)
+            except Exception as e:
+                QMessageBox.critical(self, "Read Error", f"Failed reading raw session log: {e}")
+                return
+
+        if not content.strip():
+            QMessageBox.warning(
+                self,
+                "Empty Session Log",
+                "Selected session log is empty or could not be found on disk.",
+            )
+            return
+
+        from modules.network.nmap_parser import NmapParser
+        from terminal.ingest import TerminalIngestEngine
+        from desktop.dialogs.scanner_preview_dialog import ScannerResultPreviewDialog
+        from core.asset_inventory import AssetInventoryService
+
+        cmd = "Recorded Session"
+        try:
+            if sess.commands_json:
+                cmds = json.loads(sess.commands_json)
+                if isinstance(cmds, list) and cmds:
+                    for c in reversed(cmds):
+                        cmd_str = c if isinstance(c, str) else c.get("command", "")
+                        if "nmap" in cmd_str.lower() or "scan" in cmd_str.lower():
+                            cmd = cmd_str
+                            break
+        except Exception:
+            pass
+
+        scan_res = None
+        findings = []
+        try:
+            scan_res = NmapParser.parse_text(content)
+        except Exception:
+            pass
+
+        try:
+            findings = TerminalIngestEngine._parse_nmap(
+                content, self.active_project.id, sess.evidence_id, command=cmd
+            )
+        except Exception:
+            pass
+
+        has_hosts = bool(scan_res and scan_res.hosts)
+        has_findings = bool(findings)
+
+        if not has_hosts and not has_findings:
+            QMessageBox.information(
+                self,
+                "No Scan Data Detected",
+                f"Session {sess.session_id} does not contain recognized network scan output (such as Nmap host discovery, port scans, or service banners).\n\n"
+                f"Only recognized scan outputs can be synchronized into Project Assets.",
+            )
+            return
+
+        dialog = ScannerResultPreviewDialog(
+            tool_name="nmap" if "nmap" in cmd.lower() else "session-vault",
+            command=cmd,
+            scan_result=scan_res,
+            findings=findings,
+            raw_output=content,
+            db=self.db,
+            project=self.active_project,
+            parent=self,
+        )
+
+        if dialog.exec() == ScannerResultPreviewDialog.DialogCode.Accepted:
+            # Sync approved hosts
+            if dialog.confirmed_hosts and self.db:
+                try:
+                    from modules.network.nmap_parser import NmapScanResult
+                    approved_scan = NmapScanResult(command_args=cmd, hosts=dialog.confirmed_hosts)
+                    AssetInventoryService(self.db).sync_scan_assets(
+                        project_id=self.active_project.id,
+                        scan_result=approved_scan,
+                        scopes=self.db.list_scopes(self.active_project.id),
+                        source_tool="session-vault",
+                        evidence_id=sess.evidence_id,
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(self, "Sync Warning", f"Error syncing assets: {exc}")
+
+            # Sync approved findings
+            for f in dialog.confirmed_findings:
+                f.project_id = self.active_project.id
+                f.evidence_id = sess.evidence_id
+                f.source_tool = "session-vault"
+                self.db.upsert_finding_deduplicated(f)
+
+            self.project_data_updated.emit()
+            QMessageBox.information(
+                self,
+                "Ingestion Complete",
+                f"Successfully ingested {len(dialog.confirmed_hosts)} host(s) and {len(dialog.confirmed_findings)} finding(s) "
+                f"from Session {sess.session_id} into Project '{self.active_project.name}'.",
+            )
+
+

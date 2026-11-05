@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Cyber Sentinel 3D Network Topology</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #080c14; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #f8fafc; }
+    #canvas-container { width: 100%; height: 100%; position: absolute; top: 0; left: 0; }
+    canvas { width: 100%; height: 100%; display: block; }
+    
+    /* Overlay HUD */
+    .hud-panel {
+      position: absolute;
+      background: rgba(15, 23, 42, 0.82);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(51, 65, 85, 0.7);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 11px;
+      pointer-events: auto;
+      z-index: 10;
+    }
+    
+    .hud-top-left {
+      top: 14px;
+      left: 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .hud-top-left .title {
+      font-weight: 700;
+      color: #38bdf8;
+      letter-spacing: 0.5px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .hud-top-left .badge {
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+    }
+    
+    .hud-top-right {
+      top: 14px;
+      right: 14px;
+      display: flex;
+      gap: 6px;
+    }
+    .hud-btn {
+      background: #1e293b;
+      color: #94a3b8;
+      border: 1px solid #334155;
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      transition: all 0.15s ease;
+    }
+    .hud-btn:hover {
+      background: #334155;
+      color: #f8fafc;
+      border-color: #475569;
+    }
+    .hud-btn.active {
+      background: #0284c7;
+      color: #ffffff;
+      border-color: #38bdf8;
+    }
+    
+    .hud-legend {
+      bottom: 14px;
+      left: 14px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: #94a3b8;
+    }
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    
+    .hud-stats {
+      bottom: 14px;
+      right: 14px;
+      color: #64748b;
+    }
+    .hud-stats span {
+      color: #38bdf8;
+      font-weight: 600;
+    }
+
+    /* Node Hover Tooltip */
+    #tooltip {
+      position: absolute;
+      display: none;
+      background: rgba(15, 23, 42, 0.94);
+      backdrop-filter: blur(12px);
+      border: 1px solid #38bdf8;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 12px rgba(56, 189, 248, 0.3);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 11px;
+      pointer-events: none;
+      z-index: 20;
+      min-width: 170px;
+      transform: translate(-50%, -120%);
+      transition: opacity 0.1s ease;
+    }
+    #tooltip .tt-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: #f8fafc;
+      margin-bottom: 2px;
+    }
+    #tooltip .tt-ip {
+      color: #38bdf8;
+      font-family: monospace;
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    #tooltip .tt-row {
+      display: flex;
+      justify-content: space-between;
+      color: #94a3b8;
+      margin-top: 3px;
+    }
+    #tooltip .tt-val {
+      font-weight: 600;
+      color: #e2e8f0;
+    }
+    #tooltip .tt-risk-critical { color: #ef4444; }
+    #tooltip .tt-risk-high { color: #f97316; }
+    #tooltip .tt-risk-medium { color: #eab308; }
+    #tooltip .tt-risk-clean { color: #22c55e; }
+  </style>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <div id="canvas-container">
+    <canvas id="webglCanvas"></canvas>
+  </div>
+
+  <div class="hud-panel hud-top-left">
+    <div class="title"><span>🛡️</span> CYBER SENTINEL 3D MESH</div>
+    <div class="badge" id="hudMeshStatus">ONLINE</div>
+  </div>
+
+  <div class="hud-panel hud-top-right">
+    <button class="hud-btn" id="btnAutoRotate">⟳ Auto-Rotate</button>
+    <button class="hud-btn" id="btnResetCamera">⌖ Reset View</button>
+    <button class="hud-btn" id="btnZoomIn">+</button>
+    <button class="hud-btn" id="btnZoomOut">−</button>
+  </div>
+
+  <div class="hud-panel hud-legend">
+    <div class="legend-item"><div class="legend-dot" style="background: #ef4444;"></div> Critical</div>
+    <div class="legend-item"><div class="legend-dot" style="background: #f97316;"></div> High</div>
+    <div class="legend-item"><div class="legend-dot" style="background: #eab308;"></div> Medium</div>
+    <div class="legend-item"><div class="legend-dot" style="background: #22c55e;"></div> Secure</div>
+    <div class="legend-item"><div class="legend-dot" style="background: #38bdf8;"></div> Gateway / Hub</div>
+  </div>
+
+  <div class="hud-panel hud-stats">
+    Nodes: <span id="statNodeCount">0</span> · Active Links: <span id="statLinkCount">0</span>
+  </div>
+
+  <div id="tooltip">
+    <div class="tt-title" id="ttTitle">Host</div>
+    <div class="tt-ip" id="ttIp">192.168.1.1</div>
+    <div class="tt-row"><span>Type:</span><span class="tt-val" id="ttType">Server</span></div>
+    <div class="tt-row"><span>Open Ports:</span><span class="tt-val" id="ttPorts">0</span></div>
+    <div class="tt-row"><span>Risk Posture:</span><span class="tt-val" id="ttRisk">Secure</span></div>
+  </div>
+
+  <script>
+    // --- Pure WebGL 3D Graph Engine ---
+    (function() {
+      const canvas = document.getElementById('webglCanvas');
+      const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+      if (!gl) {
+        document.body.innerHTML = '<div style="padding:20px;color:#ef4444;">WebGL not supported in this environment.</div>';
+        return;
+      }
+
+      // PyChannel Bridge Connection
+      let pyBridge = null;
+      if (typeof QWebChannel !== 'undefined') {
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+          pyBridge = channel.objects.pyBridge;
+        });
+      }
+
+      // Matrix Math Library (Self-contained)
+      const Mat4 = {
+        perspective: function(out, fovy, aspect, near, far) {
+          const f = 1.0 / Math.tan(fovy / 2);
+          const nf = 1 / (near - far);
+          out[0] = f / aspect; out[1] = 0; out[2] = 0; out[3] = 0;
+          out[4] = 0; out[5] = f; out[6] = 0; out[7] = 0;
+          out[8] = 0; out[9] = 0; out[10] = (far + near) * nf; out[11] = -1;
+          out[12] = 0; out[13] = 0; out[14] = (2 * far * near) * nf; out[15] = 0;
+          return out;
+        },
+        lookAt: function(out, eye, center, up) {
+          let x0, x1, x2, y0, y1, y2, z0, z1, z2, len;
+          let eyex = eye[0], eyey = eye[1], eyez = eye[2];
+          let upx = up[0], upy = up[1], upz = up[2];
+          let centerx = center[0], centery = center[1], centerz = center[2];
+
+          z0 = eyex - centerx; z1 = eyey - centery; z2 = eyez - centerz;
+          len = 1 / Math.hypot(z0, z1, z2);
+          z0 *= len; z1 *= len; z2 *= len;
+
+          x0 = upy * z2 - upz * z1; x1 = upz * z0 - upx * z2; x2 = upx * z1 - upy * z0;
+          len = 1 / Math.hypot(x0, x1, x2);
+          x0 *= len; x1 *= len; x2 *= len;
+
+          y0 = z1 * x2 - z2 * x1; y1 = z2 * x0 - z0 * x2; y2 = z0 * x1 - z1 * x0;
+          len = 1 / Math.hypot(y0, y1, y2);
+          y0 *= len; y1 *= len; y2 *= len;
+
+          out[0] = x0; out[1] = y0; out[2] = z0; out[3] = 0;
+          out[4] = x1; out[5] = y1; out[6] = z1; out[7] = 0;
+          out[8] = x2; out[9] = y2; out[10] = z2; out[11] = 0;
+          out[12] = -(x0 * eyex + x1 * eyey + x2 * eyez);
+          out[13] = -(y0 * eyex + y1 * eyey + y2 * eyez);
+          out[14] = -(z0 * eyex + z1 * eyey + z2 * eyez);
+          out[15] = 1;
+          return out;
+        },
+        multiply: function(out, a, b) {
+          let a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
+          let a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+          let a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+          let a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+
+          let b0  = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+          out[0] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+          out[1] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+          out[2] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+          out[3] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+
+          b0 = b[4]; b1 = b[5]; b2 = b[6]; b3 = b[7];
+          out[4] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+          out[5] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+          out[6] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+          out[7] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+
+          b0 = b[8]; b1 = b[9]; b2 = b[10]; b3 = b[11];
+          out[8] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+          out[9] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+          out[10] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+          out[11] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+
+          b0 = b[12]; b1 = b[13]; b2 = b[14]; b3 = b[15];
+          out[12] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+          out[13] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+          out[14] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+          out[15] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+          return out;
+        }
+      };
+
+      // Shaders
+      const vsSource = `
+        attribute vec3 aPosition;
+        attribute vec3 aNormal;
+        uniform mat4 uProjection;
+        uniform mat4 uView;
+        uniform vec3 uOffset;
+        uniform float uScale;
+        varying vec3 vNormal;
+        varying vec3 vPosition;
+
+        void main(void) {
+          vec3 worldPos = aPosition * uScale + uOffset;
+          gl_Position = uProjection * uView * vec4(worldPos, 1.0);
+          vNormal = aNormal;
+          vPosition = worldPos;
+        }
+      `;
+
+      const fsSource = `
+        precision mediump float;
+        uniform vec3 uColor;
+        uniform vec3 uLightPos;
+        uniform float uSelected;
+        varying vec3 vNormal;
+        varying vec3 vPosition;
+
+        void main(void) {
+          vec3 lightDir = normalize(uLightPos - vPosition);
+          float diff = max(dot(normalize(vNormal), lightDir), 0.25);
+          vec3 viewDir = normalize(vec3(0.0, 0.0, 1.0) - vPosition);
+          float rim = 1.0 - max(dot(normalize(vNormal), viewDir), 0.0);
+          rim = smoothstep(0.5, 1.0, rim);
+
+          vec3 baseColor = uColor * diff + vec3(0.12, 0.2, 0.3) * (1.0 - diff);
+          if (uSelected > 0.5) {
+            baseColor += vec3(0.4, 0.8, 1.0) * rim;
+          }
+          gl_FragColor = vec4(baseColor, 1.0);
+        }
+      `;
+
+      // Line Shaders for Connections
+      const vsLineSource = `
+        attribute vec3 aPosition;
+        uniform mat4 uProjection;
+        uniform mat4 uView;
+        void main(void) {
+          gl_Position = uProjection * uView * vec4(aPosition, 1.0);
+        }
+      `;
+      const fsLineSource = `
+        precision mediump float;
+        uniform vec4 uColor;
+        void main(void) {
+          gl_FragColor = uColor;
+        }
+      `;
+
+      function createShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.error(gl.getShaderInfoLog(shader));
+          gl.deleteShader(shader);
+          return null;
+        }
+        return shader;
+      }
+
+      function createProgram(gl, vs, fs) {
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          console.error(gl.getProgramInfoLog(program));
+          return null;
+        }
+        return program;
+      }
+
+      const sphereProg = createProgram(gl, createShader(gl, gl.VERTEX_SHADER, vsSource), createShader(gl, gl.FRAGMENT_SHADER, fsSource));
+      const lineProg = createProgram(gl, createShader(gl, gl.VERTEX_SHADER, vsLineSource), createShader(gl, gl.FRAGMENT_SHADER, fsLineSource));
+
+      // Build Sphere Geometry
+      function createSphere(radius, lats, longs) {
+        const positions = [];
+        const normals = [];
+        const indices = [];
+
+        for (let i = 0; i <= lats; ++i) {
+          const theta = (i * Math.PI) / lats;
+          const sinTheta = Math.sin(theta);
+          const cosTheta = Math.cos(theta);
+
+          for (let j = 0; j <= longs; ++j) {
+            const phi = (j * 2 * Math.PI) / longs;
+            const x = Math.cos(phi) * sinTheta;
+            const y = cosTheta;
+            const z = Math.sin(phi) * sinTheta;
+
+            normals.push(x, y, z);
+            positions.push(radius * x, radius * y, radius * z);
+          }
+        }
+
+        for (let i = 0; i < lats; ++i) {
+          for (let j = 0; j < longs; ++j) {
+            const first = i * (longs + 1) + j;
+            const second = first + longs + 1;
+            indices.push(first, second, first + 1);
+            indices.push(second, second + 1, first + 1);
+          }
+        }
+
+        return {
+          positions: new Float32Array(positions),
+          normals: new Float32Array(normals),
+          indices: new Uint16Array(indices)
+        };
+      }
+
+      const sphereGeo = createSphere(1.0, 16, 24);
+      const spherePosBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, spherePosBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, sphereGeo.positions, gl.STATIC_DRAW);
+
+      const sphereNormBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, sphereNormBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, sphereGeo.normals, gl.STATIC_DRAW);
+
+      const sphereIdxBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sphereIdxBuf);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphereGeo.indices, gl.STATIC_DRAW);
+
+      // Line Buffer
+      const linePosBuf = gl.createBuffer();
+
+      // Camera State
+      const camera = {
+        yaw: 0.35,
+        pitch: 0.3,
+        dist: 45.0,
+        target: [0, 0, 0],
+        autoRotate: true
+      };
+
+      let isDragging = false;
+      let dragButton = 0;
+      let lastMouseX = 0;
+      let lastMouseY = 0;
+      let hoveredNode = null;
+      let selectedNode = null;
+
+      // Graph Data Model
+      let graphNodes = [];
+      let graphLinks = [];
+
+      // Color Palette Map
+      function getSeverityColor(sev) {
+        switch ((sev || '').toLowerCase()) {
+          case 'critical': return [0.93, 0.27, 0.27]; // #EF4444
+          case 'high': return [0.98, 0.45, 0.09];     // #F97316
+          case 'medium': return [0.92, 0.70, 0.03];   // #EAB308
+          case 'low':
+          case 'info': return [0.22, 0.74, 0.97];     // #38BDF8
+          default: return [0.13, 0.77, 0.37];         // #22C55E (Secure)
+        }
+      }
+
+      // Default Demonstration Topology if empty
+      function loadDefaultGraph() {
+        const nodes = [
+          { id: 'wan_0', label: 'Internet / WAN', ip: '0.0.0.0/0', type: 'Gateway', sev: 'info', x: 0, y: 16, z: 0, scale: 2.2, color: [0.22, 0.74, 0.97] },
+          { id: 'gw_0', label: 'FGT-XS-01 Firewall', ip: '192.168.1.1', type: 'Firewall', sev: 'info', x: 0, y: 8, z: 0, scale: 2.0, color: [0.02, 0.71, 0.83] },
+          
+          // Subnet 1: DMZ
+          { id: 'sub_1', label: 'DMZ 192.168.10.0/24', ip: '192.168.10.1', type: 'Subnet', sev: 'info', x: -16, y: 0, z: -8, scale: 1.6, color: [0.5, 0.4, 0.9] },
+          { id: 'h_101', label: 'web-prod-01', ip: '192.168.10.10', type: 'Web Server', sev: 'critical', ports: 3, x: -22, y: -6, z: -12, scale: 1.4, color: [0.93, 0.27, 0.27] },
+          { id: 'h_102', label: 'api-gateway', ip: '192.168.10.20', type: 'API', sev: 'high', ports: 2, x: -14, y: -7, z: -14, scale: 1.3, color: [0.98, 0.45, 0.09] },
+          
+          // Subnet 2: Internal LAN
+          { id: 'sub_2', label: 'LAN 192.168.20.0/24', ip: '192.168.20.1', type: 'Subnet', sev: 'info', x: 16, y: 0, z: -8, scale: 1.6, color: [0.5, 0.4, 0.9] },
+          { id: 'h_201', label: 'dc-primary.corp', ip: '192.168.20.5', type: 'Domain Controller', sev: 'medium', ports: 7, x: 22, y: -6, z: -12, scale: 1.5, color: [0.92, 0.70, 0.03] },
+          { id: 'h_202', label: 'file-share-01', ip: '192.168.20.15', type: 'File Server', sev: 'clean', ports: 2, x: 14, y: -7, z: -14, scale: 1.2, color: [0.13, 0.77, 0.37] },
+          
+          // Subnet 3: Database Tier
+          { id: 'sub_3', label: 'DB 192.168.30.0/24', ip: '192.168.30.1', type: 'Subnet', sev: 'info', x: 0, y: -4, z: 12, scale: 1.6, color: [0.5, 0.4, 0.9] },
+          { id: 'h_301', label: 'db-cluster-master', ip: '192.168.30.50', type: 'Database', sev: 'clean', ports: 1, x: 0, y: -10, z: 18, scale: 1.3, color: [0.13, 0.77, 0.37] }
+        ];
+
+        const links = [
+          { source: 'wan_0', target: 'gw_0' },
+          { source: 'gw_0', target: 'sub_1' },
+          { source: 'gw_0', target: 'sub_2' },
+          { source: 'gw_0', target: 'sub_3' },
+          { source: 'sub_1', target: 'h_101' },
+          { source: 'sub_1', target: 'h_102' },
+          { source: 'sub_2', target: 'h_201' },
+          { source: 'sub_2', target: 'h_202' },
+          { source: 'sub_3', target: 'h_301' }
+        ];
+
+        setGraphData({ nodes, links });
+      }
+
+      function setGraphData(data) {
+        graphNodes = data.nodes || [];
+        graphLinks = data.links || [];
+
+        // Build position lookup for fast line vertex generation
+        const nodeMap = {};
+        graphNodes.forEach(n => {
+          nodeMap[n.id] = n;
+          if (!n.color) n.color = getSeverityColor(n.sev);
+          if (!n.scale) n.scale = 1.3;
+        });
+
+        // Generate line coordinates
+        const lineCoords = [];
+        graphLinks.forEach(link => {
+          const s = nodeMap[link.source];
+          const t = nodeMap[link.target];
+          if (s && t) {
+            lineCoords.push(s.x, s.y, s.z);
+            lineCoords.push(t.x, t.y, t.z);
+          }
+        });
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, linePosBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lineCoords), gl.STATIC_DRAW);
+
+        document.getElementById('statNodeCount').innerText = graphNodes.length;
+        document.getElementById('statLinkCount').innerText = graphLinks.length;
+      }
+
+      // Public API for PySide6 integration
+      window.updateGraphData = function(jsonStr) {
+        try {
+          const data = typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
+          setGraphData(data);
+        } catch (e) {
+          console.error("Failed to parse graph data:", e);
+        }
+      };
+
+      // Raycasting for Node Hover/Click
+      function getProjectedNode(node, view, proj, width, height) {
+        const p = [node.x, node.y, node.z, 1.0];
+        // Multiply by view
+        const vp = [
+          view[0]*p[0] + view[4]*p[1] + view[8]*p[2] + view[12]*p[3],
+          view[1]*p[0] + view[5]*p[1] + view[9]*p[2] + view[13]*p[3],
+          view[2]*p[0] + view[6]*p[1] + view[10]*p[2] + view[14]*p[3],
+          view[3]*p[0] + view[7]*p[1] + view[11]*p[2] + view[15]*p[3]
+        ];
+        // Multiply by proj
+        const cp = [
+          proj[0]*vp[0] + proj[4]*vp[1] + proj[8]*vp[2] + proj[12]*vp[3],
+          proj[1]*vp[0] + proj[5]*vp[1] + proj[9]*vp[2] + proj[13]*vp[3],
+          proj[2]*vp[0] + proj[6]*vp[1] + proj[10]*vp[2] + proj[14]*vp[3],
+          proj[3]*vp[0] + proj[7]*vp[1] + proj[11]*vp[2] + proj[15]*vp[3]
+        ];
+        if (cp[3] <= 0) return null;
+        const ndcX = cp[0] / cp[3];
+        const ndcY = cp[1] / cp[3];
+        const screenX = (ndcX * 0.5 + 0.5) * width;
+        const screenY = (-ndcY * 0.5 + 0.5) * height;
+        const screenRadius = (node.scale / cp[3]) * (height * 0.5);
+        return { x: screenX, y: screenY, r: Math.max(screenRadius, 14), z: cp[2] };
+      }
+
+      function findNodeAt(clientX, clientY, view, proj, width, height) {
+        let best = null;
+        let minZ = Infinity;
+
+        for (let i = 0; i < graphNodes.length; i++) {
+          const n = graphNodes[i];
+          const projNode = getProjectedNode(n, view, proj, width, height);
+          if (!projNode) continue;
+
+          const dx = clientX - projNode.x;
+          const dy = clientY - projNode.y;
+          const dist = Math.hypot(dx, dy);
+
+          if (dist <= projNode.r && projNode.z < minZ) {
+            minZ = projNode.z;
+            best = { node: n, screenX: projNode.x, screenY: projNode.y };
+          }
+        }
+        return best;
+      }
+
+      // Input Event Handlers
+      window.addEventListener('resize', resizeCanvas);
+      function resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      resizeCanvas();
+
+      canvas.addEventListener('mousedown', function(e) {
+        isDragging = true;
+        dragButton = e.button;
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+      });
+
+      window.addEventListener('mouseup', function(e) {
+        if (isDragging) {
+          isDragging = false;
+        }
+      });
+
+      canvas.addEventListener('mousemove', function(e) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        if (isDragging) {
+          const dx = e.clientX - lastMouseX;
+          const dy = e.clientY - lastMouseY;
+          lastMouseX = e.clientX;
+          lastMouseY = e.clientY;
+
+          if (dragButton === 0) {
+            // Left drag: Orbit
+            camera.yaw += dx * 0.008;
+            camera.pitch += dy * 0.008;
+            camera.pitch = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45, camera.pitch));
+          } else if (dragButton === 2) {
+            // Right drag: Pan
+            camera.target[0] -= dx * 0.04;
+            camera.target[1] += dy * 0.04;
+          }
+          return;
+        }
+
+        // Raycasting Hover
+        const view = getCameraViewMatrix();
+        const proj = getCameraProjMatrix();
+        const hit = findNodeAt(mouseX, mouseY, view, proj, canvas.clientWidth, canvas.clientHeight);
+
+        const tooltip = document.getElementById('tooltip');
+        if (hit) {
+          hoveredNode = hit.node;
+          canvas.style.cursor = 'pointer';
+          tooltip.style.display = 'block';
+          tooltip.style.left = hit.screenX + 'px';
+          tooltip.style.top = hit.screenY + 'px';
+
+          document.getElementById('ttTitle').innerText = hit.node.label || hit.node.id;
+          document.getElementById('ttIp').innerText = hit.node.ip || '—';
+          document.getElementById('ttType').innerText = hit.node.type || 'Host';
+          document.getElementById('ttPorts').innerText = hit.node.ports !== undefined ? hit.node.ports : '—';
+          
+          const riskEl = document.getElementById('ttRisk');
+          const sev = (hit.node.sev || 'clean').toUpperCase();
+          riskEl.innerText = sev;
+          riskEl.className = 'tt-val tt-risk-' + (hit.node.sev || 'clean').toLowerCase();
+        } else {
+          hoveredNode = null;
+          canvas.style.cursor = 'default';
+          tooltip.style.display = 'none';
+        }
+      });
+
+      canvas.addEventListener('click', function(e) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        const view = getCameraViewMatrix();
+        const proj = getCameraProjMatrix();
+        const hit = findNodeAt(mouseX, mouseY, view, proj, canvas.clientWidth, canvas.clientHeight);
+
+        if (hit) {
+          selectedNode = hit.node;
+          console.log("Selected node:", hit.node.id, hit.node.ip);
+          
+          // Communicate to PySide6 via PyBridge or window event
+          if (pyBridge && pyBridge.onNodeSelected) {
+            pyBridge.onNodeSelected(hit.node.id, hit.node.ip);
+          } else if (window.qt && window.qt.onNodeSelected) {
+            window.qt.onNodeSelected(hit.node.id, hit.node.ip);
+          }
+        }
+      });
+
+      canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+      canvas.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        camera.dist += e.deltaY * 0.05;
+        camera.dist = Math.max(10.0, Math.min(120.0, camera.dist));
+      }, { passive: false });
+
+      // HUD Button Controls
+      const btnAuto = document.getElementById('btnAutoRotate');
+      btnAuto.classList.add('active');
+      btnAuto.addEventListener('click', function() {
+        camera.autoRotate = !camera.autoRotate;
+        btnAuto.classList.toggle('active', camera.autoRotate);
+      });
+
+      document.getElementById('btnResetCamera').addEventListener('click', function() {
+        camera.yaw = 0.35;
+        camera.pitch = 0.3;
+        camera.dist = 45.0;
+        camera.target = [0, 0, 0];
+      });
+
+      document.getElementById('btnZoomIn').addEventListener('click', function() {
+        camera.dist = Math.max(10.0, camera.dist - 5.0);
+      });
+
+      document.getElementById('btnZoomOut').addEventListener('click', function() {
+        camera.dist = Math.min(120.0, camera.dist + 5.0);
+      });
+
+      // Camera Matrices
+      const projMatrix = new Float32Array(16);
+      const viewMatrix = new Float32Array(16);
+
+      function getCameraProjMatrix() {
+        const aspect = canvas.clientWidth / canvas.clientHeight;
+        return Mat4.perspective(projMatrix, 45 * Math.PI / 180, aspect, 0.1, 500.0);
+      }
+
+      function getCameraViewMatrix() {
+        const cy = Math.cos(camera.yaw);
+        const sy = Math.sin(camera.yaw);
+        const cp = Math.cos(camera.pitch);
+        const sp = Math.sin(camera.pitch);
+
+        const eye = [
+          camera.target[0] + camera.dist * sy * cp,
+          camera.target[1] + camera.dist * sp,
+          camera.target[2] + camera.dist * cy * cp
+        ];
+        return Mat4.lookAt(viewMatrix, eye, camera.target, [0, 1, 0]);
+      }
+
+      // Render Loop
+      let lastTime = performance.now();
+      function render(now) {
+        requestAnimationFrame(render);
+
+        const dt = (now - lastTime) / 1000;
+        lastTime = now;
+
+        if (camera.autoRotate && !isDragging) {
+          camera.yaw += dt * 0.12;
+        }
+
+        gl.clearColor(0.031, 0.047, 0.078, 1.0); // #080C14
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST);
+
+        const proj = getCameraProjMatrix();
+        const view = getCameraViewMatrix();
+
+        // 1. Draw Links
+        if (graphLinks.length > 0) {
+          gl.useProgram(lineProg);
+          const uProjL = gl.getUniformLocation(lineProg, 'uProjection');
+          const uViewL = gl.getUniformLocation(lineProg, 'uView');
+          const uColorL = gl.getUniformLocation(lineProg, 'uColor');
+          gl.uniformMatrix4fv(uProjL, false, proj);
+          gl.uniformMatrix4fv(uViewL, false, view);
+          gl.uniform4f(uColorL, 0.14, 0.23, 0.35, 0.7); // Subtle cyber blue link
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, linePosBuf);
+          const aPosL = gl.getAttribLocation(lineProg, 'aPosition');
+          gl.enableVertexAttribArray(aPosL);
+          gl.vertexAttribPointer(aPosL, 3, gl.FLOAT, false, 0, 0);
+
+          gl.drawArrays(gl.LINES, 0, graphLinks.length * 2);
+        }
+
+        // 2. Draw Sphere Nodes
+        gl.useProgram(sphereProg);
+        const uProj = gl.getUniformLocation(sphereProg, 'uProjection');
+        const uView = gl.getUniformLocation(sphereProg, 'uView');
+        const uOffset = gl.getUniformLocation(sphereProg, 'uOffset');
+        const uScale = gl.getUniformLocation(sphereProg, 'uScale');
+        const uColor = gl.getUniformLocation(sphereProg, 'uColor');
+        const uLightPos = gl.getUniformLocation(sphereProg, 'uLightPos');
+        const uSelected = gl.getUniformLocation(sphereProg, 'uSelected');
+
+        gl.uniformMatrix4fv(uProj, false, proj);
+        gl.uniformMatrix4fv(uView, false, view);
+        gl.uniform3f(uLightPos, 20.0, 40.0, 30.0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, spherePosBuf);
+        const aPos = gl.getAttribLocation(sphereProg, 'aPosition');
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, sphereNormBuf);
+        const aNorm = gl.getAttribLocation(sphereProg, 'aNormal');
+        gl.enableVertexAttribArray(aNorm);
+        gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sphereIdxBuf);
+
+        for (let i = 0; i < graphNodes.length; i++) {
+          const n = graphNodes[i];
+          const isHover = (hoveredNode && hoveredNode.id === n.id);
+          const isSel = (selectedNode && selectedNode.id === n.id);
+          const scale = (n.scale || 1.3) * (isHover ? 1.25 : (isSel ? 1.15 : 1.0));
+
+          gl.uniform3f(uOffset, n.x, n.y, n.z);
+          gl.uniform1f(uScale, scale);
+          gl.uniform3f(uColor, n.color[0], n.color[1], n.color[2]);
+          gl.uniform1f(uSelected, (isHover || isSel) ? 1.0 : 0.0);
+
+          gl.drawElements(gl.TRIANGLES, sphereGeo.indices.length, gl.UNSIGNED_SHORT, 0);
+        }
+      }
+
+      // Initialize
+      loadDefaultGraph();
+      requestAnimationFrame(render);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,1153 @@
+"""Main application window for CyberSecuritySuite desktop platform."""
+
+from typing import Optional
+
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QSplitter,
+    QSplitterHandle,
+    QStackedWidget,
+    QStatusBar,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.registry import ToolRegistry
+from desktop.theme import CPENTTheme, DARK_THEME_QSS, ThemeManager, ThemeMode
+from desktop.widgets.sidebar_nav import SidebarNavWidget
+
+
+class WorkspaceSplitterHandle(QSplitterHandle):
+    """Prominent tactile drag handle with centered grip bar, hover glow, and double-click split toggle."""
+
+    def __init__(self, orientation: Qt.Orientation, parent: QSplitter):
+        super().__init__(orientation, parent)
+        self.setCursor(Qt.CursorShape.SplitVCursor if orientation == Qt.Orientation.Vertical else Qt.CursorShape.SplitHCursor)
+        self.setToolTip("↕ Drag up/down to resize Assessment Workspace and Terminal (Double-click to toggle 50/50 split)")
+        self._hovered = False
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        splitter = self.splitter()
+        if splitter and hasattr(splitter, "toggle_quick_split"):
+            splitter.toggle_quick_split()
+        super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        is_light = ThemeManager.instance().is_light
+        bg_color = QColor("#E9EEF4") if is_light else QColor("#1A1D24")
+        painter.fillRect(self.rect(), bg_color)
+
+        border_color = QColor("#C7D0DA") if is_light else QColor("#2B303C")
+        painter.setPen(border_color)
+        painter.drawLine(0, 0, self.width(), 0)
+        painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+
+        # Center physical grip pill
+        w = 96
+        h = 4
+        cx = (self.width() - w) // 2
+        cy = (self.height() - h) // 2
+
+        if self._hovered:
+            grip_color = QColor("#B42318") if is_light else QColor("#D32F2F")
+        else:
+            grip_color = QColor("#64748B") if is_light else QColor("#94A3B8")
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(grip_color)
+        painter.drawRoundedRect(cx, cy, w, h, 2, 2)
+
+        # 3 subtle tactile grip dots inside the pill
+        dot_color = QColor("#FFFFFF") if self._hovered else (QColor("#CBD5E1") if is_light else QColor("#1E2128"))
+        painter.setBrush(dot_color)
+        for offset in (-24, 0, 24):
+            painter.drawEllipse(cx + w // 2 + offset - 1, cy + 1, 2, 2)
+
+        painter.end()
+
+
+class WorkspaceSplitter(QSplitter):
+    """Custom vertical splitter utilizing prominent tactile drag handle."""
+
+    def createHandle(self) -> QSplitterHandle:
+        return WorkspaceSplitterHandle(self.orientation(), self)
+
+    def toggle_quick_split(self):
+        sizes = self.sizes()
+        total = sum(sizes) or 800
+        half = total // 2
+        if abs(sizes[0] - half) < 50:
+            self.setSizes([int(total * 0.72), int(total * 0.28)])
+        else:
+            self.setSizes([half, half])
+from desktop.views.active_directory_view import ActiveDirectoryView
+from desktop.views.ai_chat_view import AIChatView
+from desktop.views.assets_view import AssetsView
+from desktop.views.cpent_labs_view import CPENTLabsView
+from desktop.views.dashboard_view import DashboardView
+from desktop.views.findings_view import FindingsView
+from desktop.views.network_scan_view import NetworkScanView
+from desktop.views.osint_view import OSINTView
+from desktop.views.projects_view import ProjectsView
+from desktop.views.reports_view import ReportsView
+from desktop.views.tools_view import ToolsDashboardView
+from desktop.views.visualization_workspace import VisualizationWorkspace
+from desktop.views.web_scan_view import WebScanView
+from desktop.views.wireless_iot_view import WirelessIoTView
+from desktop.widgets.code_security_workbench import CodeSecurityWorkbenchWidget
+from desktop.widgets.pivoting_assistant_widget import PivotingAssistantWidget
+from desktop.widgets.terminal_view import TerminalWidget
+from desktop.widgets.topology_designer import TopologyDesignerWidget
+from storage.db import Database
+from storage.models import Project, ProjectStatus
+
+
+class MainWindow(QMainWindow):
+    """Core desktop window integrating sidebar, workspace views, and terminal."""
+
+    def __init__(self, db: Database, registry: Optional[ToolRegistry] = None):
+        super().__init__()
+        self.db = db
+        self.registry = registry or ToolRegistry()
+        self.active_project: Optional[Project] = None
+
+        self.theme_manager = ThemeManager.instance()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+
+        self.setWindowTitle("CyberSecuritySuite — Security Testing & CPENT Platform")
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
+        self.setMinimumSize(900, 500)
+        self._init_window_geometry()
+        self.theme_manager.apply_theme(self)
+
+        self._init_ui()
+        self._init_status_bar()
+        self._select_initial_project()
+
+    def _init_window_geometry(self):
+        """Sizes and centers the window to comfortably fit the active screen without overflowing."""
+        from PySide6.QtWidgets import QApplication
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            # Calculate target width and height within 92% of available space
+            target_w = max(900, min(1200, int(avail.width() * 0.94)))
+            target_h = max(500, min(700, int(avail.height() * 0.90)))
+            self.resize(target_w, target_h)
+            # Center on screen so it never starts pushed below display
+            x = avail.x() + max(0, (avail.width() - target_w) // 2)
+            y = avail.y() + max(0, (avail.height() - target_h) // 2)
+            self.move(x, y)
+        else:
+            self.resize(1024, 600)
+
+    def _init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 1. Left Modern Collapsible Sidebar Navigation
+        self.sidebar_nav = SidebarNavWidget(self)
+        self.sidebar_nav.route_requested.connect(self._on_sidebar_route_requested)
+        main_layout.addWidget(self.sidebar_nav)
+
+        # Legacy button compatibility container (retained for backward compatibility and test suites)
+        self._legacy_nav_container = QWidget(self)
+        self._legacy_nav_container.setVisible(False)
+        legacy_layout = QVBoxLayout(self._legacy_nav_container)
+
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+
+        # 4 Core Consolidated Navigation Workspaces (Preserved for tests)
+        self.btn_scope_projects = self._create_nav_btn("◈  Projects", 0)
+        self.btn_security_workspace = self._create_nav_btn("💻  Assessment", 1)
+        self.btn_findings_reports = self._create_nav_btn("✦  Reports", 2)
+        self.btn_cpent_labs = self._create_nav_btn("▣  Labs & Playbooks", 3)
+
+        legacy_layout.addWidget(self.btn_scope_projects)
+        legacy_layout.addWidget(self.btn_security_workspace)
+        legacy_layout.addWidget(self.btn_findings_reports)
+        legacy_layout.addWidget(self.btn_cpent_labs)
+
+        self.btn_toggle_ai_panel = QPushButton("🤖  AI Assistant")
+        self.btn_toggle_ai_panel.setObjectName("btnToggleAIPanel")
+        self.btn_toggle_ai_panel.setProperty("class", "nav-btn")
+        self.btn_toggle_ai_panel.setStyleSheet("text-align: left; padding: 8px 12px; font-weight: 500;")
+        self.btn_toggle_ai_panel.setToolTip("Toggle Right AI Assistant Panel (Ctrl+L / Ctrl+I)")
+        self.btn_toggle_ai_panel.setCheckable(True)
+        self.btn_toggle_ai_panel.setChecked(True)
+        self.btn_toggle_ai_panel.clicked.connect(lambda: self._toggle_ai_panel())
+        legacy_layout.addWidget(self.btn_toggle_ai_panel)
+
+        self.btn_theme_toggle = self.sidebar_nav.btn_theme
+        self.btn_theme_toggle.setObjectName("btnThemeToggle")
+        self.btn_theme_toggle.clicked.connect(self._toggle_theme)
+        self._update_theme_toggle_ui()
+
+        self.btn_ai_settings = self.sidebar_nav.btn_settings
+
+        # Navigation aliases preserving backward compatibility and automated routing
+        self.btn_projects = self.btn_scope_projects
+        self.btn_dashboard = self._create_sub_nav_btn(0, 1)
+        self.btn_network = self._create_sub_nav_btn(1, 0)
+        self.btn_web = self._create_sub_nav_btn(1, 1)
+        self.btn_osint = self._create_sub_nav_btn(1, 2)
+        self.btn_tools = self._create_sub_nav_btn(1, 3)
+        self.btn_topology = self._create_sub_nav_btn(1, 4)
+        self.btn_findings = self.btn_findings_reports
+        self.btn_cpent = self.btn_cpent_labs
+        self.btn_ai_chat = QPushButton("🤖 AI Assistant")
+        self.btn_ai_chat.clicked.connect(self._focus_ai_panel)
+
+        # 2. Right Content Area (Splitter between Views and Terminal)
+        content_splitter = WorkspaceSplitter(Qt.Orientation.Vertical)
+        self.content_splitter = content_splitter
+        content_splitter.setObjectName("workspaceSplitter")
+        content_splitter.setHandleWidth(14)
+        content_splitter.setChildrenCollapsible(True)
+
+        # Bottom Integrated Terminal Panel created first so Views can link to its engine & shell
+        self.terminal_widget = TerminalWidget(db=self.db)
+        self.terminal_widget.assessment_id_getter = self.get_active_assessment_id
+
+        # Top Views Stack (Consolidated into 4 Workspaces)
+        self.view_stack = QStackedWidget()
+
+        # Workspace 0: Scope & Projects Workspace
+        self.scope_projects_widget = QWidget()
+        scope_layout = QVBoxLayout(self.scope_projects_widget)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.setSpacing(0)
+        self.scope_tabs = QTabWidget()
+        self.projects_view = ProjectsView(self.db)
+        self.dashboard_view = DashboardView(self.db)
+        self.assets_view = AssetsView(self.db)
+        self.scope_tabs.addTab(self.projects_view, "◈ Scope && Rules")
+        self.scope_tabs.addTab(self.dashboard_view, "⌂ Dashboard")
+        self.scope_tabs.addTab(self.assets_view, "📋 Asset Inventory")
+        if hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+            self.scope_tabs.tabBar().setVisible(False)
+        scope_layout.addWidget(self.scope_tabs)
+
+        # Workspace 1: Security Workspace (Terminal-Centric Assessment & Modules)
+        self.security_workspace_widget = QWidget()
+        sec_layout = QVBoxLayout(self.security_workspace_widget)
+        sec_layout.setContentsMargins(0, 0, 0, 0)
+        sec_layout.setSpacing(0)
+        self.security_tabs = QTabWidget()
+        ai_engine = getattr(self.terminal_widget, "ai_assistant", None)
+        self.network_view = NetworkScanView(self.db)
+        self.web_view = WebScanView(self.db)
+        self.osint_view = OSINTView(self.db)
+        self.tools_view = ToolsDashboardView(self.db, self.registry)
+        self.topology_view = TopologyDesignerWidget(db=self.db)
+        self.visualization_workspace = VisualizationWorkspace(self.db)
+        self.wireless_iot_view = WirelessIoTView(db=self.db)
+        self.wireless_iot_view.findings_updated.connect(self._on_terminal_project_data_updated)
+        self.ad_view = ActiveDirectoryView(db=self.db)
+        self.pivoting_view = PivotingAssistantWidget(db=self.db)
+        self.code_security_view = CodeSecurityWorkbenchWidget(db=self.db)
+
+        self.security_tabs.addTab(self.network_view, "◎ Network Discovery")
+        self.security_tabs.addTab(self.web_view, "◇ Web Testing")
+        self.security_tabs.addTab(self.osint_view, "🔎 OSINT")
+        self.security_tabs.addTab(self.tools_view, "⚙ Tools")
+        self.security_tabs.addTab(self.topology_view, "🗺️ Infrastructure Network Map Studio")
+        self.security_tabs.addTab(self.wireless_iot_view, "📡 Wireless && IoT")
+        self.security_tabs.addTab(self.ad_view, "🏢 Active Directory")
+        self.security_tabs.addTab(self.pivoting_view, "🔀 Pivoting && Tunneling")
+        self.security_tabs.addTab(self.code_security_view, "🛡️ Code Security (SAST)")
+        self.security_tabs.addTab(self.visualization_workspace, "🌐 Enterprise Cyber Terrain")
+        self.security_tabs.setCurrentWidget(self.network_view)
+        sec_layout.addWidget(self.security_tabs)
+
+        # Workspace 2: Findings & Reports
+        self.findings_reports_widget = QWidget()
+        findings_reports_layout = QVBoxLayout(self.findings_reports_widget)
+        findings_reports_layout.setContentsMargins(0, 0, 0, 0)
+        findings_reports_layout.setSpacing(0)
+        self.findings_reports_tabs = QTabWidget()
+        self.reports_view = ReportsView(self.db)
+        self.findings_view = FindingsView(self.db)
+        self.findings_reports_tabs.addTab(self.reports_view, "📊 Report Generator && Executive Dashboard")
+        self.findings_reports_tabs.addTab(self.findings_view, "🎯 Findings Triage && Evidence")
+        if hasattr(self.findings_reports_tabs, "tabBar") and self.findings_reports_tabs.tabBar():
+            self.findings_reports_tabs.tabBar().setVisible(False)
+        findings_reports_layout.addWidget(self.findings_reports_tabs)
+
+        # Workspace 3: CPENT Labs & Methodology
+        self.cpent_view = CPENTLabsView(db=self.db)
+        self.cpent_labs_widget = self.cpent_view
+
+        self.view_stack.addWidget(self.scope_projects_widget)
+        self.view_stack.addWidget(self.security_workspace_widget)
+        self.view_stack.addWidget(self.findings_reports_widget)
+        self.view_stack.addWidget(self.cpent_labs_widget)
+
+        content_splitter.addWidget(self.view_stack)
+        content_splitter.addWidget(self.terminal_widget)
+        # Child indices are only valid after both widgets have been added.
+        content_splitter.setCollapsible(0, True)
+        content_splitter.setCollapsible(1, True)
+
+        # Default: Start with terminal visible (VS Code-style persistent bottom panel)
+        self._terminal_expanded = False
+        self._terminal_visible = True
+        self._normal_splitter_sizes = [680, 240]
+        content_splitter.setStretchFactor(0, 7)
+        content_splitter.setStretchFactor(1, 3)
+        self.terminal_widget.setMinimumHeight(120)
+        self.view_stack.setMinimumHeight(240)
+        content_splitter.setSizes([680, 240])
+
+        # 2. Main Horizontal Splitter between Center Workspace and Right AI Assistant Panel
+        self.main_horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_horizontal_splitter.setObjectName("mainHorizontalSplitter")
+        self.main_horizontal_splitter.setHandleWidth(6)
+        self.main_horizontal_splitter.setChildrenCollapsible(True)
+
+        self.main_horizontal_splitter.addWidget(content_splitter)
+
+        # Right Persistent AI Assistant Panel
+        self.right_ai_panel = QWidget()
+        self.right_ai_panel.setObjectName("rightAIPanel")
+        self.right_ai_panel.setMinimumWidth(260)
+        right_ai_layout = QVBoxLayout(self.right_ai_panel)
+        right_ai_layout.setContentsMargins(0, 0, 0, 0)
+        right_ai_layout.setSpacing(0)
+
+        self.ai_chat_view = AIChatView(db=self.db, engine=ai_engine.engine if ai_engine else None)
+        self.ai_chat_view.collapse_requested.connect(lambda: self._toggle_ai_panel(force_visible=False))
+        right_ai_layout.addWidget(self.ai_chat_view)
+
+        self.main_horizontal_splitter.addWidget(self.right_ai_panel)
+        self.main_horizontal_splitter.setStretchFactor(0, 7)
+        self.main_horizontal_splitter.setStretchFactor(1, 3)
+
+        main_layout.addWidget(self.main_horizontal_splitter)
+
+        # Connect inter-view signals
+        self.projects_view.project_selected.connect(self._on_project_selected)
+        if hasattr(self.projects_view, "scope_updated"):
+            self.projects_view.scope_updated.connect(self._on_scope_updated)
+        self.dashboard_view.project_selected.connect(self._on_project_selected)
+        self.tools_view.open_scanner_requested.connect(self._on_open_scanner_requested)
+        self.tools_view.open_shell_requested.connect(self._on_open_shell_requested)
+        self.ai_chat_view.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        self.dashboard_view.navigate_requested.connect(self._on_dashboard_navigation)
+        self.terminal_widget.project_data_updated.connect(self._on_terminal_project_data_updated)
+        self.terminal_widget.project_selected.connect(self._on_project_selected)
+        self.terminal_widget.expand_requested.connect(self._toggle_terminal_expanded)
+        self.terminal_widget.collapse_requested.connect(self._collapse_terminal)
+        self.terminal_widget.split_half_requested.connect(self._split_half)
+        self.osint_view.project_data_updated.connect(self._on_terminal_project_data_updated)
+        self.network_view.project_selected.connect(self._on_project_selected)
+        self.network_view.scan_completed.connect(self._on_nmap_scan_completed)
+        if hasattr(self.network_view, "open_network_map_requested"):
+            self.network_view.open_network_map_requested.connect(
+                lambda: self._navigate_to_workspace_subtab(1, 4)
+            )
+        self.web_view.project_data_updated.connect(self._on_terminal_project_data_updated)
+        if hasattr(self, "assets_view") and hasattr(self.assets_view, "project_data_updated"):
+            self.assets_view.project_data_updated.connect(self._on_terminal_project_data_updated)
+        if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "tab_pivoting"):
+            self.cpent_view.tab_pivoting.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "tab_ad_playbook"):
+            self.cpent_view.tab_ad_playbook.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "tab_exam_sim"):
+            self.cpent_view.tab_exam_sim.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        if hasattr(self, "ad_view") and hasattr(self.ad_view, "command_to_shell_requested"):
+            self.ad_view.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        if hasattr(self, "pivoting_view") and hasattr(self.pivoting_view, "command_to_shell_requested"):
+            self.pivoting_view.command_to_shell_requested.connect(self._on_ai_command_to_shell)
+        self.btn_scope_projects.setChecked(True)
+
+        # Global shortcuts to toggle AI Assistant panel (Ctrl+L / Ctrl+I)
+        self.shortcut_ai_l = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.shortcut_ai_l.activated.connect(lambda: self._toggle_ai_panel())
+        self.shortcut_ai_i = QShortcut(QKeySequence("Ctrl+I"), self)
+        self.shortcut_ai_i.activated.connect(lambda: self._toggle_ai_panel())
+
+        # Context-aware updates when switching workspaces or security sub-tabs
+        self.view_stack.currentChanged.connect(self._on_workspace_view_changed)
+        self.security_tabs.currentChanged.connect(self._on_security_tab_changed)
+
+        # Restore layout state and initialize context
+        self._restore_ai_panel_settings()
+        self._on_workspace_view_changed(0)
+
+        # Startup default landing view: ⌂ Dashboard
+        if hasattr(self, "scope_tabs") and hasattr(self, "dashboard_view"):
+            self.scope_tabs.setCurrentWidget(self.dashboard_view)
+        if hasattr(self, "sidebar_nav"):
+            self.sidebar_nav.select_item("dashboard")
+
+        # Global shortcut to toggle terminal dock (Ctrl+` / F12)
+        self.shortcut_term_backtick = QShortcut(QKeySequence("Ctrl+`"), self)
+        self.shortcut_term_backtick.activated.connect(self._toggle_terminal_visibility)
+        self.shortcut_term_f12 = QShortcut(QKeySequence("F12"), self)
+        self.shortcut_term_f12.activated.connect(self._toggle_terminal_visibility)
+
+    def _toggle_terminal_visibility(self):
+        """Toggles the persistent bottom terminal panel visible or hidden (VS Code Ctrl+` behavior)."""
+        if getattr(self, "_terminal_visible", True):
+            # Hide terminal
+            current_sizes = self.content_splitter.sizes()
+            if len(current_sizes) == 2 and current_sizes[1] > 40:
+                self._normal_splitter_sizes = current_sizes
+            self.terminal_widget.setMinimumHeight(0)
+            self.content_splitter.setSizes([1000, 0])
+            self._terminal_visible = False
+            self._terminal_expanded = False
+            if hasattr(self.terminal_widget, "btn_collapse_terminal"):
+                self.terminal_widget.btn_collapse_terminal.setText("▲ Show")
+                self.terminal_widget.btn_collapse_terminal.setToolTip("Show bottom terminal panel (Ctrl+` or F12)")
+        else:
+            # Show terminal
+            sizes = self._normal_splitter_sizes if (self._normal_splitter_sizes and self._normal_splitter_sizes[1] > 40) else [680, 240]
+            self.terminal_widget.setMinimumHeight(120)
+            self.content_splitter.setSizes(sizes)
+            self._terminal_visible = True
+            self._terminal_expanded = False
+            if hasattr(self.terminal_widget, "btn_collapse_terminal"):
+                self.terminal_widget.btn_collapse_terminal.setText("✕ Hide")
+                self.terminal_widget.btn_collapse_terminal.setToolTip("Hide bottom terminal panel (Ctrl+` or F12)")
+            if hasattr(self.terminal_widget, "cmd_input"):
+                self.terminal_widget.cmd_input.setFocus()
+
+    def _toggle_terminal_expanded(self):
+        """Toggles maximizing the terminal to full height vs restoring normal split."""
+        if not self._terminal_expanded:
+            current_sizes = self.content_splitter.sizes()
+            if len(current_sizes) == 2 and current_sizes[1] > 40:
+                self._normal_splitter_sizes = current_sizes
+            self.terminal_widget.setMinimumHeight(130)
+            self.view_stack.setMinimumHeight(0)
+            self.content_splitter.setSizes([0, 1000])
+            self._terminal_expanded = True
+            self._terminal_visible = True
+            if hasattr(self.terminal_widget, "btn_expand_terminal"):
+                self.terminal_widget.btn_expand_terminal.setText("⤡ Restore")
+                self.terminal_widget.btn_expand_terminal.setToolTip("Restore workspace and terminal split")
+            if hasattr(self.terminal_widget, "cmd_input"):
+                self.terminal_widget.cmd_input.setFocus()
+        else:
+            self.view_stack.setMinimumHeight(240)
+            sizes = self._normal_splitter_sizes if (self._normal_splitter_sizes and self._normal_splitter_sizes[1] > 40) else [680, 240]
+            self.content_splitter.setSizes(sizes)
+            self._terminal_expanded = False
+            self._terminal_visible = True
+            if hasattr(self.terminal_widget, "btn_expand_terminal"):
+                self.terminal_widget.btn_expand_terminal.setText("⤢ Maximize")
+                self.terminal_widget.btn_expand_terminal.setToolTip("Maximize terminal to full workspace height")
+
+    def _collapse_terminal(self):
+        """Collapses / hides the bottom terminal panel."""
+        self._toggle_terminal_visibility()
+
+    def _split_half(self):
+        """Splits the workspace and terminal equally 50/50."""
+        self.terminal_widget.setMinimumHeight(120)
+        self.view_stack.setMinimumHeight(200)
+        total = sum(self.content_splitter.sizes()) or 800
+        half = total // 2
+        self._normal_splitter_sizes = [half, half]
+        self.content_splitter.setSizes([half, half])
+        self._terminal_visible = True
+        self._terminal_expanded = False
+        if hasattr(self.terminal_widget, "btn_expand_terminal"):
+            self.terminal_widget.btn_expand_terminal.setText("⤢ Maximize")
+        if hasattr(self.terminal_widget, "btn_collapse_terminal"):
+            self.terminal_widget.btn_collapse_terminal.setText("✕ Hide")
+
+    def _toggle_ai_panel(self, force_visible: Optional[bool] = None):
+        """Toggles or sets the visibility of the right persistent AI Assistant panel."""
+        if not hasattr(self, "right_ai_panel"):
+            return
+
+        current_vis = self.right_ai_panel.isVisible()
+        new_vis = (not current_vis) if force_visible is None else bool(force_visible)
+
+        self.right_ai_panel.setVisible(new_vis)
+        if hasattr(self, "btn_toggle_ai_panel"):
+            self.btn_toggle_ai_panel.setChecked(new_vis)
+
+        if new_vis:
+            # If splitter sizes collapsed to 0 or panel has negligible width, restore sizes
+            sizes = self.main_horizontal_splitter.sizes()
+            if len(sizes) == 2 and sizes[1] < 180:
+                total = sum(sizes) or self.width()
+                ai_w = max(280, min(380, int(total * 0.28)))
+                self.main_horizontal_splitter.setSizes([max(500, total - ai_w), ai_w])
+            self.ai_chat_view.focus_input()
+
+        self._save_ai_panel_settings()
+
+    def _focus_ai_panel(self):
+        """Ensures the right AI panel is visible and focuses the input edit."""
+        if not self.right_ai_panel.isVisible():
+            self._toggle_ai_panel(force_visible=True)
+        self.ai_chat_view.focus_input()
+
+    def _save_ai_panel_settings(self):
+        """Persists AI panel visibility and splitter sizes to QSettings."""
+        try:
+            settings = QSettings("CyberSecuritySuite", "Layout")
+            if hasattr(self, "right_ai_panel"):
+                settings.setValue("ai_panel_visible", self.right_ai_panel.isVisible())
+            if hasattr(self, "main_horizontal_splitter"):
+                settings.setValue("main_splitter_sizes", self.main_horizontal_splitter.saveState())
+        except Exception:
+            pass
+
+    def _restore_ai_panel_settings(self):
+        """Restores AI panel visibility and splitter sizes from QSettings."""
+        try:
+            settings = QSettings("CyberSecuritySuite", "Layout")
+            state = settings.value("main_splitter_sizes")
+            if state:
+                self.main_horizontal_splitter.restoreState(state)
+            else:
+                total = max(900, self.width())
+                ai_w = max(280, min(380, int(total * 0.28)))
+                self.main_horizontal_splitter.setSizes([total - ai_w, ai_w])
+
+            visible = settings.value("ai_panel_visible", True)
+            if isinstance(visible, str):
+                visible = visible.lower() == "true"
+            is_vis = bool(visible)
+            self.right_ai_panel.setVisible(is_vis)
+            if hasattr(self, "btn_toggle_ai_panel"):
+                self.btn_toggle_ai_panel.setChecked(is_vis)
+        except Exception:
+            self.right_ai_panel.setVisible(True)
+
+    def _on_workspace_view_changed(self, index: int):
+        """Notifies AI Assistant of current active workspace for context-aware assistance."""
+        names = {
+            0: "Projects & Scope",
+            1: "Assessment Workspace",
+            2: "Reports & Findings",
+            3: "Labs & Playbooks",
+        }
+        name = names.get(index, "Main Workspace")
+        if index == 1 and hasattr(self, "security_tabs"):
+            subtab_name = self.security_tabs.tabText(self.security_tabs.currentIndex())
+            name = f"Assessment > {subtab_name.strip()}"
+
+        details = {}
+        if self.active_project:
+            details["project_id"] = self.active_project.id
+            details["project_name"] = self.active_project.name
+            details["target_scope"] = getattr(self.active_project, "target_scope", "")
+
+        if hasattr(self, "ai_chat_view") and hasattr(self.ai_chat_view, "set_current_workspace"):
+            self.ai_chat_view.set_current_workspace(name, details)
+
+    def _on_security_tab_changed(self, index: int):
+        """Notifies AI Assistant when security sub-tab changes."""
+        if hasattr(self, "view_stack") and self.view_stack.currentIndex() == 1:
+            self._on_workspace_view_changed(1)
+
+    def _on_nmap_scan_completed(self, result):
+        """Automatically updates Network Map with discovered hosts and services from scan."""
+        execution = getattr(result, "execution", None)
+        project_id = getattr(execution, "project_id", None)
+        if project_id is None and self.active_project:
+            project_id = self.active_project.id
+        if hasattr(self, "topology_view") and hasattr(self.topology_view, "load_scan"):
+            try:
+                self.topology_view.load_scan(getattr(result, "scan_result", None), getattr(result, "findings", []))
+            except Exception as exc:
+                logger.debug("Failed loading scan in topology_view: %s", exc)
+        self._refresh_project_data(project_id)
+
+    def get_active_assessment_id(self) -> Optional[int]:
+        """Returns currently selected assessment ID across views if active."""
+        if hasattr(self, "network_view") and hasattr(self.network_view, "_get_selected_assessment_id"):
+            try:
+                aid = self.network_view._get_selected_assessment_id()
+                if aid is not None:
+                    return aid
+            except Exception:
+                pass
+        return None
+
+    def _refresh_project_data(self, project_id: Optional[int] = None):
+        """Refresh all project views from persisted data without crossing project boundaries."""
+        if not self.active_project or self.active_project.id is None:
+            return
+        if project_id is not None and project_id != self.active_project.id:
+            return
+
+        project_id = self.active_project.id
+        self.dashboard_view.refresh()
+        self.findings_view.load_findings(project_id)
+        self.reports_view.refresh_report_data()
+        self.topology_view.load_discovered_assets(self.db, project_id)
+        if hasattr(self, "assets_view") and hasattr(self.assets_view, "set_active_project"):
+            try:
+                self.assets_view.set_active_project(self.active_project)
+            except Exception as exc:
+                logger.debug("Failed refreshing assets view: %s", exc)
+        if hasattr(self, "visualization_workspace") and hasattr(self.visualization_workspace, "load_discovered_assets"):
+            try:
+                self.visualization_workspace.load_discovered_assets(self.db, project_id)
+            except Exception as exc:
+                logger.debug("Failed refreshing visualization workspace: %s", exc)
+        if hasattr(self, "network_view"):
+            if hasattr(self.network_view, "_refresh_erp_dashboard"):
+                try:
+                    self.network_view._refresh_erp_dashboard()
+                except Exception as exc:
+                    logger.debug("Failed refreshing network view ERP: %s", exc)
+            if hasattr(self.network_view, "map_view") and hasattr(self.network_view.map_view, "load_discovered_assets"):
+                try:
+                    self.network_view.map_view.load_discovered_assets(self.db, project_id)
+                except Exception as exc:
+                    logger.debug("Failed refreshing network map view: %s", exc)
+            if hasattr(self.network_view, "_refresh_activity_log"):
+                try:
+                    self.network_view._refresh_activity_log()
+                except Exception as exc:
+                    logger.debug("Failed refreshing network view activity log: %s", exc)
+
+    def closeEvent(self, event):
+        """Save settings and clean up on close."""
+        self._save_ai_panel_settings()
+        super().closeEvent(event)
+
+    def _create_nav_btn(self, label: str, view_index: int) -> QPushButton:
+        btn = QPushButton(label)
+        btn.setProperty("class", "nav-btn")
+        btn.setCheckable(True)
+        self.nav_group.addButton(btn, view_index)
+        btn.clicked.connect(lambda: self.view_stack.setCurrentIndex(view_index))
+        return btn
+
+    def _create_sub_nav_btn(self, workspace_index: int, subtab_index: int) -> QPushButton:
+        btn = QPushButton()
+        btn.clicked.connect(lambda: self._navigate_to_workspace_subtab(workspace_index, subtab_index))
+        return btn
+
+    def _navigate_to_workspace_subtab(self, workspace_index: int, subtab_index: int):
+        """Navigates to a specific workspace and selects its target sub-tab."""
+        self.view_stack.setCurrentIndex(workspace_index)
+        if workspace_index == 0:
+            self.btn_scope_projects.setChecked(True)
+            self.scope_tabs.setCurrentIndex(subtab_index)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("dashboard" if subtab_index == 1 else "projects")
+        elif workspace_index == 1:
+            self.btn_security_workspace.setChecked(True)
+            self.security_tabs.setCurrentIndex(subtab_index)
+            if hasattr(self, "sidebar_nav"):
+                item_map = {0: "enum", 1: "web", 2: "osint", 3: "tools", 4: "studio", 5: "wireless_iot", 6: "ad", 7: "pivoting", 8: "code_security"}
+                self.sidebar_nav.select_item(item_map.get(subtab_index, "enum"))
+        elif workspace_index == 2:
+            self.btn_findings_reports.setChecked(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("reports")
+        elif workspace_index == 3:
+            self.btn_cpent_labs.setChecked(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("exploit_lab")
+
+    def _on_sidebar_route_requested(self, item_id: str):
+        """Routes sidebar navigation clicks to existing workspace and sub-tab targets."""
+        if item_id == "dashboard":
+            self._navigate_to_workspace_subtab(0, 1)
+            if hasattr(self, "scope_tabs") and hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+                self.scope_tabs.tabBar().setVisible(False)
+        elif item_id == "projects":
+            self._navigate_to_workspace_subtab(0, 0)
+            if hasattr(self, "scope_tabs") and hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+                self.scope_tabs.tabBar().setVisible(False)
+            if hasattr(self, "projects_view") and hasattr(self.projects_view, "tabs"):
+                self.projects_view.tabs.setCurrentIndex(4)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("projects")
+        elif item_id == "scope":
+            self._navigate_to_workspace_subtab(0, 0)
+            if hasattr(self, "scope_tabs") and hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+                self.scope_tabs.tabBar().setVisible(False)
+            if hasattr(self, "projects_view") and hasattr(self.projects_view, "tabs"):
+                self.projects_view.tabs.setCurrentIndex(0)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("projects")
+        elif item_id == "audit":
+            self._navigate_to_workspace_subtab(0, 0)
+            if hasattr(self, "scope_tabs") and hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+                self.scope_tabs.tabBar().setVisible(False)
+            if hasattr(self, "projects_view") and hasattr(self.projects_view, "tabs"):
+                self.projects_view.tabs.setCurrentIndex(3)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("audit")
+        elif item_id in ("footprint", "footprinting", "recon"):
+            self._navigate_to_workspace_subtab(1, 0)
+            if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "network_view") and hasattr(self.network_view, "tab_widget"):
+                self.network_view.tab_widget.setCurrentIndex(0)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("recon")
+        elif item_id == "osint":
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "osint_view"):
+                self.security_tabs.setCurrentWidget(self.osint_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("osint")
+        elif item_id in ("info_gathering", "assets", "asset_discovery"):
+            self.view_stack.setCurrentIndex(0)
+            self.btn_scope_projects.setChecked(True)
+            if hasattr(self, "scope_tabs") and hasattr(self, "assets_view"):
+                self.scope_tabs.setCurrentWidget(self.assets_view)
+                if hasattr(self.scope_tabs, "tabBar") and self.scope_tabs.tabBar():
+                    self.scope_tabs.tabBar().setVisible(False)
+                if hasattr(self.assets_view, "refresh"):
+                    self.assets_view.refresh()
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("info_gathering" if item_id == "info_gathering" else "assets")
+        elif item_id in ("discovery", "ports", "enum"):
+            self._navigate_to_workspace_subtab(1, 0)
+            if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "network_view") and hasattr(self.network_view, "tab_widget"):
+                self.network_view.tab_widget.setCurrentIndex(2)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("enumeration" if item_id in ("enumeration", "discovery") else "enum")
+        elif item_id in ("enumeration", "visualization", "network_visualization", "studio", "topology"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "topology_view"):
+                self.security_tabs.setCurrentWidget(self.topology_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(False)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("enumeration" if item_id == "enumeration" else ("visualization" if item_id in ("visualization", "network_visualization") else "studio"))
+        elif item_id == "pcap":
+            self._navigate_to_workspace_subtab(1, 0)
+            if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "network_view") and hasattr(self.network_view, "pcap_tab"):
+                self.network_view.tab_widget.setCurrentWidget(self.network_view.pcap_tab)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("pcap")
+        elif item_id in ("tls", "ssl", "tls_analyzer"):
+            self._navigate_to_workspace_subtab(1, 0)
+            if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "network_view") and hasattr(self.network_view, "tls_tab"):
+                self.network_view.tab_widget.setCurrentWidget(self.network_view.tls_tab)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("tls")
+        elif item_id == "vuln":
+            self._navigate_to_workspace_subtab(1, 0)
+            if hasattr(self, "security_tabs") and hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "network_view") and hasattr(self.network_view, "tab_widget"):
+                self.network_view.tab_widget.setCurrentIndex(3)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("vuln")
+        elif item_id in ("vulnerability", "assessment", "security_assessment", "web", "web_scan"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "web_view"):
+                self.security_tabs.setCurrentWidget(self.web_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("vulnerability" if item_id == "vulnerability" else "assessment")
+        elif item_id in ("ad", "active_directory"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "ad_view"):
+                self.security_tabs.setCurrentWidget(self.ad_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("ad")
+        elif item_id == "wireless_iot":
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "wireless_iot_view"):
+                self.security_tabs.setCurrentWidget(self.wireless_iot_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("wireless_iot")
+        elif item_id in ("code_security", "sast"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "code_security_view"):
+                self.security_tabs.setCurrentWidget(self.code_security_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("code_security")
+        elif item_id in ("post_exploitation", "pivoting"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "pivoting_view"):
+                self.security_tabs.setCurrentWidget(self.pivoting_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(True)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("post_exploitation" if item_id == "post_exploitation" else "pivoting")
+        elif item_id in ("terminal_tools", "tools"):
+            self.view_stack.setCurrentIndex(1)
+            self.btn_security_workspace.setChecked(True)
+            if hasattr(self, "security_tabs") and hasattr(self, "tools_view"):
+                self.security_tabs.setCurrentWidget(self.tools_view)
+                if hasattr(self.security_tabs, "tabBar") and self.security_tabs.tabBar():
+                    self.security_tabs.tabBar().setVisible(False)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("terminal_tools" if item_id == "terminal_tools" else "tools")
+            if hasattr(self, "content_splitter"):
+                if not getattr(self, "_terminal_visible", True):
+                    self._toggle_terminal_visibility()
+                elif hasattr(self.terminal_widget, "cmd_input"):
+                    self.terminal_widget.cmd_input.setFocus()
+        elif item_id == "ai_copilot":
+            self._toggle_ai_panel()
+        elif item_id in ("cpent_labs", "exploit_lab"):
+            self.view_stack.setCurrentIndex(3)
+            self.btn_cpent_labs.setChecked(True)
+            if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "tabs"):
+                self.cpent_view.tabs.setCurrentIndex(5)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("cpent_labs" if item_id == "cpent_labs" else "exploit_lab")
+        elif item_id in ("reporting", "reports", "reports_evidence"):
+            self.view_stack.setCurrentIndex(2)
+            self.btn_findings_reports.setChecked(True)
+            if hasattr(self, "findings_reports_tabs") and hasattr(self, "reports_view") and hasattr(self.reports_view, "tabs"):
+                self.findings_reports_tabs.setCurrentIndex(0)
+                if hasattr(self.findings_reports_tabs, "tabBar") and self.findings_reports_tabs.tabBar():
+                    self.findings_reports_tabs.tabBar().setVisible(False)
+                self.reports_view.tabs.setCurrentIndex(3)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("reporting" if item_id == "reporting" else "reports")
+        elif item_id in ("findings", "evidence"):
+            self.view_stack.setCurrentIndex(2)
+            self.btn_findings_reports.setChecked(True)
+            if hasattr(self, "findings_reports_tabs"):
+                self.findings_reports_tabs.setCurrentIndex(1 if item_id == "findings" else 0)
+                if hasattr(self.findings_reports_tabs, "tabBar") and self.findings_reports_tabs.tabBar():
+                    self.findings_reports_tabs.tabBar().setVisible(False)
+                if item_id == "evidence" and hasattr(self, "reports_view") and hasattr(self.reports_view, "tabs"):
+                    self.reports_view.tabs.setCurrentIndex(1)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.select_item("reporting" if item_id == "evidence" else "findings")
+        elif item_id == "settings":
+            self._open_ai_settings()
+
+    def _init_status_bar(self):
+        status = QStatusBar()
+        self.setStatusBar(status)
+
+        self.status_project_label = QLabel("Project: None")
+        self.status_project_label.setStyleSheet("padding-left: 16px; font-weight: 500;")
+        self.status_nmap_label = QLabel(
+            "Nmap: Ready" if self.registry.is_available("nmap") else "Nmap: Not Found"
+        )
+        self.status_nmap_label.setStyleSheet(
+            f"color: {CPENTTheme.SUCCESS_GREEN}; padding-right: 8px;"
+            if self.registry.is_available("nmap")
+            else f"color: {CPENTTheme.ERROR_RED}; padding-right: 8px;"
+        )
+
+        status.addPermanentWidget(self.status_project_label, 1)
+        status.addPermanentWidget(self.status_nmap_label)
+
+    def _select_initial_project(self):
+        """Initializes startup project selection if not already established."""
+        if self.active_project is not None:
+            return
+
+        projects = self.db.list_projects()
+        if not projects:
+            return
+
+        active_projects = [p for p in projects if p.status == ProjectStatus.ACTIVE]
+        initial_project = active_projects[0] if active_projects else projects[0]
+
+        self._on_project_selected(initial_project)
+        if (
+            hasattr(self, "projects_view")
+            and hasattr(self.projects_view, "select_project_by_id")
+            and initial_project.id is not None
+        ):
+            if (
+                hasattr(self.projects_view, "projects_table")
+                and self.projects_view.projects_table.currentRow() < 0
+            ):
+                blocked = self.projects_view.signalsBlocked()
+                self.projects_view.blockSignals(True)
+                try:
+                    self.projects_view.select_project_by_id(initial_project.id)
+                finally:
+                    self.projects_view.blockSignals(blocked)
+
+        if hasattr(self, "view_stack"):
+            self._on_workspace_view_changed(self.view_stack.currentIndex())
+
+    def _on_project_selected(self, project: Optional[Project]):
+        if project is None:
+            self.active_project = None
+            if hasattr(self, "status_project_label"):
+                self.status_project_label.setText("  Project: None")
+            if hasattr(self, "network_view"):
+                self.network_view.set_active_project(None)
+            if hasattr(self, "web_view"):
+                self.web_view.set_active_project(None)
+            if hasattr(self, "findings_view"):
+                self.findings_view.load_findings(None)
+            if hasattr(self, "reports_view"):
+                self.reports_view.set_active_project(None)
+            if hasattr(self, "dashboard_view"):
+                self.dashboard_view.set_active_project(None)
+            if hasattr(self, "ai_chat_view"):
+                self.ai_chat_view.set_active_project(None)
+            if hasattr(self, "osint_view"):
+                self.osint_view.set_active_project(None)
+            if hasattr(self, "topology_view"):
+                self.topology_view.set_active_project(None)
+            if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "set_active_project"):
+                self.cpent_view.set_active_project(None)
+            if hasattr(self, "wireless_iot_view"):
+                self.wireless_iot_view.set_active_project(None)
+            if hasattr(self, "ad_view") and hasattr(self.ad_view, "set_active_project"):
+                self.ad_view.set_active_project(None)
+            if hasattr(self, "pivoting_view") and hasattr(self.pivoting_view, "set_active_project"):
+                self.pivoting_view.set_active_project(None)
+            if hasattr(self, "code_security_view") and hasattr(self.code_security_view, "set_active_project"):
+                self.code_security_view.set_active_project(None)
+            if hasattr(self, "assets_view") and hasattr(self.assets_view, "set_active_project"):
+                self.assets_view.set_active_project(None)
+            if hasattr(self, "visualization_workspace") and hasattr(self.visualization_workspace, "set_active_project"):
+                self.visualization_workspace.set_active_project(None)
+            if hasattr(self, "terminal_widget"):
+                self.terminal_widget.set_active_project(None, self.db)
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.set_active_project("None", "Unassigned")
+            if hasattr(self, "view_stack"):
+                self._on_workspace_view_changed(self.view_stack.currentIndex())
+            return
+
+        self.active_project = project
+        if hasattr(self, "sidebar_nav"):
+            scopes = self.db.list_scopes(project.id) if (project and self.db) else []
+            scope_str = f"{len(scopes)} Boundary Rules" if scopes else "Unassigned"
+            self.sidebar_nav.set_active_project(project.name, scope_str)
+        if hasattr(self, "status_project_label"):
+            self.status_project_label.setText(f"Project: {project.name} (Client: {project.client_name or 'N/A'})")
+        if hasattr(self, "network_view"):
+            self.network_view.set_active_project(project)
+        if hasattr(self, "web_view"):
+            self.web_view.set_active_project(project)
+        if hasattr(self, "findings_view"):
+            self.findings_view.load_findings(project.id)
+        if hasattr(self, "reports_view"):
+            self.reports_view.set_active_project(project)
+        if hasattr(self, "dashboard_view"):
+            self.dashboard_view.set_active_project(project)
+        if hasattr(self, "ai_chat_view"):
+            self.ai_chat_view.set_active_project(project)
+        if hasattr(self, "osint_view"):
+            self.osint_view.set_active_project(project)
+        if hasattr(self, "topology_view"):
+            self.topology_view.set_active_project(project)
+        if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "set_active_project"):
+            self.cpent_view.set_active_project(project)
+        if hasattr(self, "wireless_iot_view"):
+            self.wireless_iot_view.set_active_project(project)
+        if hasattr(self, "ad_view") and hasattr(self.ad_view, "set_active_project"):
+            self.ad_view.set_active_project(project)
+        if hasattr(self, "pivoting_view") and hasattr(self.pivoting_view, "set_active_project"):
+            self.pivoting_view.set_active_project(project)
+        if hasattr(self, "code_security_view") and hasattr(self.code_security_view, "set_active_project"):
+            self.code_security_view.set_active_project(project)
+        if hasattr(self, "assets_view") and hasattr(self.assets_view, "set_active_project"):
+            self.assets_view.set_active_project(project)
+        if hasattr(self, "visualization_workspace") and hasattr(self.visualization_workspace, "set_active_project"):
+            self.visualization_workspace.set_active_project(project)
+        if hasattr(self, "terminal_widget"):
+            self.terminal_widget.set_active_project(project, self.db)
+            self.terminal_widget.append_system_msg(f"Active project switched to: '{project.name}'")
+
+        if (
+            hasattr(self, "projects_view")
+            and hasattr(self.projects_view, "select_project_by_id")
+            and project.id is not None
+        ):
+            pv_active = getattr(self.projects_view, "active_project", None)
+            if pv_active is None or getattr(pv_active, "id", None) != project.id:
+                blocked = self.projects_view.signalsBlocked()
+                self.projects_view.blockSignals(True)
+                try:
+                    self.projects_view.select_project_by_id(project.id)
+                finally:
+                    self.projects_view.blockSignals(blocked)
+
+        if hasattr(self, "view_stack"):
+            self._on_workspace_view_changed(self.view_stack.currentIndex())
+
+    def _on_scope_updated(self, project_id: int):
+        """Refreshes sidebar scope counter and asset view when scope rules change."""
+        if self.active_project and self.active_project.id == project_id:
+            scopes = self.db.list_scopes(project_id)
+            scope_str = f"{len(scopes)} target(s)" if scopes else "Unassigned"
+            if hasattr(self, "sidebar_nav"):
+                self.sidebar_nav.set_active_project(self.active_project.name, scope_str)
+            if hasattr(self, "assets_view") and hasattr(self.assets_view, "refresh"):
+                self.assets_view.refresh()
+
+    def _on_terminal_project_data_updated(self):
+        """Refreshes views from the database after terminal or scanner data is persisted."""
+        self._refresh_project_data()
+
+    def _on_dashboard_navigation(self, index: int):
+        mapping = {
+            0: (0, 1),  # Dashboard (Scope & Projects -> Tab 1)
+            1: (0, 0),  # Projects (Scope & Projects -> Tab 0)
+            2: (1, 1),  # Network (Security Workspace -> Tab 1)
+            3: (1, 2),  # Web (Security Workspace -> Tab 2)
+            4: (2, 0),  # Findings (Findings & Reports Workspace)
+            5: (1, 4),  # Tools (Security Workspace -> Tab 4)
+            6: (3, 0),  # CPENT (CPENT Labs Workspace)
+            7: (1, 0),  # AI Chat (Security Workspace -> Tab 0)
+            8: (1, 3),  # OSINT (Security Workspace -> Tab 3)
+        }
+        if index in mapping:
+            ws_idx, tab_idx = mapping[index]
+            self._navigate_to_workspace_subtab(ws_idx, tab_idx)
+
+    def _on_open_scanner_requested(self, tool_name: str):
+        if tool_name == "nmap":
+            self._navigate_to_workspace_subtab(1, 1)  # Network Recon
+        elif tool_name in ("c0desec", "sqlmap", "wafw00f", "gobuster", "ptk"):
+            self._navigate_to_workspace_subtab(1, 2)  # Web & API Assessment
+        elif tool_name in ("zaproxy", "burpsuite"):
+            self._navigate_to_workspace_subtab(1, 2)  # Web & API Assessment
+            if hasattr(self.web_view, "set_proxy_tab_visible"):
+                self.web_view.set_proxy_tab_visible(True)
+        elif tool_name in ("volatility3", "bandit"):
+            self._navigate_to_workspace_subtab(2, 0)  # Findings & Reports
+        elif tool_name in ("amass", "recon-ng", "theharvester"):
+            self._navigate_to_workspace_subtab(1, 3)  # OSINT Intelligence
+
+    def _on_open_shell_requested(self, tool_name: str, command: str):
+        """Switches to the integrated Terminal prompt and pre-populates command."""
+        # Switch to Command Console where cmd_input lives, or fallback to Terminal
+        for idx in range(self.terminal_widget.tabs.count()):
+            if "Command Console" in self.terminal_widget.tabs.tabText(idx):
+                self.terminal_widget.tabs.setCurrentIndex(idx)
+                break
+        else:
+            for idx in range(self.terminal_widget.tabs.count()):
+                if "Terminal" in self.terminal_widget.tabs.tabText(idx):
+                    self.terminal_widget.tabs.setCurrentIndex(idx)
+                    break
+        self.terminal_widget.cmd_input.setText(command)
+        self.terminal_widget.cmd_input.setFocus()
+
+    def _on_ai_command_to_shell(self, cmd: str):
+        """Loads AI suggested command into the Terminal prompt."""
+        for idx in range(self.terminal_widget.tabs.count()):
+            if "Command Console" in self.terminal_widget.tabs.tabText(idx):
+                self.terminal_widget.tabs.setCurrentIndex(idx)
+                break
+        else:
+            for idx in range(self.terminal_widget.tabs.count()):
+                if "Terminal" in self.terminal_widget.tabs.tabText(idx):
+                    self.terminal_widget.tabs.setCurrentIndex(idx)
+                    break
+        self.terminal_widget.cmd_input.setText(cmd)
+        self.terminal_widget.cmd_input.setFocus()
+
+    def _open_ai_settings(self):
+        if getattr(self, "_ai_settings_open", False):
+            return
+        self._ai_settings_open = True
+        try:
+            from desktop.dialogs.ai_settings_dialog import AISettingsDialog
+            engine = getattr(self.terminal_widget, "ai_assistant", None)
+            engine_obj = engine.engine if engine else None
+            dlg = AISettingsDialog(engine=engine_obj, parent=self)
+            if dlg.exec():
+                if engine:
+                    engine._on_provider_changed(engine.provider_combo.currentIndex())
+        finally:
+            self._ai_settings_open = False
+
+    def _toggle_theme(self):
+        """Toggles between Dark Mode and Light Mode dynamically."""
+        self.theme_manager.toggle_theme(apply_to_app=True)
+
+    def _update_theme_toggle_ui(self):
+        """Updates the theme toggle button label and icon to match the current mode."""
+        if hasattr(self, "btn_theme_toggle"):
+            if self.theme_manager.is_dark:
+                self.btn_theme_toggle.setText("☀  Light Mode")
+                self.btn_theme_toggle.setToolTip("Switch to Light Mode")
+            else:
+                self.btn_theme_toggle.setText("🌙  Dark Mode")
+                self.btn_theme_toggle.setToolTip("Switch to Dark Mode")
+
+    def _on_theme_changed(self, mode: str):
+        """Slot invoked when theme changes dynamically at runtime."""
+        self._update_theme_toggle_ui()
+        self.theme_manager.apply_theme(self)
+        if hasattr(self, "content_splitter"):
+            self.content_splitter.update()
+        if hasattr(self, "topology_view") and hasattr(self.topology_view, "update_theme"):
+            self.topology_view.update_theme(mode)
+        if hasattr(self, "network_view") and hasattr(self.network_view, "update_theme"):
+            self.network_view.update_theme(mode)
+        if hasattr(self, "ai_chat_view") and hasattr(self.ai_chat_view, "update_theme"):
+            self.ai_chat_view.update_theme(mode)
+        if hasattr(self, "cpent_view") and hasattr(self.cpent_view, "update_theme"):
+            self.cpent_view.update_theme(mode)
+        if hasattr(self, "wireless_iot_view") and hasattr(self.wireless_iot_view, "update_theme"):
+            self.wireless_iot_view.update_theme(mode)
+        if hasattr(self, "reports_view") and hasattr(self.reports_view, "update_theme"):
+            self.reports_view.update_theme(mode)
+        if hasattr(self, "dashboard_view"):
+            self.dashboard_view.refresh()
+        if hasattr(self, "findings_view") and self.active_project and self.active_project.id is not None:
+            self.findings_view.load_findings(self.active_project.id)
+        if hasattr(self, "statusBar") and self.statusBar():
+            self.statusBar().showMessage(f"Theme switched to {mode.capitalize()} Mode", 2500)

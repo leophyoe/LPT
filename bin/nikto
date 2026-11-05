@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+NIKTO_PL="$PROJECT_ROOT/source/web/nikto/program/nikto.pl"
+
+if [ ! -f "$NIKTO_PL" ]; then
+    echo "Error: Nikto not found at $NIKTO_PL" >&2
+    exit 1
+fi
+
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--version" || "$arg" == "-version" ]]; then
+        args+=("-Version")
+    elif [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        args+=("-Help")
+    else
+        args+=("$arg")
+    fi
+done
+
+exec perl "$NIKTO_PL" "${args[@]}"

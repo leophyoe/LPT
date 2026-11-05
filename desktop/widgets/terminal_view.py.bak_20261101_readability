@@ -1,0 +1,952 @@
+"""Integrated Execution Terminal & Application Console for CyberSecuritySuite.
+
+SECURITY & EXECUTION ARCHITECTURE:
+-----------------------------------
+1. Interactive Command Console:
+   - This terminal functions as an UNRESTRICTED OPERATOR CONSOLE. It allows security
+     engineers and penetration testers to execute standard bash/system commands (e.g. ls,
+     cd, python scripts, diagnostics, and customized security tooling).
+   - Session Tracking: When an active project is selected, interactive terminal sessions,
+     commands, and outputs are automatically audited, recorded into SQLite, scrubbed of
+     sensitive credentials via regex redaction, and hashed in the Evidence Vault (SHA-256).
+   - The interactive shell is intentionally unrestricted to avoid impeding authorized manual
+     penetration testing operations.
+
+2. Automated Assessment Adapters vs. Terminal:
+   - In contrast to the interactive operator terminal, all AUTOMATED ASSESSMENT ADAPTERS
+     (NmapAdapter, NiktoAdapter, SQLMapAdapter, HydraAdapter, WAFW00FAdapter, GobusterAdapter)
+     are strictly SCOPE-ENFORCED through ToolExecutionService and ScopeAuthorizationService.
+   - Automated adapters unconditionally fail-closed before subprocess creation if a target
+     is not authorized within the active project scope.
+   - High-risk operations (intrusive SQLMap injection tests or intensive Hydra brute-force)
+     require explicit operator confirmation guards (confirmed_high_risk=True).
+
+Provides:
+1. Interactive Command Shell with line input, command history, working directory
+   tracking, cancellation, and real-time streaming output.
+2. Application & Tool Log Console for background scanners and framework events.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import shlex
+import sqlite3
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from desktop.theme import CPENTTheme
+
+from storage.db import Database
+from storage.models import (
+    AssessmentStatus, Evidence, ExecutionStatus, Finding, FindingSeverity, Project,
+    ToolExecution, ValidationStatus,
+)
+from terminal.recorder import TerminalSessionRecorder, redact_sensitive_text
+from terminal.runner import ProcessRunner
+from modules.network.nmap_parser import NmapParser
+
+logger = logging.getLogger(__name__)
+
+
+class CommandHistoryLineEdit(QLineEdit):
+    """Line edit with Up/Down arrow history navigation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history: List[str] = []
+        self.history_idx: int = -1
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Up:
+            if self.history and self.history_idx > 0:
+                self.history_idx -= 1
+                self.setText(self.history[self.history_idx])
+            elif self.history and self.history_idx == -1:
+                self.history_idx = len(self.history) - 1
+                self.setText(self.history[self.history_idx])
+            return
+        elif event.key() == Qt.Key.Key_Down:
+            if self.history and 0 <= self.history_idx < len(self.history) - 1:
+                self.history_idx += 1
+                self.setText(self.history[self.history_idx])
+            elif self.history and self.history_idx == len(self.history) - 1:
+                self.history_idx = -1
+                self.clear()
+            return
+        super().keyPressEvent(event)
+
+    def add_to_history(self, cmd: str):
+        clean = cmd.strip()
+        if clean and (not self.history or self.history[-1] != clean):
+            self.history.append(clean)
+        self.history_idx = -1
+
+
+class ShellWorkerSignals(QObject):
+    output_received = Signal(str, str)
+    execution_finished = Signal(int, float)
+    command_result = Signal(object, str, object)
+
+
+class TerminalWidget(QWidget):
+    """Two-tier execution environment: Interactive Command Shell and Tool Log Console."""
+
+    project_data_updated = Signal()
+    project_selected = Signal(Project)
+    expand_requested = Signal()
+    collapse_requested = Signal()
+    split_half_requested = Signal()
+
+    def __init__(
+        self,
+        parent=None,
+        db: Optional[Database] = None,
+        evidence_dir: Optional[Path] = None,
+    ):
+        super().__init__(parent)
+        self.runner = ProcessRunner()
+        self.cwd = os.getcwd()
+        self._current_thread: Optional[threading.Thread] = None
+        self.active_project: Optional[Project] = None
+        self.db: Optional[Database] = db
+        self.evidence_dir = evidence_dir or (
+            Path(__file__).resolve().parents[2] / "storage" / "evidence"
+        )
+        self.shell_recorder = TerminalSessionRecorder()
+        self._last_cmd: str = ""
+
+        self.signals = ShellWorkerSignals()
+        self.signals.output_received.connect(self._on_shell_output)
+        self.signals.execution_finished.connect(self._on_shell_finished)
+        self.signals.command_result.connect(self._save_command_result)
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.terminal_header = QWidget()
+        self.terminal_header.setObjectName("terminalHeader")
+        self.terminal_header.setStyleSheet(
+            "QWidget#terminalHeader { background-color: #0b0f19; border-top: 1px solid #1e293b; border-bottom: 1px solid #1e293b; }"
+            "QLabel#sectionTitle { color: #f8fafc; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }"
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: 500; }"
+            "QPushButton:hover { background: #334155; color: #ffffff; }"
+        )
+        header_layout = QHBoxLayout(self.terminal_header)
+        header_layout.setContentsMargins(10, 4, 10, 4)
+        header_layout.setSpacing(8)
+
+        title = QLabel("Terminal")
+        title.setObjectName("sectionTitle")
+        header_layout.addWidget(title)
+
+        self.lbl_term_status = QLabel("● Ready (bash)")
+        self.lbl_term_status.setStyleSheet("color: #10b981; font-size: 10px; font-weight: bold;")
+        header_layout.addWidget(self.lbl_term_status)
+
+        self.lbl_term_context = QLabel(f"[{os.path.basename(self.cwd)}]")
+        self.lbl_term_context.setStyleSheet("color: #64748b; font-size: 10px;")
+        header_layout.addWidget(self.lbl_term_context)
+
+        header_layout.addStretch()
+
+        self.btn_clear_terminal = QPushButton("🗑️ Clear")
+        self.btn_clear_terminal.setObjectName("clearTerminalButton")
+        self.btn_clear_terminal.setToolTip("Clear active terminal output")
+        self.btn_clear_terminal.setFixedHeight(24)
+        self.btn_clear_terminal.clicked.connect(self.clear_active_tab_output)
+        header_layout.addWidget(self.btn_clear_terminal)
+
+        self.btn_split_half = QPushButton("⚖ 50/50")
+        self.btn_split_half.setObjectName("splitHalfButton")
+        self.btn_split_half.setToolTip("Split workspace and terminal height 50/50")
+        self.btn_split_half.setFixedHeight(24)
+        self.btn_split_half.clicked.connect(self.split_half_requested.emit)
+        header_layout.addWidget(self.btn_split_half)
+
+        self.btn_expand_terminal = QPushButton("⤢ Maximize")
+        self.btn_expand_terminal.setObjectName("expandTerminalButton")
+        self.btn_expand_terminal.setToolTip("Maximize terminal to full workspace height")
+        self.btn_expand_terminal.setFixedHeight(24)
+        self.btn_expand_terminal.clicked.connect(self.expand_requested.emit)
+        header_layout.addWidget(self.btn_expand_terminal)
+
+        self.btn_collapse_terminal = QPushButton("✕ Hide")
+        self.btn_collapse_terminal.setObjectName("collapseTerminalButton")
+        self.btn_collapse_terminal.setToolTip("Hide bottom terminal panel (Ctrl+` or F12)")
+        self.btn_collapse_terminal.setFixedHeight(24)
+        self.btn_collapse_terminal.clicked.connect(self.collapse_requested.emit)
+        header_layout.addWidget(self.btn_collapse_terminal)
+
+        layout.addWidget(self.terminal_header)
+
+        # Tab Widget separating Shell vs Application Logs
+        self.tabs = QTabWidget()
+
+        # -------------------------------------------------------------
+        # Tab 1: Real Linux Pseudo-Terminal (xterm.js + PTY)
+        # -------------------------------------------------------------
+        try:
+            from desktop.widgets.vscode_terminal import VSCodeTerminal
+            self.vscode_term = VSCodeTerminal(cwd=self.cwd, parent=self)
+            self.vscode_term.project_data_updated.connect(self.project_data_updated.emit)
+            self.tabs.addTab(self.vscode_term, "🖥️ Terminal")
+            self.tabs.setTabToolTip(self.tabs.count() - 1, "Real Linux Pseudo-Terminal (xterm.js + PTY + Bash)")
+        except Exception as exc:
+            logger.warning("Could not initialize VSCodeTerminal: %s", exc)
+            self.vscode_term = None
+
+        # -------------------------------------------------------------
+        # Tab 2: Interactive Command Shell & Runner
+        # -------------------------------------------------------------
+        shell_widget = QWidget()
+        shell_layout = QVBoxLayout(shell_widget)
+        shell_layout.setContentsMargins(4, 4, 4, 4)
+        shell_layout.setSpacing(4)
+
+        # Top status toolbar for shell
+        shell_bar = QHBoxLayout()
+        self.shell_status_label = QLabel("Shell: Ready")
+        self.shell_status_label.setStyleSheet(f"color: {CPENTTheme.SUCCESS_GREEN}; font-weight: bold; font-size: 11px;")
+        shell_bar.addWidget(self.shell_status_label)
+
+        self.cwd_label = QLabel(f"cwd: {self._format_cwd()}")
+        self.cwd_label.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-size: 11px;")
+        shell_bar.addWidget(self.cwd_label)
+        shell_bar.addStretch()
+
+        self.btn_clear_shell = QPushButton("Clear")
+        self.btn_clear_shell.setFixedHeight(22)
+        self.btn_clear_shell.clicked.connect(self.clear_shell)
+        shell_bar.addWidget(self.btn_clear_shell)
+
+        self.btn_copy_shell = QPushButton("Copy Output")
+        self.btn_copy_shell.setFixedHeight(22)
+        self.btn_copy_shell.clicked.connect(self.copy_shell)
+        shell_bar.addWidget(self.btn_copy_shell)
+
+        self.lbl_shell_rec_status = QLabel("⚪ Rec: Off")
+        self.lbl_shell_rec_status.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-size: 11px;")
+        shell_bar.addWidget(self.lbl_shell_rec_status)
+
+        self.btn_toggle_shell_rec = QPushButton("🔴 Start Recording")
+        self.btn_toggle_shell_rec.setFixedHeight(22)
+        self.btn_toggle_shell_rec.clicked.connect(self.toggle_shell_recording)
+        shell_bar.addWidget(self.btn_toggle_shell_rec)
+
+        self.btn_save_shell_evidence = QPushButton("💾 Save to Evidence")
+        self.btn_save_shell_evidence.setFixedHeight(22)
+        self.btn_save_shell_evidence.setStyleSheet(f"background-color: {CPENTTheme.PRIMARY_BLUE}; color: #ffffff; font-weight: bold;")
+        self.btn_save_shell_evidence.clicked.connect(lambda: self.save_session_as_evidence("shell"))
+        shell_bar.addWidget(self.btn_save_shell_evidence)
+
+        shell_layout.addLayout(shell_bar)
+
+        # Shell Output Display
+        self.shell_text = QPlainTextEdit()
+        self.shell_text.setObjectName("terminalView")
+        self.shell_text.setReadOnly(True)
+        self.shell_text.setMaximumBlockCount(10000)
+        shell_layout.addWidget(self.shell_text)
+
+        # Command Input Row
+        input_bar = QHBoxLayout()
+        input_bar.setSpacing(6)
+
+        prompt_label = QLabel("$")
+        prompt_label.setStyleSheet(f"color: {CPENTTheme.PRIMARY_BLUE}; font-weight: bold; font-family: {CPENTTheme.FONT_FAMILY_MONO}; font-size: 14px;")
+        input_bar.addWidget(prompt_label)
+
+        self.cmd_input = CommandHistoryLineEdit()
+        self.cmd_input.setPlaceholderText("Type command (e.g. nmap --version, python3 source/web/sqlmap/sqlmap.py --version, ls -la)...")
+        self.cmd_input.returnPressed.connect(self.run_command)
+        input_bar.addWidget(self.cmd_input, 1)
+
+        self.btn_run = QPushButton("Run")
+        self.btn_run.setProperty("class", "action-primary")
+        self.btn_run.setFixedHeight(28)
+        self.btn_run.clicked.connect(self.run_command)
+        input_bar.addWidget(self.btn_run)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setProperty("class", "action-secondary")
+        self.btn_stop.setFixedHeight(28)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_command)
+        input_bar.addWidget(self.btn_stop)
+
+        shell_layout.addLayout(input_bar)
+
+        self.tabs.addTab(shell_widget, "⚡ Command Console")
+        self.tabs.setTabToolTip(self.tabs.count() - 1, "Script & Automated Tool Command Runner")
+
+        # -------------------------------------------------------------
+        # Tab 2: Application & Tool Logs Console
+        # -------------------------------------------------------------
+        logs_widget = QWidget()
+        logs_layout = QVBoxLayout(logs_widget)
+        logs_layout.setContentsMargins(4, 4, 4, 4)
+        logs_layout.setSpacing(4)
+
+        logs_bar = QHBoxLayout()
+        self.title_label = QLabel("Application & Automated Tool Event Log")
+        self.title_label.setStyleSheet(f"font-weight: bold; color: {CPENTTheme.PRIMARY_BLUE}; font-size: 11px;")
+        logs_bar.addWidget(self.title_label)
+        logs_bar.addStretch()
+
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFixedHeight(22)
+        self.clear_btn.clicked.connect(self.clear_logs)
+        logs_bar.addWidget(self.clear_btn)
+
+        self.copy_btn = QPushButton("Copy All")
+        self.copy_btn.setFixedHeight(22)
+        self.copy_btn.clicked.connect(self.copy_all)
+        logs_bar.addWidget(self.copy_btn)
+
+        self.btn_save_log_evidence = QPushButton("💾 Save Logs to Evidence")
+        self.btn_save_log_evidence.setFixedHeight(22)
+        self.btn_save_log_evidence.setStyleSheet(f"background-color: {CPENTTheme.PRIMARY_BLUE}; color: #ffffff; font-weight: bold;")
+        self.btn_save_log_evidence.clicked.connect(lambda: self.save_session_as_evidence("logs"))
+        logs_bar.addWidget(self.btn_save_log_evidence)
+
+        logs_layout.addLayout(logs_bar)
+
+        self.log_text = QPlainTextEdit()
+        self.log_text.setObjectName("terminalView")
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(5000)
+        logs_layout.addWidget(self.log_text)
+
+        # Backward compatibility reference for existing tests
+        self.text_edit = self.log_text
+
+        self.tabs.addTab(logs_widget, "📋 System Logs")
+        self.tabs.setTabToolTip(self.tabs.count() - 1, "System & Tool Execution Logs")
+
+        # -------------------------------------------------------------
+        # Tab 4: AI Copilot & Analyzer
+        # -------------------------------------------------------------
+        from desktop.widgets.terminal_ai_assistant import TerminalAIAssistantWidget
+        self.ai_assistant = TerminalAIAssistantWidget()
+        self.ai_assistant.terminal_get_output_cb = self.get_latest_output
+        self.ai_assistant.command_ready.connect(self._on_ai_command_ready)
+        self.tabs.addTab(self.ai_assistant, "🤖 AI Analyzer")
+        self.tabs.setTabToolTip(self.tabs.count() - 1, "AI Security Analyzer")
+
+        # -------------------------------------------------------------
+        # Tab 5: Sessions & Cryptographic Evidence Vault
+        # -------------------------------------------------------------
+        from desktop.widgets.terminal_session_history import TerminalSessionHistoryWidget
+        self.session_vault = TerminalSessionHistoryWidget()
+        self.tabs.addTab(self.session_vault, "📜 Evidence Vault")
+        self.tabs.setTabToolTip(self.tabs.count() - 1, "Cryptographic Evidence Vault")
+
+        layout.addWidget(self.tabs)
+
+        # Show the runnable command prompt by default; the PTY terminal remains
+        # available in its own tab for interactive full-screen sessions.
+        for tab_index in range(self.tabs.count()):
+            if any(term in self.tabs.tabText(tab_index) for term in ("Terminal", "Command Console")):
+                self.tabs.setCurrentIndex(tab_index)
+                break
+
+        # Display initial shell banner
+        self._append_shell_text(
+            f"CyberSecuritySuite Command Shell [Ready]\n"
+            f"Working Directory: {self.cwd}\n"
+            f"Type Ubuntu commands, scripts, or security tools. Press Enter to run.\n\n",
+            "system",
+        )
+
+    def _format_cwd(self) -> str:
+        home = str(Path.home())
+        if self.cwd.startswith(home):
+            return "~" + self.cwd[len(home):]
+        return self.cwd
+
+    def run_command(self):
+        """Execute user command entered in the prompt."""
+        raw_cmd = self.cmd_input.text().strip()
+        if not raw_cmd:
+            return
+
+        self.cmd_input.add_to_history(raw_cmd)
+        self.cmd_input.clear()
+
+        # Handle built-in 'cd'
+        if raw_cmd == "cd" or raw_cmd.startswith("cd "):
+            parts = raw_cmd.split(maxsplit=1)
+            target_dir = parts[1].strip() if len(parts) > 1 else str(Path.home())
+            target_dir = os.path.expanduser(target_dir)
+            target_path = Path(self.cwd) / target_dir if not os.path.isabs(target_dir) else Path(target_dir)
+            target_path = target_path.resolve()
+
+            if target_path.is_dir():
+                self.cwd = str(target_path)
+                self.cwd_label.setText(f"cwd: {self._format_cwd()}")
+                self._append_shell_text(f"$ {raw_cmd}\n", "prompt")
+                self._append_shell_text(f"[+] Directory changed to: {self.cwd}\n\n", "success")
+            else:
+                self._append_shell_text(f"$ {raw_cmd}\n", "prompt")
+                self._append_shell_text(f"[-] cd: {target_dir}: No such directory\n\n", "stderr")
+            return
+
+        # Handle 'clear' command in shell
+        if raw_cmd == "clear":
+            self.shell_text.clear()
+            return
+
+        # Parse command with shlex
+        try:
+            cmd_args = shlex.split(raw_cmd)
+        except ValueError as e:
+            self._append_shell_text(f"$ {raw_cmd}\n", "prompt")
+            self._append_shell_text(f"[-] Command parse error: {e}\n\n", "stderr")
+            return
+
+        self._append_shell_text(f"$ {raw_cmd}\n", "prompt")
+        self._last_cmd = raw_cmd
+
+        # Out-of-Scope Safeguard for managed security scanning tools
+        cmd_lower = raw_cmd.lower()
+        sec_tools = ("nmap", "sqlmap", "nikto", "wafw00f", "gobuster", "ffuf", "nuclei", "hydra")
+        is_sec_scan = any(re.search(rf"(?:^|[/\\\s]){re.escape(t)}(?:$|[\s.])", cmd_lower) for t in sec_tools)
+
+        if is_sec_scan and self.active_project and self.db:
+            try:
+                from terminal.ingest import TerminalIngestEngine
+                from core.scope import ScopeAuthorizationService
+                targets = TerminalIngestEngine.extract_targets(raw_cmd, "")
+                scopes = self.db.list_scopes(self.active_project.id)
+                for target_val, target_type in targets:
+                    scope_check = ScopeAuthorizationService.is_target_authorized(target_val, scopes, project=self.active_project)
+                    if not scope_check.is_allowed:
+                        try:
+                            from storage.models import EngagementAuditLog
+                            self.db.add_audit_log(EngagementAuditLog(
+                                project_id=self.active_project.id,
+                                action="out_of_scope_scan_blocked",
+                                actor="command_console_scope_guard",
+                                details=f"Blocked attempt to run scan against unauthorized target '{target_val}'. Reason: {scope_check.reason}",
+                            ))
+                        except Exception:
+                            pass
+
+                        self._append_shell_text(
+                            f"[-] [SCOPE GUARD] Scan blocked: Target '{target_val}' is unauthorized for project '{self.active_project.name}'.\n"
+                            f"[-] Reason: {scope_check.reason}\n"
+                            f"[-] Active scanning against unauthorized targets violates Engagement Rules.\n\n",
+                            "stderr",
+                        )
+                        QMessageBox.critical(
+                            self,
+                            "⚠️ Out-of-Scope Security Scan Blocked",
+                            f"Security scan against unauthorized target '{target_val}' was blocked by Engagement Scope Guard.\n\n"
+                            f"Active Project: {self.active_project.name}\n"
+                            f"Target: {target_val}\n"
+                            f"Reason: {scope_check.reason}\n\n"
+                            f"Active scanning against unauthorized targets violates legal rules of engagement. This attempt has been recorded in the audit trail.",
+                        )
+                        return
+            except Exception as exc:
+                logger.debug("Scope guard error: %s", exc)
+
+        project_at_start = self.active_project
+        if self.shell_recorder.is_recording:
+            self.shell_recorder.record_input(f"$ {raw_cmd}\n")
+
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.shell_status_label.setText("Shell: Running...")
+        self.shell_status_label.setStyleSheet(f"color: {CPENTTheme.PRIMARY_BLUE}; font-weight: bold; font-size: 11px;")
+
+        def worker():
+            import time
+            start = time.time()
+            try:
+                res = self.runner.run(
+                    cmd_args,
+                    cwd=self.cwd,
+                    on_output=lambda chunk, stream: self.signals.output_received.emit(chunk, stream),
+                )
+                self.signals.command_result.emit(res, raw_cmd, project_at_start)
+                dur = time.time() - start
+                code = res.exit_code if res.exit_code is not None else 0
+                self.signals.execution_finished.emit(code, dur)
+            except Exception as e:
+                dur = time.time() - start
+                self.signals.output_received.emit(f"[-] Execution error: {e}\n", "stderr")
+                self.signals.execution_finished.emit(1, dur)
+
+        self._current_thread = threading.Thread(target=worker, daemon=True)
+        self._current_thread.start()
+
+    @Slot(object, str, object)
+    def _save_command_result(self, result, raw_command: str, project: Optional[Project]):
+        """Persist command output as project execution/evidence and ingest security findings."""
+        if not self.db:
+            # Under automated tests, strictly isolate database using in-memory SQLite to prevent production DB writes
+            if "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("CYBERSECURITYSUITE_ENV") == "test":
+                from storage.db import Database
+                self.db = Database(":memory:")
+            else:
+                from storage.db import Database
+                db_path = Path(__file__).resolve().parents[2] / "storage" / "data" / "cybersecuritysuite.db"
+                try:
+                    self.db = Database(str(db_path))
+                except (OSError, sqlite3.Error) as exc:
+                    logger.exception("Could not open the application database at %s", db_path)
+                    self._append_shell_text(f"[-] Database error: {exc}\n", "stderr")
+                    return
+
+        if not self.db:
+            return
+
+        if not project:
+            project = self.active_project
+
+        if not project:
+            # Gracefully notify user without auto-creating unauthorized default projects
+            self._append_shell_text(
+                "[-] [Notice] No project is currently selected. To record execution logs, evidence, and findings, please select an active project in the top bar or Projects & Scope view.\n\n",
+                "system",
+            )
+            return
+
+        project_id = project.id
+        raw_output = (result.stdout or "") + (result.stderr or "")
+        safe_output = redact_sensitive_text(raw_output)
+        safe_command = redact_sensitive_text(raw_command)
+        command_lower = raw_command.lower()
+        known_tools = ("nmap", "sqlmap", "gobuster", "wafw00f", "nikto", "ffuf", "nuclei", "bandit", "vol.py", "volatility")
+        tool_name = next((name for name in known_tools if re.search(rf"(?:^|[/\\\s]){re.escape(name)}(?:$|[\s.])", command_lower)), "terminal")
+
+        # Resolve active assessment ID if available
+        assessment_id: Optional[int] = None
+        if hasattr(self, "assessment_id_getter") and callable(self.assessment_id_getter):
+            try:
+                assessment_id = self.assessment_id_getter()
+            except Exception:
+                assessment_id = None
+        if assessment_id is None and hasattr(project, "selected_assessment_id"):
+            assessment_id = getattr(project, "selected_assessment_id", None)
+        if assessment_id is None and hasattr(self, "window") and hasattr(self.window(), "get_active_assessment_id"):
+            try:
+                assessment_id = self.window().get_active_assessment_id()
+            except Exception:
+                assessment_id = None
+        if assessment_id is None and self.db and project_id:
+            try:
+                assessments = self.db.list_assessments(project_id)
+                active_asm = next((a for a in assessments if getattr(a, "status", None) == AssessmentStatus.IN_PROGRESS), None)
+                if not active_asm and assessments:
+                    active_asm = assessments[0]
+                if active_asm:
+                    assessment_id = active_asm.id
+            except Exception:
+                pass
+
+        execution = self.db.create_execution(ToolExecution(
+            project_id=project_id,
+            assessment_id=assessment_id,
+            tool_name=tool_name,
+            command=safe_command,
+            status=result.status,
+            exit_code=result.exit_code,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            duration_seconds=result.duration_seconds,
+        ))
+
+        # Record operator console audit event (distinguished from automated assessment jobs)
+        if self.db and project_id:
+            try:
+                from storage.models import EngagementAuditLog
+                dur_str = f"{result.duration_seconds:.2f}s" if result.duration_seconds is not None else "0.00s"
+                self.db.add_audit_log(EngagementAuditLog(
+                    project_id=project_id,
+                    action="terminal_command_executed",
+                    actor="operator_console",
+                    details=f"Operator executed: '{safe_command}' (Tool: {tool_name}, Exit Code: {result.exit_code}, Duration: {dur_str})",
+                ))
+            except Exception as e:
+                logger.debug("Failed to record terminal audit log: %s", e)
+
+        if safe_output.strip():
+            project_evidence_dir = self.evidence_dir / f"project_{project_id}"
+            project_evidence_dir.mkdir(parents=True, exist_ok=True)
+            evidence_path = project_evidence_dir / f"terminal_exec_{execution.id}.txt"
+            evidence_path.write_text(safe_output, encoding="utf-8", errors="replace")
+            digest = hashlib.sha256(safe_output.encode("utf-8", errors="replace")).hexdigest()
+            execution.raw_output_path = str(evidence_path)
+            self.db.update_execution(execution)
+            evidence = self.db.add_evidence(Evidence(
+                project_id=project_id,
+                execution_id=execution.id,
+                assessment_id=assessment_id,
+                file_path=str(evidence_path),
+                sha256_hash=digest,
+                description=f"Terminal output for execution #{execution.id} ({tool_name})",
+                mime_type="text/plain",
+            ))
+
+            # Allow ingestion if execution completed or if known security tools return standard scan codes (0, 1, 2) with output
+            can_ingest = (
+                result.status == ExecutionStatus.COMPLETED
+                or result.exit_code in (0, 1, 2)
+                or tool_name in ("nmap", "sqlmap", "nikto", "gobuster", "ffuf", "wafw00f")
+            )
+            if can_ingest and safe_output.strip():
+                try:
+                    from terminal.ingest import TerminalIngestEngine
+                    TerminalIngestEngine.ingest_command_output(
+                        db=self.db,
+                        project_id=project_id,
+                        execution_id=execution.id,
+                        tool_name=tool_name,
+                        command=safe_command,
+                        output=safe_output,
+                        evidence_id=evidence.id if evidence else None,
+                        assessment_id=assessment_id,
+                    )
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    logger.exception("Could not ingest supported terminal output")
+                    self._append_shell_text(f"[-] Result ingestion error: {exc}\n", "stderr")
+
+        # Refresh session vault tab inside terminal if active
+        if hasattr(self, "session_vault"):
+            try:
+                if hasattr(self.session_vault, "set_context"):
+                    self.session_vault.set_context(project, self.db)
+                elif hasattr(self.session_vault, "load_sessions"):
+                    self.session_vault.load_sessions()
+            except Exception as exc:
+                logger.debug("Failed to refresh session vault: %s", exc)
+
+        self.project_data_updated.emit()
+
+    @staticmethod
+    def _parse_nmap_output(output: str, project_id: int, execution_id: int) -> List[Finding]:
+        """Convert Nmap XML or standard terminal output into conservative findings."""
+        findings = []
+        scan_result = None
+        stripped = output.strip()
+        if stripped.startswith("<?xml") or stripped.startswith("<nmaprun"):
+            try:
+                scan_result = NmapParser.parse_xml(stripped)
+            except ValueError:
+                scan_result = None
+        if scan_result:
+            findings.extend(NmapParser.to_findings(scan_result, project_id, execution_id))
+            for host in scan_result.hosts:
+                if host.status == "up" and not any(p.state == "open" for p in host.ports):
+                    findings.append(Finding(
+                        project_id=project_id,
+                        title=f"Host discovered: {host.hostname or host.ip}",
+                        severity=FindingSeverity.INFORMATIONAL,
+                        affected_asset=host.hostname or host.ip,
+                        description="Nmap reported this host as up. No open ports were included in the captured result.",
+                        source_tool="nmap",
+                        execution_id=execution_id,
+                    ))
+            return findings
+
+        host = ""
+        for line in output.splitlines():
+            report_match = re.search(r"Nmap scan report for (?:.+?\s+\()?([0-9a-fA-F:.]+)\)?\s*$", line.strip())
+            if report_match:
+                host = report_match.group(1)
+                continue
+            port_match = re.match(r"\s*(\d{1,5})/(tcp|udp)\s+open\s+(\S+)(?:\s+(.*))?$", line, re.IGNORECASE)
+            if not port_match or not host:
+                continue
+            port, protocol, service, detail = port_match.groups()
+            severity, remediation = FindingSeverity.INFORMATIONAL, "Confirm that this service is required and restrict access to authorized clients."
+            if service.lower() == "telnet":
+                severity, remediation = FindingSeverity.HIGH, "Replace Telnet with SSH and restrict network access."
+            elif service.lower() in {"smb", "microsoft-ds"}:
+                severity, remediation = FindingSeverity.MEDIUM, "Restrict SMB exposure and disable legacy SMB protocols."
+            findings.append(Finding(
+                project_id=project_id,
+                title=f"Discovered service: {service} on {host}:{port}/{protocol}",
+                severity=severity,
+                affected_asset=host,
+                affected_port_service=f"{port}/{protocol} {service} {detail or ''}".strip(),
+                description=f"Nmap reported an open {service} service on {host}:{port}/{protocol}. This is an observation and requires assessment context before assigning exploitability.",
+                remediation=remediation,
+                validation_status=ValidationStatus.UNVERIFIED,
+                source_tool="nmap",
+                execution_id=execution_id,
+            ))
+        return findings
+
+    def stop_command(self):
+        """Cancel actively running shell command."""
+        self.runner.cancel()
+        self._append_shell_text("\n[^C Process cancellation sent]\n", "stderr")
+        self.btn_stop.setEnabled(False)
+
+    @Slot(str, str)
+    def _on_shell_output(self, chunk: str, stream: str):
+        if self.shell_recorder.is_recording:
+            self.shell_recorder.record_output(chunk)
+        self._append_shell_text(chunk, stream)
+
+    @Slot(int, float)
+    def _on_shell_finished(self, exit_code: int, duration: float):
+        if self.shell_recorder.is_recording:
+            self.shell_recorder.record_command(
+                self._last_cmd,
+                exit_code=exit_code,
+                cwd=self.cwd,
+                duration=duration,
+            )
+            self.lbl_shell_rec_status.setText(f"🔴 Rec: Active ({len(self.shell_recorder.events)} events)")
+
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+
+        if exit_code == 0:
+            status_msg = f"[Process finished with exit code {exit_code} ({duration:.2f}s)]\n\n"
+            self._append_shell_text(status_msg, "success")
+            self.shell_status_label.setText("Shell: Ready")
+            self.shell_status_label.setStyleSheet(f"color: {CPENTTheme.SUCCESS_GREEN}; font-weight: bold; font-size: 11px;")
+        else:
+            status_msg = f"[Process exited with code {exit_code} ({duration:.2f}s)]\n\n"
+            self._append_shell_text(status_msg, "stderr")
+            self.shell_status_label.setText(f"Shell: Exited ({exit_code})")
+            self.shell_status_label.setStyleSheet(f"color: {CPENTTheme.ERROR_RED}; font-weight: bold; font-size: 11px;")
+
+    def _append_shell_text(self, text: str, stream: str = "stdout"):
+        cursor = self.shell_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        fmt = QTextCharFormat()
+        if stream == "prompt":
+            fmt.setForeground(QColor(CPENTTheme.PRIMARY_BLUE))
+            fmt.setFontWeight(700)
+        elif stream == "stderr":
+            fmt.setForeground(QColor(CPENTTheme.ERROR_RED))
+        elif stream == "system":
+            fmt.setForeground(QColor(CPENTTheme.AMBER_ACCENT))
+        elif stream == "success":
+            fmt.setForeground(QColor(CPENTTheme.SUCCESS_GREEN))
+        else:
+            fmt.setForeground(QColor(CPENTTheme.PRIMARY_TEXT))
+
+        cursor.insertText(text, fmt)
+        self.shell_text.setTextCursor(cursor)
+        self.shell_text.ensureCursorVisible()
+
+    # -------------------------------------------------------------
+    # Application & Tool Log Methods (Backward Compatible)
+    # -------------------------------------------------------------
+    @Slot(str, str)
+    def append_output(self, text: str, stream: str = "stdout"):
+        """Append streamed output to the tool log tab."""
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        fmt = QTextCharFormat()
+        if stream == "stderr":
+            fmt.setForeground(QColor(CPENTTheme.ERROR_RED))
+        elif stream == "system":
+            fmt.setForeground(QColor(CPENTTheme.PRIMARY_BLUE))
+            fmt.setFontWeight(600)
+        elif stream == "success":
+            fmt.setForeground(QColor(CPENTTheme.SUCCESS_GREEN))
+        else:
+            fmt.setForeground(QColor(CPENTTheme.PRIMARY_TEXT))
+
+        cursor.insertText(text, fmt)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
+
+    def append_system_msg(self, message: str):
+        self.append_output(f"\n[*] {message}\n", stream="system")
+
+    def append_error_msg(self, message: str):
+        self.append_output(f"\n[-] ERROR: {message}\n", stream="stderr")
+
+    def append_success_msg(self, message: str):
+        self.append_output(f"\n[+] {message}\n", stream="success")
+
+    def clear(self):
+        """Clears both shell and log outputs."""
+        self.clear_shell()
+        self.clear_logs()
+
+    def clear_active_tab_output(self):
+        """Clears the output buffer of the currently active terminal tab."""
+        self.clear()
+        if hasattr(self, "vscode_term") and self.vscode_term:
+            if hasattr(self.vscode_term, "clear"):
+                try:
+                    self.vscode_term.clear()
+                except Exception:
+                    pass
+
+    def clear_shell(self):
+        self.shell_text.clear()
+
+    def clear_logs(self):
+        self.log_text.clear()
+
+    def copy_shell(self):
+        QApplication.clipboard().setText(self.shell_text.toPlainText())
+
+    def set_active_project(self, project: Optional[Project], db: Optional[Database] = None):
+        """Updates active project and database context for evidence saving and AI scope validation."""
+        self.active_project = project
+        self.db = db
+        if project:
+            self.shell_recorder.project_id = project.id
+            if not self.shell_recorder.is_recording:
+                self.lbl_shell_rec_status.setText("⚪ Rec: Off")
+        else:
+            self.shell_recorder.project_id = None
+            self.lbl_shell_rec_status.setText("⚪ Rec: Disabled (No Project)")
+
+        if hasattr(self, "ai_assistant"):
+            self.ai_assistant.set_context(project, db)
+        if hasattr(self, "session_vault"):
+            self.session_vault.set_context(project, db)
+        if self.vscode_term and hasattr(self.vscode_term, "set_context"):
+            self.vscode_term.set_context(project, db)
+
+    @Slot()
+    def toggle_shell_recording(self):
+        """Toggles Command Shell session recording on or off."""
+        if not self.active_project:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project in Projects & Scope before recording terminal sessions.",
+            )
+            return
+
+        if not self.shell_recorder.is_recording:
+            self.shell_recorder.start(project_id=self.active_project.id, cwd=self.cwd)
+            self.btn_toggle_shell_rec.setText("⏹️ Stop Recording")
+            self.lbl_shell_rec_status.setText("🔴 Rec: Active (0 events)")
+            self.lbl_shell_rec_status.setStyleSheet(f"color: {CPENTTheme.ERROR_RED}; font-size: 11px; font-weight: bold;")
+        else:
+            self.shell_recorder.stop(exit_status=0)
+            self.btn_toggle_shell_rec.setText("🔴 Start Recording")
+            self.lbl_shell_rec_status.setText(f"⚪ Rec: Stopped ({len(self.shell_recorder.events)} events)")
+            self.lbl_shell_rec_status.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-size: 11px;")
+
+    def get_latest_output(self) -> str:
+        """Returns the most recent output from shell or logs for AI analysis."""
+        shell_out = self.shell_text.toPlainText().strip()
+        if shell_out:
+            return shell_out
+        return self.log_text.toPlainText().strip()
+
+    @Slot(str)
+    def _on_ai_command_ready(self, cmd: str):
+        """Inserts AI-generated or suggested command into the command line input."""
+        self.cmd_input.setText(cmd)
+        for i in range(self.tabs.count()):
+            if any(term in self.tabs.tabText(i) for term in ("Terminal", "Command Console", "Command Shell")):
+                self.tabs.setCurrentIndex(i)
+                break
+        self.cmd_input.setFocus()
+
+    def save_session_as_evidence(self, source: str = "shell") -> Optional[Evidence]:
+        """Saves current terminal session or logs as cryptographic project evidence for reports."""
+        if not self.active_project or not self.db:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project first in Projects & Scope to link this session as evidence.",
+            )
+            return None
+
+        content = self.shell_text.toPlainText().strip() if source == "shell" else self.log_text.toPlainText().strip()
+        if not content:
+            QMessageBox.warning(
+                self,
+                "Empty Output",
+                "No output recorded to save. Run commands or tools first.",
+            )
+            return None
+
+        # If saving from shell and recorder has events, use the recorder
+        if source == "shell" and self.shell_recorder.events:
+            rec = self.shell_recorder
+        else:
+            rec = TerminalSessionRecorder(project_id=self.active_project.id)
+            rec.start(project_id=self.active_project.id, cwd=self.cwd)
+            rec.record_output(content)
+            rec.stop(exit_status=0)
+
+        res = rec.save_session_as_evidence(db=self.db, project_id=self.active_project.id)
+
+        # Ingest session content for targets and findings
+        try:
+            from terminal.ingest import TerminalIngestEngine
+            TerminalIngestEngine.ingest_command_output(
+                db=self.db,
+                project_id=self.active_project.id,
+                execution_id=res.evidence.execution_id,
+                tool_name=f"vault_{source}",
+                command=f"vault_{source}",
+                output=content,
+            )
+        except Exception:
+            pass
+
+        self.project_data_updated.emit()
+
+        # Refresh vault view if available
+        if hasattr(self, "session_vault"):
+            self.session_vault.load_sessions()
+
+        self.append_system_msg(
+            f"💾 Terminal {source} session saved as Evidence #{res.evidence.id} (SHA-256: {res.sha256_hash[:12]}...). Included in report."
+        )
+
+        dup_msg = "\n(Session record verified in cryptographic vault)" if res.is_duplicate else ""
+        QMessageBox.information(
+            self,
+            "Evidence Saved",
+            f"Terminal session successfully vaulted as Project Evidence #{res.evidence.id}!\n\n"
+            f"File: {Path(res.plain_path).name}\n"
+            f"SHA-256 Hash:\n{res.sha256_hash}\n\n"
+            f"This session record is permanently vaulted and will appear in generated reports.{dup_msg}",
+        )
+        return res.evidence
+
+    def copy_all(self):
+        QApplication.clipboard().setText(self.log_text.toPlainText())
+
+    def closeEvent(self, event):
+        if self.vscode_term:
+            self.vscode_term.close_pty()
+        super().closeEvent(event)

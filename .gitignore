@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.hypothesis/
+
+# Local databases, project sessions, and outputs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.backup
+*.bak
+backups/
+storage/data/
+storage/evidence/*
+!storage/evidence/.gitkeep
+storage/reports/*
+!storage/reports/.gitkeep
+reports/output/*
+!reports/output/.gitkeep
+
+# Large courseware, manual downloads, and archives
+CPENT.pdf
+CPENT-Report-Templates.zip
+*.pdf
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+
+# Sensitive and credential files
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+secrets.json
+.vault_credentials
+*.vault
+
+# Upstream cloned sources (we track our own code and wrappers, not raw third-party git checkouts)
+source/*/*
+!source/*/.gitkeep
+labs/cpent/references/*/
+labs/cpent/references/*/*
+!labs/cpent/references/*.md
+
+# Logs and runtime artifacts
+*.log
+logs/
+*.pid
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

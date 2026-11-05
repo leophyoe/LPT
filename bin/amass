@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# 1. Search for external amass binary, ignoring this wrapper script itself
+REAL_AMASS=""
+for candidate in $(which -a amass 2>/dev/null); do
+    resolved_candidate="$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+    resolved_self="$(readlink -f "$0" 2>/dev/null || echo "$SCRIPT_DIR/amass")"
+    if [ "$resolved_candidate" != "$resolved_self" ] && [ -x "$candidate" ]; then
+        REAL_AMASS="$candidate"
+        break
+    fi
+done
+
+if [ -n "$REAL_AMASS" ]; then
+    EXEC_CMD="$REAL_AMASS"
+elif [ -f "$PROJECT_ROOT/source/network/amass/amass" ] && [ -x "$PROJECT_ROOT/source/network/amass/amass" ]; then
+    EXEC_CMD="$PROJECT_ROOT/source/network/amass/amass"
+elif [ -f "$PROJECT_ROOT/bin/amass_bin" ] && [ -x "$PROJECT_ROOT/bin/amass_bin" ]; then
+    EXEC_CMD="$PROJECT_ROOT/bin/amass_bin"
+elif [ -f "/snap/bin/amass" ] && [ -x "/snap/bin/amass" ]; then
+    EXEC_CMD="/snap/bin/amass"
+elif [ -f "$HOME/go/bin/amass" ] && [ -x "$HOME/go/bin/amass" ]; then
+    EXEC_CMD="$HOME/go/bin/amass"
+elif [ -f "/usr/bin/amass" ] && [ -x "/usr/bin/amass" ]; then
+    EXEC_CMD="/usr/bin/amass"
+elif [ -f "/usr/local/bin/amass" ] && [ -x "/usr/local/bin/amass" ]; then
+    EXEC_CMD="/usr/local/bin/amass"
+else
+    echo "[-] Error: OWASP Amass is not installed on this system." >&2
+    echo "    Install with: sudo snap install amass OR sudo apt install amass OR go install -v github.com/owasp-amass/amass/v4/...@master" >&2
+    exit 1
+fi
+
+# Normalize version flags
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--version" ]]; then
+        args+=("-version")
+    else
+        args+=("$arg")
+    fi
+done
+
+exec "$EXEC_CMD" "${args[@]}"

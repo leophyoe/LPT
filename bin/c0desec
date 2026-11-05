@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""CyberSecuritySuite standalone wrapper for c0desec."""
+import os
+import sys
+from pathlib import Path
+import runpy
+
+ROOT = Path(__file__).resolve().parent.parent
+C0DESEC_DIR = ROOT / "source" / "web" / "c0desec-pentest"
+TARGET = C0DESEC_DIR / "c0desec" / "main.py"
+
+if not TARGET.exists():
+    sys.stderr.write(f"[-] Error: c0desec main.py not found at {TARGET}\n")
+    sys.exit(127)
+
+sys.path.insert(0, str(C0DESEC_DIR))
+sys.argv = [str(TARGET)] + sys.argv[1:]
+
+try:
+    runpy.run_path(str(TARGET), run_name="__main__")
+except SystemExit as exc:
+    sys.exit(exc.code)

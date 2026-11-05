@@ -1,0 +1,1553 @@
+"""Interactive Network Asset & Topology Map with Cyber Sentinel Dashboard.
+
+Faithfully implements the user-referenced Cyber Sentinel & Modern Network Map layout:
+- Top: Cyber Sentinel Enterprise Security banner with Real-Time Status, Security Posture (89%),
+  Live Asset count, Critical Incidents, and Asset Health.
+- Left: Collapsible Devices Drawer with search bar, 'High Risk' and 'Active' filters,
+  and device items with dynamic Risk Score badges (72/red, 10/green).
+- Center: High-DPI QGraphicsScene with neon cyber nodes, logical subnet clustering,
+  and connection links.
+- Right: Expanded 'Device Details' panel with:
+  * IP/CIDR & Hostname with [Copy IP] button.
+  * Device Type, OS Fingerprint, and Risk Score gauge.
+  * [🔍 Analyse Attack Path] button.
+  * Discovered Ports & Services table.
+  * Security & Health: Detected Issues count and Recommended Actions.
+  * AI Copilot / NOVA notification pill ('Traffic spike detected, risk +12').
+  * Activity Timeline.
+- Full backward compatibility for export_svg, export_png, load_scan, and host_selected signals.
+"""
+
+from __future__ import annotations
+
+import html
+import ipaddress
+import json
+import logging
+import math
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QGraphicsItem,
+    QGraphicsLineItem,
+    QGraphicsScene,
+    QGraphicsTextItem,
+    QGraphicsView,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from desktop.theme import CPENTTheme
+from modules.network.nmap_parser import HostResult, NmapScanResult, PortResult
+from storage.models import Finding
+
+
+class NetworkHostNodeItem(QGraphicsItem):
+    """Visual interactive node representing a discovered network host."""
+
+    def __init__(
+        self,
+        host: HostResult,
+        x: float,
+        y: float,
+        findings_count: int = 0,
+        radius: float = 30.0,
+    ):
+        super().__init__()
+        self.host = host
+        self.findings_count = findings_count
+        self.radius = radius
+        self.setPos(x, y)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+
+        open_ports = [p for p in host.ports if p.state == "open"]
+        tt = (
+            f"Host: {host.ip}\n"
+            f"Status: {host.status.upper()} ({host.status_reason or 'detected'})\n"
+            f"Hostname: {host.hostname or 'None'}\n"
+            f"OS: {host.os_summary}\n"
+            f"MAC: {host.mac_address or 'Unknown'} {f'({host.vendor})' if host.vendor else ''}\n"
+            f"Open Ports: {len(open_ports)}\n"
+            f"Findings: {findings_count}"
+        )
+        self.setToolTip(tt)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-self.radius - 8, -self.radius - 8, self.radius * 2 + 16, self.radius * 2 + 32)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        open_ports = [p for p in self.host.ports if p.state == "open"]
+
+        device_lower = (getattr(self.host, "device_type", "") or "").lower()
+        is_dc = "domain controller" in device_lower or "dc" in (self.host.hostname or "").lower()
+        is_domain = "domain" in device_lower and not is_dc
+        is_comp = "computer" in device_lower or "workstation" in device_lower
+
+        # Color scheme based on status, device type, and security observations
+        if self.host.status != "up":
+            bg_color = QColor("#0f172a")
+            border_color = QColor("#475569")
+        elif self.findings_count > 0:
+            bg_color = QColor("#451a03" if is_dc else "#450a0a")
+            border_color = QColor("#ef4444")
+        elif is_dc:
+            # Distinct Active Directory DC visual style: Rich Amber / Gold
+            bg_color = QColor("#3b1f04")
+            border_color = QColor("#f59e0b")
+        elif is_domain:
+            # Domain Naming Context Hub: Deep Indigo / Royal Blue
+            bg_color = QColor("#1e1b4b")
+            border_color = QColor("#6366f1")
+        elif is_comp:
+            # Domain Member Workstation: Dark Slate / Sky Blue
+            bg_color = QColor("#082f49")
+            border_color = QColor("#38bdf8")
+        elif len(open_ports) > 0:
+            bg_color = QColor("#082f49")
+            border_color = QColor("#0ea5e9")
+        else:
+            bg_color = QColor("#022c22")
+            border_color = QColor("#10b981")
+
+        # Outer Neon Glow Ring if selected or high risk
+        if self.isSelected() or self.findings_count > 0:
+            glow_pen = QPen(border_color, 6)
+            glow_pen.setColor(QColor(border_color.red(), border_color.green(), border_color.blue(), 60))
+            painter.setPen(glow_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(-self.radius - 4, -self.radius - 4, (self.radius + 4) * 2, (self.radius + 4) * 2)
+
+        pen_width = 3 if self.isSelected() else 2
+        painter.setPen(QPen(border_color, pen_width))
+        painter.setBrush(QBrush(bg_color))
+        painter.drawRoundedRect(
+            QRectF(-self.radius, -self.radius, self.radius * 2, self.radius * 2),
+            8, 8
+        )
+
+        # Center Icon / Text
+        painter.setPen(QColor("#f8fafc"))
+        font = QFont("Segoe UI", 8, QFont.Bold)
+        painter.setFont(font)
+
+        # Open Ports Badge top-right
+        if len(open_ports) > 0:
+            badge_r = 9.0
+            bx = self.radius - 4
+            by = -self.radius + 4
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor("#0284c7")))
+            painter.drawEllipse(QPointF(bx, by), badge_r, badge_r)
+            painter.setPen(QColor("#FFFFFF"))
+            badge_font = QFont("Segoe UI", 7, QFont.Bold)
+            painter.setFont(badge_font)
+            painter.drawText(QRectF(bx - badge_r, by - badge_r, badge_r * 2, badge_r * 2), Qt.AlignCenter, str(len(open_ports)))
+
+        # Center Label: IP Last Octet, Role or Device Type
+        parts = self.host.ip.split(".")
+        hn_lower = (self.host.hostname or "").lower()
+        if is_dc:
+            center_text = "DC"
+        elif is_domain:
+            center_text = "DOM"
+        elif is_comp:
+            center_text = "PC"
+        elif "gateway" in hn_lower or "router" in hn_lower or self.host.ip.endswith(".1"):
+            center_text = "GW"
+        elif self.host.hostname and len(self.host.hostname) <= 5 and not self.host.hostname.startswith("192."):
+            center_text = self.host.hostname.upper()
+        else:
+            center_text = f".{parts[-1]}" if len(parts) == 4 else self.host.ip[:6]
+
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRectF(-self.radius, -self.radius, self.radius * 2, self.radius * 2), Qt.AlignCenter, center_text)
+
+        # Label Underneath
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(QColor("#94a3b8"))
+        display_lbl = self.host.hostname if self.host.hostname else self.host.ip
+        if len(display_lbl) > 18:
+            display_lbl = display_lbl[:16] + ".."
+        painter.drawText(QRectF(-self.radius - 30, self.radius + 4, self.radius * 2 + 60, 16), Qt.AlignCenter, display_lbl)
+
+
+class NetworkSubnetHubItem(QGraphicsItem):
+    """Central logical hub representing a subnet or broadcast domain."""
+
+    def __init__(self, subnet_cidr: str, x: float, y: float, radius: float = 44.0):
+        super().__init__()
+        self.subnet_cidr = subnet_cidr
+        self.radius = radius
+        self.setPos(x, y)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setToolTip(f"Subnet Segment: {subnet_cidr}\nLogical broadcast domain & routing zone.")
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-self.radius - 12, -self.radius - 12, (self.radius + 12) * 2, (self.radius + 12) * 2 + 16)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = QRectF(-self.radius, -self.radius, self.radius * 2, self.radius * 2)
+
+        # Subtle cyan outer glow
+        glow_pen = QPen(QColor(6, 182, 212, 45), 6)
+        painter.setPen(glow_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 12, 12)
+
+        # Main box
+        painter.setPen(QPen(QColor("#06b6d4"), 2, Qt.SolidLine))
+        painter.setBrush(QBrush(QColor("#0b1329")))
+        painter.drawRoundedRect(rect, 10, 10)
+
+        # Center Title & CIDR
+        painter.setPen(QColor("#38bdf8"))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        painter.drawText(QRectF(-self.radius, -self.radius + 10, self.radius * 2, 18), Qt.AlignCenter, "⚡ SUBNET SEGMENT")
+
+        painter.setPen(QColor("#f8fafc"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(QRectF(-self.radius, -self.radius + 30, self.radius * 2, 20), Qt.AlignCenter, self.subnet_cidr)
+
+        painter.setPen(QColor("#64748b"))
+        painter.setFont(QFont("Segoe UI", 7))
+        painter.drawText(QRectF(-self.radius, -self.radius + 52, self.radius * 2, 16), Qt.AlignCenter, "Broadcast Domain")
+
+
+class NetworkRadarBackgroundItem(QGraphicsItem):
+    """Concentric cyber radar range rings and azimuth axes for Radial Pivot Horizon projection."""
+
+    def __init__(self, max_radius: float = 680.0):
+        super().__init__()
+        self.max_radius = max_radius
+        self.setZValue(-100)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.ItemIsMovable, False)
+
+    def boundingRect(self) -> QRectF:
+        r = self.max_radius + 60
+        return QRectF(-r, -r, r * 2, r * 2)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Concentric Radar Rings & Tier Guides (Aligned with Radial Node Orbits)
+        ring_specs = [
+            (120.0, "TIER 0 : BROADCAST DOMAIN PERIMETER", "#0284c7"),
+            (240.0, "TIER 1 : PRIMARY ASSET HORIZON", "#0ea5e9"),
+            (360.0, "TIER 2 : EXTENDED ASSET HORIZON", "#06b6d4"),
+            (520.0, "TIER 3 : EXTERNAL RECON BOUNDARY", "#334155"),
+        ]
+
+        # Cardinal crosshairs
+        axis_pen = QPen(QColor(30, 41, 59, 100), 1.2, Qt.DashLine)
+        painter.setPen(axis_pen)
+        painter.drawLine(QPointF(-self.max_radius, 0), QPointF(self.max_radius, 0))
+        painter.drawLine(QPointF(0, -self.max_radius), QPointF(0, self.max_radius))
+
+        # Diagonal guides (45 deg)
+        diag_pen = QPen(QColor(15, 23, 42, 80), 1.0, Qt.DotLine)
+        painter.setPen(diag_pen)
+        d = self.max_radius * 0.7071
+        painter.drawLine(QPointF(-d, -d), QPointF(d, d))
+        painter.drawLine(QPointF(-d, d), QPointF(d, -d))
+
+        # Concentric range rings
+        for radius, label, color_hex in ring_specs:
+            if radius > self.max_radius:
+                continue
+            base_color = QColor(color_hex)
+            r_pen = QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 50), 1.0, Qt.DashLine)
+            painter.setPen(r_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(0, 0), radius, radius)
+
+            # High-tech Tier Label along 135° diagonal (top-left) to avoid node collision
+            painter.setPen(QColor(100, 116, 139, 140))
+            painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            lx = -radius * 0.7071 - 8
+            ly = -radius * 0.7071 - 4
+            painter.drawText(QRectF(lx - 200, ly - 8, 200, 16), Qt.AlignRight, label)
+
+        # Azimuth Cardinal Degree Ticks
+        painter.setPen(QColor("#475569"))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        painter.drawText(QRectF(-50, -self.max_radius - 22, 100, 16), Qt.AlignCenter, "[ 000° NORTH ]")
+        painter.drawText(QRectF(self.max_radius + 6, -8, 100, 16), Qt.AlignLeft, "[ 090° EAST ]")
+        painter.drawText(QRectF(-50, self.max_radius + 6, 100, 16), Qt.AlignCenter, "[ 180° SOUTH ]")
+        painter.drawText(QRectF(-self.max_radius - 106, -8, 100, 16), Qt.AlignRight, "[ 270° WEST ]")
+
+
+class NetworkWANNodeItem(QGraphicsItem):
+    """External Internet / WAN gateway root node (Fortinet Style)."""
+
+    def __init__(self, x: float = 0, y: float = -280, label: str = "INTERNET\nEXTERNAL WAN"):
+        super().__init__()
+        self.label = label
+        self.setPos(x, y)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setToolTip("External Internet WAN Gateway\nBorder traffic entry point.")
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-65, -28, 130, 56)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.boundingRect()
+        glow_pen = QPen(QColor(2, 132, 199, 50), 5)
+        painter.setPen(glow_pen)
+        painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 10, 10)
+        painter.setPen(QPen(QColor("#0284c7"), 2))
+        painter.setBrush(QBrush(QColor("#082f49")))
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(QColor("#38bdf8"))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        painter.drawText(rect, Qt.AlignCenter, "🌐  INTERNET\nEXTERNAL WAN")
+
+
+class NetworkGatewayNodeItem(QGraphicsItem):
+    """Central Assessment Pivot / Gateway node representing access horizon and routing."""
+
+    def __init__(self, x: float = 0, y: float = -140, name: str = "Assessment Pivot", subtitle: str = "Engagement Pivot · Access Horizon"):
+        super().__init__()
+        self.name = name
+        self.subtitle = subtitle
+        self.setPos(x, y)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setToolTip(f"Gateway / Pivot: {name}\n{subtitle}")
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-80, -36, 160, 72)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.boundingRect()
+        glow_pen = QPen(QColor(6, 182, 212, 50), 5)
+        painter.setPen(glow_pen)
+        painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 10, 10)
+        painter.setPen(QPen(QColor("#06b6d4"), 2))
+        painter.setBrush(QBrush(QColor("#0b1329")))
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(QRectF(-75, -28, 150, 20), Qt.AlignCenter, f"🛡️  {self.name}")
+        painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(-75, -2, 150, 32), Qt.AlignCenter, self.subtitle)
+
+
+class NetworkConnectionItem(QGraphicsLineItem):
+    """Neon cyber connection link between nodes with smooth Bézier curve support."""
+
+    def __init__(self, start_pos: QPointF, end_pos: QPointF, edge_style: str = "curve", color: str = "#0ea5e9"):
+        super().__init__(start_pos.x(), start_pos.y(), end_pos.x(), end_pos.y())
+        self.start_pos = start_pos
+        self.end_pos = end_pos
+        self.edge_style = edge_style
+        self.link_color = QColor(color)
+        pen = QPen(self.link_color, 1.8, Qt.SolidLine)
+        self.setPen(pen)
+        self.setZValue(-1)
+
+    def boundingRect(self) -> QRectF:
+        x1 = min(self.start_pos.x(), self.end_pos.x()) - 10
+        y1 = min(self.start_pos.y(), self.end_pos.y()) - 10
+        x2 = max(self.start_pos.x(), self.end_pos.x()) + 10
+        y2 = max(self.start_pos.y(), self.end_pos.y()) + 10
+        return QRectF(x1, y1, max(20.0, x2 - x1), max(20.0, y2 - y1))
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        if self.edge_style == "line":
+            painter.setPen(self.pen())
+            painter.drawLine(self.start_pos, self.end_pos)
+            return
+
+        path = QPainterPath()
+        p1 = self.start_pos
+        p2 = self.end_pos
+        path.moveTo(p1)
+
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+
+        if self.edge_style == "ortho":
+            mid_y = p1.y() + dy * 0.5
+            path.lineTo(p1.x(), mid_y)
+            path.lineTo(p2.x(), mid_y)
+            path.lineTo(p2.x(), p2.y())
+        else:
+            c1 = QPointF(p1.x(), p1.y() + dy * 0.5)
+            c2 = QPointF(p2.x(), p2.y() - dy * 0.5)
+            path.cubicTo(c1, c2, p2)
+
+        glow_pen = QPen(QColor(self.link_color.red(), self.link_color.green(), self.link_color.blue(), 35), 4)
+        painter.setPen(glow_pen)
+        painter.drawPath(path)
+        painter.setPen(self.pen())
+        painter.drawPath(path)
+
+
+class NetworkGraphicsView(QGraphicsView):
+    """Custom high-DPI QGraphicsView with smooth mouse wheel zooming centered on cursor and middle-click pan."""
+
+    def __init__(self, scene: QGraphicsScene, parent: Optional[QWidget] = None):
+        super().__init__(scene, parent)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setRenderHint(QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setStyleSheet("border: none; background-color: #06090e;")
+        self._is_panning = False
+        self._pan_start = QPointF(0, 0)
+
+    def wheelEvent(self, event):
+        zoom_factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
+        current_scale = self.transform().m11()
+        if 0.1 <= current_scale * zoom_factor <= 8.0:
+            self.scale(zoom_factor, zoom_factor)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and bool(event.modifiers() & Qt.ControlModifier)):
+            self._is_panning = True
+            self._pan_start = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_panning:
+            delta = event.position() - self._pan_start
+            self._pan_start = event.position()
+            self.horizontalScrollBar().setValue(int(self.horizontalScrollBar().value() - delta.x()))
+            self.verticalScrollBar().setValue(int(self.verticalScrollBar().value() - delta.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._is_panning and (event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton):
+            self._is_panning = False
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class NetworkMapView(QWidget):
+    """Interactive Network Asset & Topology Map with Cyber Sentinel Dashboard."""
+
+    host_selected = Signal(object)  # Emits HostResult when selected
+    analyse_path_requested = Signal(str)  # Emits target IP
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_scan: Optional[NmapScanResult] = None
+        self.current_findings: List[Finding] = []
+        self._selected_host: Optional[HostResult] = None
+        self.layout_mode = "radial"
+        self.edge_style = "curve"
+        self.min_risk_filter = 0
+        self.radar_item: Optional[NetworkRadarBackgroundItem] = None
+        self._sentinel_hidden = False
+        self._init_ui()
+
+    def _init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(6)
+
+        # 1. Top Cyber Sentinel Dashboard Header (Image 2)
+        self.sentinel_bar = QFrame()
+        self.sentinel_bar.setStyleSheet(
+            "QFrame { background-color: #0b0f19; border-bottom: 1px solid #1e293b; padding: 4px; }"
+        )
+        s_layout = QHBoxLayout(self.sentinel_bar)
+        s_layout.setContentsMargins(12, 8, 12, 8)
+        s_layout.setSpacing(14)
+
+        # Title with Logo Shield
+        lbl_logo = QLabel("🛡️ CYBER SENTINEL | Attack Surface & Segment Topology")
+        lbl_logo.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        lbl_logo.setStyleSheet("color: #38bdf8;")
+        s_layout.addWidget(lbl_logo)
+
+        # Status Pill
+        lbl_status = QLabel("🟢 Real-Time Status: Active")
+        lbl_status.setStyleSheet(
+            "background-color: #022c22; color: #10b981; border: 1px solid #059669; border-radius: 12px; padding: 3px 10px; font-weight: bold; font-size: 10px;"
+        )
+        s_layout.addWidget(lbl_status)
+
+        # Security Posture KPI
+        self.lbl_posture = QLabel("Overall Posture: 89% Secure")
+        self.lbl_posture.setStyleSheet(
+            "background-color: #1e1b4b; color: #a855f7; border: 1px solid #7e22ce; border-radius: 12px; padding: 3px 10px; font-weight: bold; font-size: 10px;"
+        )
+        s_layout.addWidget(self.lbl_posture)
+
+        s_layout.addStretch()
+
+        # Export Buttons
+        self.btn_export_svg = QPushButton("Export SVG")
+        self.btn_export_svg.setStyleSheet("background-color: #1e293b; color: white; border-radius: 4px; padding: 4px 8px; font-size: 11px;")
+        self.btn_export_svg.clicked.connect(self.export_svg)
+        s_layout.addWidget(self.btn_export_svg)
+
+        self.btn_export_png = QPushButton("Export PNG")
+        self.btn_export_png.setStyleSheet("background-color: #1e293b; color: white; border-radius: 4px; padding: 4px 8px; font-size: 11px;")
+        self.btn_export_png.clicked.connect(self.export_png)
+        s_layout.addWidget(self.btn_export_png)
+
+        main_layout.addWidget(self.sentinel_bar)
+
+        # 2. Main 3-Way Horizontal Splitter:
+        # Left Devices Drawer (Image 3) | Center Canvas (Image 2 & 3) | Right Device Details (Image 3)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setStyleSheet("QSplitter::handle { background-color: #1e293b; }")
+
+        # A. Left Devices Drawer (Image 3)
+        devices_drawer = QFrame()
+        devices_drawer.setStyleSheet("background-color: #0d1117; border-right: 1px solid #1e293b;")
+        dev_layout = QVBoxLayout(devices_drawer)
+        dev_layout.setContentsMargins(10, 10, 10, 10)
+        dev_layout.setSpacing(8)
+
+        lbl_dev_hdr = QLabel("Devices")
+        lbl_dev_hdr.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        lbl_dev_hdr.setStyleSheet("color: #f1f5f9;")
+        dev_layout.addWidget(lbl_dev_hdr)
+
+        self.txt_dev_search = QLineEdit()
+        self.txt_dev_search.setPlaceholderText("🔍 Search by IP, host, tag...")
+        self.txt_dev_search.setStyleSheet(
+            "background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; color: white; padding: 5px 8px; font-size: 11px;"
+        )
+        self.txt_dev_search.textChanged.connect(self._filter_device_list)
+        dev_layout.addWidget(self.txt_dev_search)
+
+        # Quick filter buttons
+        filter_bar = QHBoxLayout()
+        self.btn_filter_all = QPushButton("All")
+        self.btn_filter_all.setCheckable(True)
+        self.btn_filter_all.setChecked(True)
+        self.btn_filter_all.setStyleSheet("background-color: #21262d; color: white; border-radius: 4px; padding: 3px 8px; font-size: 10px;")
+        self.btn_filter_all.clicked.connect(lambda: self._set_device_filter("all"))
+        filter_bar.addWidget(self.btn_filter_all)
+
+        self.btn_filter_risk = QPushButton("High Risk")
+        self.btn_filter_risk.setCheckable(True)
+        self.btn_filter_risk.setStyleSheet("background-color: #21262d; color: #ef4444; border-radius: 4px; padding: 3px 8px; font-size: 10px;")
+        self.btn_filter_risk.clicked.connect(lambda: self._set_device_filter("risk"))
+        filter_bar.addWidget(self.btn_filter_risk)
+
+        self.btn_filter_ports = QPushButton("Active Ports")
+        self.btn_filter_ports.setCheckable(True)
+        self.btn_filter_ports.setStyleSheet("background-color: #21262d; color: #38bdf8; border-radius: 4px; padding: 3px 8px; font-size: 10px;")
+        self.btn_filter_ports.clicked.connect(lambda: self._set_device_filter("ports"))
+        filter_bar.addWidget(self.btn_filter_ports)
+
+        dev_layout.addLayout(filter_bar)
+
+        self.list_devices = QListWidget()
+        self.list_devices.setStyleSheet(
+            "QListWidget { background-color: #0d1117; border: none; color: #f1f5f9; font-size: 11px; }"
+            "QListWidget::item { padding: 8px 6px; border-bottom: 1px solid #1e293b; border-radius: 4px; }"
+            "QListWidget::item:selected { background-color: #1e293b; border-left: 3px solid #38bdf8; }"
+        )
+        self.list_devices.itemClicked.connect(self._on_device_list_clicked)
+        dev_layout.addWidget(self.list_devices)
+        splitter.addWidget(devices_drawer)
+
+        # B. Center: Graphics Canvas
+        center_container = QWidget()
+        center_layout = QVBoxLayout(center_container)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+
+        # Top HUD Layout & Style Controls (Auspex / Fortinet Style)
+        hud_bar = QFrame()
+        hud_bar.setStyleSheet("QFrame { background-color: #0b0f19; border-bottom: 1px solid #1e293b; padding: 4px 8px; }")
+        hud_layout = QHBoxLayout(hud_bar)
+        hud_layout.setContentsMargins(6, 4, 6, 4)
+        hud_layout.setSpacing(8)
+
+        lbl_topo = QLabel("PROJECTION:")
+        lbl_topo.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+        hud_layout.addWidget(lbl_topo)
+
+        self.btn_layout_radial = QPushButton("🎯 Radial Pivot Horizon")
+        self.btn_layout_radial.setToolTip("Concentric Radar Attack Surface radiating from Core Pivot Gateway")
+        self.btn_layout_radial.setCheckable(True)
+        self.btn_layout_radial.setChecked(True)
+        self.btn_layout_radial.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:checked { background: #0284c7; color: #ffffff; border-color: #38bdf8; font-weight: bold; }"
+        )
+        self.btn_layout_radial.clicked.connect(lambda: self._set_layout_mode("radial"))
+        hud_layout.addWidget(self.btn_layout_radial)
+
+        self.btn_layout_tree = QPushButton("🌲 Core-Distribution Hierarchy")
+        self.btn_layout_tree.setToolTip("Hierarchical Perimeter, Distribution Hubs & Access Layer")
+        self.btn_layout_tree.setCheckable(True)
+        self.btn_layout_tree.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:checked { background: #0284c7; color: #ffffff; border-color: #38bdf8; font-weight: bold; }"
+        )
+        self.btn_layout_tree.clicked.connect(lambda: self._set_layout_mode("tree"))
+        hud_layout.addWidget(self.btn_layout_tree)
+
+        self.btn_layout_grid = QPushButton("⊞ Broadcast Domain Matrix")
+        self.btn_layout_grid.setToolTip("Structured Matrix Grid sorted by Subnets & Broadcast Domains")
+        self.btn_layout_grid.setCheckable(True)
+        self.btn_layout_grid.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:checked { background: #0284c7; color: #ffffff; border-color: #38bdf8; font-weight: bold; }"
+        )
+        self.btn_layout_grid.clicked.connect(lambda: self._set_layout_mode("grid"))
+        hud_layout.addWidget(self.btn_layout_grid)
+
+        hud_layout.addSpacing(6)
+        lbl_edge = QLabel("EDGES:")
+        lbl_edge.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+        hud_layout.addWidget(lbl_edge)
+
+        self.btn_edge_curve = QPushButton("〰 Spline Link")
+        self.btn_edge_curve.setCheckable(True)
+        self.btn_edge_curve.setChecked(True)
+        self.btn_edge_curve.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:checked { background: #0284c7; color: #ffffff; border-color: #38bdf8; font-weight: bold; }"
+        )
+        self.btn_edge_curve.clicked.connect(lambda: self._set_edge_style("curve"))
+        hud_layout.addWidget(self.btn_edge_curve)
+
+        self.btn_edge_line = QPushButton("─ Direct Spoke")
+        self.btn_edge_line.setCheckable(True)
+        self.btn_edge_line.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:checked { background: #0284c7; color: #ffffff; border-color: #38bdf8; font-weight: bold; }"
+        )
+        self.btn_edge_line.clicked.connect(lambda: self._set_edge_style("line"))
+        hud_layout.addWidget(self.btn_edge_line)
+
+        hud_layout.addStretch()
+
+        # Zoom buttons
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setFixedSize(22, 22)
+        btn_zoom_in.setStyleSheet("background: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        btn_zoom_in.clicked.connect(lambda: self.view.scale(1.2, 1.2))
+        hud_layout.addWidget(btn_zoom_in)
+
+        btn_zoom_out = QPushButton("−")
+        btn_zoom_out.setFixedSize(22, 22)
+        btn_zoom_out.setStyleSheet("background: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        btn_zoom_out.clicked.connect(lambda: self.view.scale(0.8, 0.8))
+        hud_layout.addWidget(btn_zoom_out)
+
+        btn_fit = QPushButton("⤢ Fit")
+        btn_fit.setStyleSheet("background: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: bold;")
+        btn_fit.clicked.connect(self._fit_to_view)
+        hud_layout.addWidget(btn_fit)
+
+        btn_exp_svg = QPushButton("SVG")
+        btn_exp_svg.setToolTip("Export Vector SVG Diagram")
+        btn_exp_svg.setStyleSheet("background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px;")
+        btn_exp_svg.clicked.connect(self.export_svg)
+        hud_layout.addWidget(btn_exp_svg)
+
+        btn_exp_png = QPushButton("PNG")
+        btn_exp_png.setToolTip("Export High-Res PNG Image")
+        btn_exp_png.setStyleSheet("background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px;")
+        btn_exp_png.clicked.connect(self.export_png)
+        hud_layout.addWidget(btn_exp_png)
+
+        center_layout.addWidget(hud_bar)
+
+        self.scene = QGraphicsScene(self)
+        self.scene.setBackgroundBrush(QBrush(QColor("#06090e")))
+        self.scene.selectionChanged.connect(self._on_selection_changed)
+
+        # Ambient Cyber Radar Range Rings for Radial Projection
+        self.radar_item = NetworkRadarBackgroundItem()
+        self.scene.addItem(self.radar_item)
+        self.radar_item.setVisible(self.layout_mode == "radial")
+
+        self.view = NetworkGraphicsView(self.scene)
+        self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.setDragMode(QGraphicsView.RubberBandDrag)
+        self.view.setStyleSheet("border: none; background-color: #06090e;")
+        center_layout.addWidget(self.view)
+
+        # Bottom Legend & Filter Bar (Auspex Observatory / Image 2 style)
+        legend_bar = QFrame()
+        legend_bar.setStyleSheet("QFrame { background-color: #0b0f19; border-top: 1px solid #1e293b; padding: 4px 10px; }")
+        leg_layout = QHBoxLayout(legend_bar)
+        leg_layout.setContentsMargins(6, 4, 6, 4)
+        leg_layout.setSpacing(14)
+
+        for color, name in (
+            ("#0284c7", "WAN / Gateway"),
+            ("#06b6d4", "Subnet Hub"),
+            ("#ef4444", "Critical / High Risk"),
+            ("#eab308", "Medium Risk"),
+            ("#10b981", "Secure / Clean"),
+        ):
+            pill = QHBoxLayout()
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {color}; font-size: 13px; margin-right: 3px;")
+            lbl = QLabel(name)
+            lbl.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 500;")
+            pill.addWidget(dot)
+            pill.addWidget(lbl)
+            leg_layout.addLayout(pill)
+
+        leg_layout.addStretch()
+
+        lbl_rf = QLabel("Risk: ≥")
+        lbl_rf.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        leg_layout.addWidget(lbl_rf)
+
+        self.spin_risk_filter = QSpinBox()
+        self.spin_risk_filter.setRange(0, 100)
+        self.spin_risk_filter.setValue(0)
+        self.spin_risk_filter.setFixedWidth(55)
+        self.spin_risk_filter.setStyleSheet(
+            "QSpinBox { background: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; padding: 2px 4px; font-size: 10px; }"
+        )
+        self.spin_risk_filter.valueChanged.connect(self._on_risk_filter_changed)
+        leg_layout.addWidget(self.spin_risk_filter)
+
+        center_layout.addWidget(legend_bar)
+        splitter.addWidget(center_container)
+
+        # C. Right: Device Details Drawer (Image 3)
+        self.inspector_panel = QFrame()
+        self.inspector_panel.setStyleSheet("background-color: #0b0f19; border-left: 1px solid #1e293b;")
+        insp_layout = QVBoxLayout(self.inspector_panel)
+        insp_layout.setContentsMargins(14, 12, 14, 12)
+        insp_layout.setSpacing(10)
+
+        # Header Title & Status
+        insp_hdr = QHBoxLayout()
+        self.lbl_device_title = QLabel("Device Details")
+        self.lbl_device_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.lbl_device_title.setStyleSheet("color: #ffffff;")
+        insp_hdr.addWidget(self.lbl_device_title)
+
+        self.lbl_dev_status_badge = QLabel("ACTIVE")
+        self.lbl_dev_status_badge.setStyleSheet(
+            "background-color: #064e3b; color: #34d399; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 9px;"
+        )
+        insp_hdr.addWidget(self.lbl_dev_status_badge)
+        insp_hdr.addStretch()
+
+        self.btn_copy_ip = QPushButton("📋 Copy IP")
+        self.btn_copy_ip.setStyleSheet("background-color: #1e293b; color: #94a3b8; border-radius: 4px; padding: 2px 8px; font-size: 10px;")
+        self.btn_copy_ip.clicked.connect(self._copy_selected_ip)
+        insp_hdr.addWidget(self.btn_copy_ip)
+        insp_layout.addLayout(insp_hdr)
+
+        # IP & Metadata Box
+        self.lbl_ip_cidr = QLabel("127.0.0.1 / 32")
+        self.lbl_ip_cidr.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.lbl_ip_cidr.setStyleSheet("color: #38bdf8;")
+        insp_layout.addWidget(self.lbl_ip_cidr)
+
+        self.lbl_meta_info = QLabel("Device Type: Server\nLast Scan: Active Assessment\nOS: Linux 5.x / Ubuntu")
+        self.lbl_meta_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        insp_layout.addWidget(self.lbl_meta_info)
+
+        # Analyse Path Button (Image 3)
+        self.btn_analyse_path = QPushButton("🔍 Analyse Attack Path")
+        self.btn_analyse_path.setStyleSheet(
+            "background-color: #0284c7; color: white; border-radius: 6px; padding: 8px 12px; font-weight: bold; font-size: 11px;"
+        )
+        self.btn_analyse_path.clicked.connect(self._trigger_analyse_path)
+        insp_layout.addWidget(self.btn_analyse_path)
+
+        # Services & Ports Table
+        lbl_svc = QLabel("Discovered Services & Ports")
+        lbl_svc.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        lbl_svc.setStyleSheet("color: #cbd5e1;")
+        insp_layout.addWidget(lbl_svc)
+
+        self.insp_services_table = QTableWidget()
+        self.insp_services_table.setColumnCount(3)
+        self.insp_services_table.setHorizontalHeaderLabels(["Port", "State", "Service"])
+        self.insp_services_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.insp_services_table.setStyleSheet(
+            "QTableWidget { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; color: #f1f5f9; font-size: 10px; }"
+            "QHeaderView::section { background-color: #1e293b; color: #94a3b8; font-weight: bold; padding: 2px; }"
+        )
+        insp_layout.addWidget(self.insp_services_table, stretch=1)
+
+        # AI Notification / NOVA Pill (Image 3 bottom right)
+        self.ai_notification_pill = QFrame()
+        self.ai_notification_pill.setStyleSheet(
+            "QFrame { background-color: #581c87; border: 1px solid #9333ea; border-radius: 8px; padding: 6px; }"
+        )
+        ai_box = QHBoxLayout(self.ai_notification_pill)
+        ai_box.setContentsMargins(8, 6, 8, 6)
+        lbl_ai_icon = QLabel("🤖 NOVA:")
+        lbl_ai_icon.setStyleSheet("color: #e9d5ff; font-weight: bold; font-size: 10px;")
+        ai_box.addWidget(lbl_ai_icon)
+
+        self.lbl_ai_msg = QLabel("Traffic & service pattern analyzed")
+        self.lbl_ai_msg.setStyleSheet("color: #ffffff; font-size: 10px;")
+        ai_box.addWidget(self.lbl_ai_msg, stretch=1)
+
+        btn_ai_see = QPushButton("See now")
+        btn_ai_see.setStyleSheet("background-color: #7e22ce; color: white; border-radius: 4px; padding: 2px 6px; font-size: 9px; font-weight: bold;")
+        ai_box.addWidget(btn_ai_see)
+        insp_layout.addWidget(self.ai_notification_pill)
+
+        splitter.addWidget(self.inspector_panel)
+        splitter.setSizes([220, 620, 320])
+
+        main_layout.addWidget(splitter, stretch=1)
+
+    def _ensure_radar_item(self) -> NetworkRadarBackgroundItem:
+        """Ensures radar_item is alive and attached to the scene, recreating it if cleared by Qt."""
+        try:
+            if self.radar_item is not None and self.radar_item.scene() == self.scene:
+                return self.radar_item
+        except RuntimeError:
+            pass
+        self.radar_item = NetworkRadarBackgroundItem(max_radius=680.0)
+        self.scene.addItem(self.radar_item)
+        return self.radar_item
+
+    def _set_layout_mode(self, mode: str):
+        self.layout_mode = mode
+        if hasattr(self, "btn_layout_radial"):
+            self.btn_layout_radial.setChecked(mode == "radial")
+        if hasattr(self, "btn_layout_tree"):
+            self.btn_layout_tree.setChecked(mode == "tree")
+        if hasattr(self, "btn_layout_grid"):
+            self.btn_layout_grid.setChecked(mode == "grid")
+        self._ensure_radar_item().setVisible(mode == "radial")
+        if self.current_scan:
+            self.load_scan(self.current_scan, self.current_findings)
+
+    def _set_edge_style(self, style: str):
+        self.edge_style = style
+        if hasattr(self, "btn_edge_curve"):
+            self.btn_edge_curve.setChecked(style == "curve")
+        if hasattr(self, "btn_edge_line"):
+            self.btn_edge_line.setChecked(style == "line")
+        for item in self.scene.items():
+            if isinstance(item, NetworkConnectionItem):
+                item.edge_style = style
+        self.scene.update()
+
+    def _on_risk_filter_changed(self, min_risk: int):
+        self.min_risk_filter = min_risk
+        for item in self.scene.items():
+            if isinstance(item, NetworkHostNodeItem):
+                open_ports = len([p for p in item.host.ports if p.state == "open"])
+                risk_score = 72 if item.findings_count > 0 else (30 if open_ports > 3 else 10)
+                item.setVisible(risk_score >= min_risk)
+        self.scene.update()
+
+    def _fit_to_view(self):
+        rect = self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
+        if rect.isValid() and not rect.isEmpty():
+            self.view.fitInView(rect, Qt.KeepAspectRatio)
+
+    def hide_sentinel_header(self):
+        """Hides the upper Sentinel banner to avoid duplicate headers when embedded in Studio."""
+        self._sentinel_hidden = True
+        if hasattr(self, "sentinel_bar") and self.sentinel_bar:
+            self.sentinel_bar.setVisible(False)
+
+    def show_sentinel_header(self):
+        """Restores the upper Sentinel banner."""
+        self._sentinel_hidden = False
+        if hasattr(self, "sentinel_bar") and self.sentinel_bar:
+            self.sentinel_bar.setVisible(True)
+
+    def _set_device_filter(self, mode: str):
+        self.btn_filter_all.setChecked(mode == "all")
+        self.btn_filter_risk.setChecked(mode == "risk")
+        self.btn_filter_ports.setChecked(mode == "ports")
+        self._filter_device_list()
+
+    def _filter_device_list(self):
+        query = self.txt_dev_search.text().strip().lower()
+        filter_risk = self.btn_filter_risk.isChecked()
+        filter_ports = self.btn_filter_ports.isChecked()
+
+        for i in range(self.list_devices.count()):
+            item = self.list_devices.item(i)
+            host: Optional[HostResult] = item.data(Qt.UserRole)
+            if not host:
+                continue
+
+            open_count = sum(1 for p in host.ports if p.state == "open")
+            f_count = sum(1 for f in self.current_findings if f.affected_asset == host.ip)
+
+            match_text = (not query) or (query in host.ip.lower()) or (host.hostname and query in host.hostname.lower())
+            match_risk = (not filter_risk) or (f_count > 0)
+            match_ports = (not filter_ports) or (open_count > 0)
+
+            item.setHidden(not (match_text and match_risk and match_ports))
+
+    def _on_device_list_clicked(self, item: QListWidgetItem):
+        host: Optional[HostResult] = item.data(Qt.UserRole)
+        if not host:
+            return
+
+        # Select corresponding node on canvas
+        for g_item in self.scene.items():
+            if isinstance(g_item, NetworkHostNodeItem) and g_item.host.ip == host.ip:
+                self.scene.clearSelection()
+                g_item.setSelected(True)
+                self.view.centerOn(g_item)
+                self._update_inspector_for_host(host, g_item.findings_count)
+                break
+
+    def load_scan(self, scan_result: Optional[NmapScanResult], findings: Optional[List[Finding]] = None):
+        """Loads and visualizes hosts clustered logically by subnets with dynamic layout projection."""
+        self.current_scan = scan_result
+        self.current_findings = findings or []
+        self.list_devices.clear()
+
+        existing_host_items: Dict[str, NetworkHostNodeItem] = {
+            it.host.ip: it for it in self.scene.items() if isinstance(it, NetworkHostNodeItem)
+        }
+        existing_hubs: Dict[str, NetworkSubnetHubItem] = {
+            it.subnet_cidr: it for it in self.scene.items() if isinstance(it, NetworkSubnetHubItem)
+        }
+
+        # Clear existing connection links so lines can be reconstructed to match updated node coordinates
+        for it in list(self.scene.items()):
+            if isinstance(it, NetworkConnectionItem):
+                self.scene.removeItem(it)
+
+        if not scan_result or not scan_result.hosts:
+            if not existing_host_items:
+                self.scene.clear()
+                self._ensure_radar_item().setVisible(self.layout_mode == "radial")
+                empty_item = self.scene.addText(
+                    "No Discovered Network Assets Yet\n\n"
+                    "Run a Host Discovery (-sn) or Port Scan, or Import an external Nmap XML\n"
+                    "to generate the interactive network topology map."
+                )
+                empty_item.setDefaultTextColor(QColor("#64748b"))
+                empty_item.setFont(QFont("Segoe UI", 12))
+                empty_item.setPos(-180, -40)
+            return
+
+        # Remove any lingering empty placeholder text
+        for it in list(self.scene.items()):
+            if isinstance(it, QGraphicsTextItem) and "No Discovered Network Assets" in it.toPlainText():
+                self.scene.removeItem(it)
+
+        # Update radar visibility
+        self._ensure_radar_item().setVisible(self.layout_mode == "radial")
+
+        # Populate Left Devices Drawer
+        for h in scan_result.hosts:
+            open_count = sum(1 for p in h.ports if p.state == "open")
+            f_count = sum(1 for f in self.current_findings if f.affected_asset == h.ip)
+            risk_score = 72 if f_count > 0 else (30 if open_count > 3 else 10)
+
+            name = h.hostname or h.ip
+            item = QListWidgetItem(f"🖥️ {name} ({h.ip})\n    Active • {open_count} ports • Risk {risk_score}")
+            item.setData(Qt.UserRole, h)
+            self.list_devices.addItem(item)
+
+        # 1. Group hosts by subnet (/24 for IPv4, /64 for IPv6, AD grouping for directory entities)
+        subnets: Dict[str, List[HostResult]] = {}
+        for h in scan_result.hosts:
+            dev_type = (getattr(h, "device_type", "") or "").lower()
+            is_ad = "domain" in dev_type or "computer" in dev_type or "workstation" in dev_type
+            try:
+                ip_obj = ipaddress.ip_interface(h.ip)
+                if ip_obj.version == 4:
+                    subnet_key = str(ipaddress.ip_network(f"{ip_obj.ip}/24", strict=False))
+                else:
+                    subnet_key = str(ipaddress.ip_network(f"{ip_obj.ip}/64", strict=False))
+            except Exception:
+                if is_ad:
+                    subnet_key = "Active Directory & Enterprise Directory"
+                else:
+                    subnet_key = "External / Non-IP Assets"
+            subnets.setdefault(subnet_key, []).append(h)
+
+        subnet_keys = list(subnets.keys())
+        num_subnets = max(1, len(subnet_keys))
+        hub_spacing = 460.0
+
+        # Remove previous scan hubs and hosts not belonging to the new scan
+        for cidr, hub in list(existing_hubs.items()):
+            if cidr not in subnet_keys:
+                self.scene.removeItem(hub)
+                del existing_hubs[cidr]
+
+        current_ips = {h.ip for h in scan_result.hosts}
+        for ip, h_item in list(existing_host_items.items()):
+            if ip not in current_ips:
+                self.scene.removeItem(h_item)
+                del existing_host_items[ip]
+
+        # 2. Setup central Gateway and WAN nodes
+        gw_item = next((it for it in self.scene.items() if isinstance(it, NetworkGatewayNodeItem)), None)
+        wan_item = next((it for it in self.scene.items() if isinstance(it, NetworkWANNodeItem)), None)
+
+        if self.layout_mode == "radial":
+            if num_subnets > 1:
+                if not gw_item:
+                    gw_item = NetworkGatewayNodeItem(0, 0, name="Assessment Pivot", subtitle=f"Multi-Segment Core · {num_subnets} Segments")
+                    self.scene.addItem(gw_item)
+                else:
+                    gw_item.name = "Assessment Pivot"
+                    gw_item.subtitle = f"Multi-Segment Core · {num_subnets} Segments"
+                    gw_item.setPos(0, 0)
+                    gw_item.setVisible(True)
+            else:
+                # In single-subnet radial mode, the subnet segment itself is the central pivot at (0, 0).
+                # Hide dummy gateway node to completely eliminate visual overlap.
+                if gw_item:
+                    gw_item.setVisible(False)
+            if wan_item:
+                wan_item.setVisible(False)
+        elif self.layout_mode == "tree":
+            if not wan_item:
+                wan_item = NetworkWANNodeItem(0, -280)
+                self.scene.addItem(wan_item)
+            else:
+                wan_item.setPos(0, -280)
+                wan_item.setVisible(True)
+
+            if not gw_item:
+                gw_item = NetworkGatewayNodeItem(0, -140, name="Assessment Pivot", subtitle="Perimeter & Access Horizon")
+                self.scene.addItem(gw_item)
+            else:
+                gw_item.name = "Assessment Pivot"
+                gw_item.subtitle = "Perimeter & Access Horizon"
+                gw_item.setPos(0, -140)
+                gw_item.setVisible(True)
+
+            # Link WAN -> Gateway
+            self.scene.addItem(NetworkConnectionItem(wan_item.pos(), gw_item.pos(), edge_style=self.edge_style, color="#0284c7"))
+        else:  # grid mode
+            if gw_item:
+                gw_item.setVisible(False)
+            if wan_item:
+                wan_item.setVisible(False)
+
+        # 3. Layout subnet clusters & Spoke geometry
+        max_orbit_radius = 240.0
+        for s_idx, subnet_cidr in enumerate(subnet_keys):
+            hosts_in_subnet = subnets[subnet_cidr]
+            num_hosts = len(hosts_in_subnet)
+
+            # Determine Subnet Hub position
+            if self.layout_mode == "radial":
+                if num_subnets == 1:
+                    center_x = 0.0
+                    center_y = 0.0
+                else:
+                    sub_angle = (2 * math.pi / num_subnets) * s_idx - (math.pi / 2.0)
+                    sub_dist = 280.0
+                    center_x = sub_dist * math.cos(sub_angle)
+                    center_y = sub_dist * math.sin(sub_angle)
+            elif self.layout_mode == "grid":
+                cols = max(1, int(math.ceil(math.sqrt(num_subnets))))
+                center_x = ((s_idx % cols) - cols / 2.0) * hub_spacing
+                center_y = ((s_idx // cols) - 1) * hub_spacing
+            else:
+                # Tree: Subnets arranged horizontally under Gateway
+                center_x = (s_idx - (num_subnets - 1) / 2.0) * hub_spacing
+                center_y = 20.0
+
+            if subnet_cidr in existing_hubs:
+                hub_item = existing_hubs[subnet_cidr]
+                hub_item.setPos(center_x, center_y)
+                hub_item.setVisible(True)
+            else:
+                hub_item = NetworkSubnetHubItem(subnet_cidr, center_x, center_y)
+                self.scene.addItem(hub_item)
+                existing_hubs[subnet_cidr] = hub_item
+
+            # Connect Gateway -> Subnet Hub (only when gateway is visible and at a distinct position)
+            if gw_item and gw_item.isVisible() and (center_x != 0.0 or center_y != 0.0):
+                gw_link = NetworkConnectionItem(
+                    gw_item.pos(),
+                    QPointF(center_x, center_y),
+                    edge_style=self.edge_style,
+                    color="#0284c7",
+                )
+                self.scene.addItem(gw_link)
+
+            # 4. Position and Connect member Hosts with Collision-Free Multi-Tier Orbits
+            if self.layout_mode == "radial":
+                if num_subnets == 1:
+                    # Dynamic Concentric Orbits based on host count
+                    if num_hosts <= 8:
+                        tier_capacities = [num_hosts]
+                        tier_radii = [240.0]
+                    elif num_hosts <= 24:
+                        tier_capacities = [8, num_hosts - 8]
+                        tier_radii = [220.0, 320.0]
+                    elif num_hosts <= 60:
+                        c0 = min(10, num_hosts)
+                        c1 = min(20, num_hosts - c0)
+                        c2 = num_hosts - c0 - c1
+                        tier_capacities = [c0, c1, c2]
+                        tier_radii = [220.0, 320.0, 420.0]
+                    elif num_hosts <= 120:
+                        tier_capacities = [12, 24, 36, num_hosts - 72]
+                        tier_radii = [220.0, 320.0, 420.0, 520.0]
+                    else:
+                        tier_radii = []
+                        tier_capacities = []
+                        remaining = num_hosts
+                        t = 0
+                        base_r = 220.0
+                        while remaining > 0:
+                            cap = min(remaining, 12 + t * 10)
+                            tier_capacities.append(cap)
+                            tier_radii.append(base_r + t * 95.0)
+                            remaining -= cap
+                            t += 1
+
+                    max_orbit_radius = max(max_orbit_radius, max(tier_radii) if tier_radii else 240.0)
+
+                    host_angles = []
+                    spoke_dists = []
+                    for t_idx, cap in enumerate(tier_capacities):
+                        r = tier_radii[t_idx]
+                        angle_step = (2 * math.pi) / max(1, cap)
+                        phase = (math.pi / cap) if (t_idx % 2 == 1) else 0.0
+                        for i in range(cap):
+                            ang = -math.pi / 2.0 + phase + i * angle_step
+                            host_angles.append(ang)
+                            spoke_dists.append(r)
+                else:
+                    sub_angle = (2 * math.pi / num_subnets) * s_idx - (math.pi / 2.0)
+                    sector_width = min(math.pi * 0.9, (2 * math.pi / num_subnets) * 0.85)
+                    if num_hosts == 1:
+                        host_angles = [sub_angle]
+                        spoke_dists = [180.0]
+                    else:
+                        host_angles = [
+                            sub_angle - (sector_width / 2.0) + (sector_width / max(1, num_hosts - 1)) * i
+                            for i in range(num_hosts)
+                        ]
+                        spoke_dists = [180.0 + (i % 3) * 75.0 if num_hosts > 5 else 180.0 for i in range(num_hosts)]
+                    max_orbit_radius = max(max_orbit_radius, 280.0 + max(spoke_dists))
+            elif self.layout_mode == "grid":
+                h_cols = max(1, int(math.ceil(math.sqrt(num_hosts))))
+            else:
+                orbit_radius = max(130.0, 36.0 * num_hosts)
+
+            for h_idx, host in enumerate(hosts_in_subnet):
+                f_count = sum(1 for f in self.current_findings if f.affected_asset == host.ip)
+
+                if self.layout_mode == "radial":
+                    h_ang = host_angles[h_idx]
+                    s_dist = spoke_dists[h_idx]
+                    if num_subnets == 1:
+                        # Full 360-degree orbit around center
+                        hx = s_dist * math.cos(h_ang)
+                        hy = s_dist * math.sin(h_ang)
+                    else:
+                        # Radiate from subnet hub outward in allocated sector
+                        hx = center_x + s_dist * math.cos(h_ang)
+                        hy = center_y + s_dist * math.sin(h_ang)
+                elif self.layout_mode == "grid":
+                    hx = center_x + ((h_idx % h_cols) - h_cols / 2.0) * 110.0
+                    hy = center_y + ((h_idx // h_cols) + 1) * 100.0
+                else:
+                    # Tree: Semi-circular fan under hub
+                    angle = (math.pi / max(1, num_hosts + 1)) * (h_idx + 1)
+                    hx = center_x + orbit_radius * math.cos(angle)
+                    hy = center_y + 110.0 + (h_idx % 2) * 50.0
+
+                if host.ip in existing_host_items:
+                    host_item = existing_host_items[host.ip]
+                    host_item.host = host
+                    host_item.findings_count = f_count
+                    host_item.setPos(hx, hy)
+                    host_item.setVisible(True)
+                    host_item.update()
+                else:
+                    host_item = NetworkHostNodeItem(host, hx, hy, findings_count=f_count)
+                    self.scene.addItem(host_item)
+                    existing_host_items[host.ip] = host_item
+
+                # Connect Subnet Hub -> Host
+                conn_line = NetworkConnectionItem(
+                    QPointF(center_x, center_y),
+                    QPointF(hx, hy),
+                    edge_style=self.edge_style,
+                    color="#0ea5e9",
+                )
+                self.scene.addItem(conn_line)
+
+        # Dynamically scale radar background rings to envelop outer tiers in Radial mode
+        if self.layout_mode == "radial":
+            radar = self._ensure_radar_item()
+            radar.max_radius = max(680.0, max_orbit_radius + 80.0)
+            radar.setVisible(True)
+            self.scene.setSceneRect(radar.boundingRect())
+        else:
+            self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-80, -80, 80, 80))
+
+        # Select first host if nothing selected
+        if scan_result.hosts and not self.scene.selectedItems():
+            self._update_inspector_for_host(scan_result.hosts[0], 0)
+
+    def load_discovered_assets(self, db: Optional[Any], project_id: Optional[int]):
+        """Loads persistent discovered asset nodes and edges from SQLite database into Cyber Sentinel scene."""
+        if not db or not project_id:
+            return
+        try:
+            asset_nodes = db.list_asset_nodes(project_id) if hasattr(db, "list_asset_nodes") else []
+            findings = db.list_findings(project_id) if hasattr(db, "list_findings") else []
+            asset_edges = db.list_asset_edges(project_id) if hasattr(db, "list_asset_edges") else []
+
+            ip_hosts: Dict[str, HostResult] = {}
+            alias_nodes = []
+
+            ad_node_types = ("domain_controller", "computer", "domain")
+            for node in asset_nodes:
+                if node.node_type not in ("ip", "hostname", "host") and node.node_type not in ad_node_types:
+                    continue
+                meta = {}
+                try:
+                    meta = json.loads(node.metadata_json) if node.metadata_json else {}
+                except Exception:
+                    meta = {}
+
+                if node.node_type == "ip":
+                    ip_val = node.value.strip()
+                    hn_val = node.label if (node.label and node.label != node.value) else None
+
+                    ports: List[PortResult] = []
+                    for s in meta.get("services", []):
+                        p_num = s.get("port")
+                        if p_num:
+                            ports.append(
+                                PortResult(
+                                    port_id=int(p_num),
+                                    protocol=s.get("proto", "tcp"),
+                                    state="open",
+                                    service_name=s.get("service", ""),
+                                    product=s.get("product", ""),
+                                    version=s.get("version", ""),
+                                )
+                            )
+                    if not ports and meta.get("open_ports"):
+                        for p_num in meta.get("open_ports", []):
+                            ports.append(
+                                PortResult(
+                                    port_id=int(p_num),
+                                    protocol="tcp",
+                                    state="open",
+                                    service_name="detected",
+                                )
+                            )
+
+                    h = HostResult(
+                        ip=ip_val,
+                        status="up",
+                        hostname=hn_val,
+                        ports=ports,
+                        mac_address=meta.get("mac_address"),
+                        vendor=meta.get("vendor"),
+                        os_match=meta.get("os_match") or meta.get("os_summary"),
+                        device_type=meta.get("device_type"),
+                        latency_ms=meta.get("latency_ms"),
+                    )
+                    ip_hosts[ip_val] = h
+                elif node.node_type == "domain_controller":
+                    dc_val = node.value.strip()
+                    hn_val = meta.get("dns_hostname") or (node.label if node.label != node.value else dc_val)
+                    dc_ip = meta.get("ip") or meta.get("host_ip") or dc_val
+                    ports = [
+                        PortResult(port_id=389, protocol="tcp", state="open", service_name="ldap"),
+                        PortResult(port_id=88, protocol="tcp", state="open", service_name="kerberos"),
+                        PortResult(port_id=445, protocol="tcp", state="open", service_name="microsoft-ds"),
+                    ]
+                    h = HostResult(
+                        ip=dc_ip,
+                        status="up",
+                        hostname=hn_val,
+                        ports=ports,
+                        os_match="Active Directory Domain Controller",
+                        device_type="Domain Controller",
+                    )
+                    ip_hosts[dc_val] = h
+                    if dc_ip != dc_val:
+                        ip_hosts[dc_ip] = h
+                elif node.node_type == "computer":
+                    c_val = node.value.strip()
+                    hn_val = meta.get("sam_name") or node.label or c_val
+                    c_ip = meta.get("ip") or meta.get("host_ip") or c_val
+                    os_str = meta.get("os") or "Domain Member Workstation"
+                    h = HostResult(
+                        ip=c_ip,
+                        status="up",
+                        hostname=hn_val,
+                        ports=[],
+                        os_match=os_str,
+                        device_type="Computer",
+                    )
+                    ip_hosts[c_val] = h
+                    if c_ip != c_val:
+                        ip_hosts[c_ip] = h
+                elif node.node_type == "domain":
+                    dom_val = node.value.strip()
+                    h = HostResult(
+                        ip=dom_val,
+                        status="up",
+                        hostname=node.label or dom_val,
+                        ports=[],
+                        os_match="Active Directory Naming Context",
+                        device_type="Domain",
+                    )
+                    ip_hosts[dom_val] = h
+                else:
+                    alias_nodes.append((node, meta))
+
+            # Merge hostnames and aliases into IP hosts to prevent duplicate node bubbles
+            for node, meta in alias_nodes:
+                assoc_ip = meta.get("ip", "").strip()
+                if assoc_ip and assoc_ip in ip_hosts:
+                    if not ip_hosts[assoc_ip].hostname:
+                        ip_hosts[assoc_ip].hostname = node.value
+                elif any(h.hostname == node.value for h in ip_hosts.values()):
+                    # Hostname already matches an existing discovered IP host
+                    continue
+                elif node.value not in ip_hosts:
+                    # Named host with no distinct IP record
+                    h = HostResult(
+                        ip=assoc_ip or node.value,
+                        status="up",
+                        hostname=node.value,
+                        ports=[],
+                        mac_address=meta.get("mac_address"),
+                        vendor=meta.get("vendor"),
+                        os_match=meta.get("os_match") or meta.get("os_summary"),
+                        device_type=meta.get("device_type", "Host"),
+                        latency_ms=meta.get("latency_ms"),
+                    )
+                    ip_hosts[node.value] = h
+
+            # Include live host discoveries from findings if not already present in ip_hosts
+            for f in findings:
+                asset_val = (f.affected_asset or "").strip()
+                if not asset_val or asset_val in ip_hosts:
+                    continue
+                if "." in asset_val or ":" in asset_val:
+                    ip_hosts[asset_val] = HostResult(
+                        ip=asset_val,
+                        status="up",
+                        hostname=None,
+                        ports=[],
+                    )
+
+            hosts = list(ip_hosts.values())
+            scan_result = NmapScanResult(
+                command_args="Loaded from database asset inventory",
+                hosts=hosts,
+                scanner="nmap",
+                summary=f"{len(hosts)} host(s) in active inventory",
+            )
+            self.load_scan(scan_result, findings)
+
+            # Map database relationship edges onto 2D canvas
+            if asset_edges:
+                node_map: Dict[int, str] = {n.id: n.value for n in asset_nodes if getattr(n, "id", None)}
+                node_items: Dict[str, QGraphicsItem] = {}
+                for it in self.scene.items():
+                    if isinstance(it, NetworkHostNodeItem):
+                        node_items[it.host.ip] = it
+                        if it.host.hostname:
+                            node_items[it.host.hostname] = it
+
+                existing_edge_pairs = set()
+                for edge in asset_edges:
+                    src_nid = getattr(edge, "source_node_id", getattr(edge, "source_id", None))
+                    tgt_nid = getattr(edge, "target_node_id", getattr(edge, "target_id", None))
+                    src_val = node_map.get(src_nid)
+                    tgt_val = node_map.get(tgt_nid)
+                    if not src_val or not tgt_val:
+                        continue
+                    item_s = node_items.get(src_val)
+                    item_t = node_items.get(tgt_val)
+                    if item_s and item_t and item_s != item_t:
+                        pair_key = (min(id(item_s), id(item_t)), max(id(item_s), id(item_t)))
+                        if pair_key not in existing_edge_pairs:
+                            existing_edge_pairs.add(pair_key)
+                            conn = NetworkConnectionItem(
+                                item_s.pos(),
+                                item_t.pos(),
+                                edge_style=self.edge_style,
+                                color="#a855f7",
+                            )
+                            self.scene.addItem(conn)
+        except Exception as exc:
+            logger.warning("Failed loading discovered assets in NetworkMapView: %s", exc)
+
+    def _on_selection_changed(self):
+        selected = self.scene.selectedItems()
+        host_items = [it for it in selected if isinstance(it, NetworkHostNodeItem)]
+        if not host_items:
+            return
+        host_item = host_items[0]
+        self._update_inspector_for_host(host_item.host, host_item.findings_count)
+        self.host_selected.emit(host_item.host)
+
+    def _update_inspector_for_host(self, h: HostResult, findings_count: int):
+        self._selected_host = h
+        self.lbl_device_title.setText(h.hostname or h.ip)
+        self.lbl_ip_cidr.setText(f"{h.ip} / 24")
+
+        open_ports = [p for p in h.ports if p.state == "open"]
+        risk_score = 72 if findings_count > 0 else (30 if len(open_ports) > 3 else 10)
+
+        meta = (
+            f"Device Type: {h.device_type or 'General Server'}\n"
+            f"OS: {h.os_summary}\n"
+            f"MAC: {h.mac_address or 'Unknown'} ({h.vendor or 'Generic'})\n"
+            f"Risk Score: {risk_score} (Findings: {findings_count})"
+        )
+        self.lbl_meta_info.setText(meta)
+
+        self.insp_services_table.setRowCount(0)
+        for row, p in enumerate(h.ports):
+            self.insp_services_table.insertRow(row)
+            self.insp_services_table.setItem(row, 0, QTableWidgetItem(f"{p.port_id}/{p.protocol}"))
+            self.insp_services_table.setItem(row, 1, QTableWidgetItem(p.state))
+            self.insp_services_table.setItem(row, 2, QTableWidgetItem(p.service_summary or "-"))
+
+        if findings_count > 0:
+            self.lbl_ai_msg.setText(f"{findings_count} vulnerabilities identified. Pivoting recommended.")
+        else:
+            self.lbl_ai_msg.setText(f"{len(open_ports)} exposed ports detected on host.")
+
+    def _copy_selected_ip(self):
+        if self._selected_host:
+            QApplication.clipboard().setText(self._selected_host.ip)
+            QMessageBox.information(self, "Copied", f"Copied IP '{self._selected_host.ip}' to clipboard!")
+
+    def _trigger_analyse_path(self):
+        if self._selected_host:
+            self.analyse_path_requested.emit(self._selected_host.ip)
+            QMessageBox.information(
+                self,
+                "Attack Path Analysis",
+                f"Initiating CPENT Multi-Hop pivoting path analysis against target {self._selected_host.ip}...",
+            )
+
+    def to_svg(self) -> str:
+        """Exports the current network map as a standalone SVG string for reports."""
+        if not self.current_scan or not self.current_scan.hosts:
+            return "<svg width='600' height='200'><text x='50' y='100' fill='#A8B3C7'>No network assets scanned.</text></svg>"
+
+        hosts = self.current_scan.hosts
+        width = 800
+        height = max(400, 80 * len(hosts))
+
+        sentinel_hidden = getattr(self, "_sentinel_hidden", False) or (
+            getattr(self, "sentinel_bar", None) is not None and self.sentinel_bar.isHidden()
+        )
+        show_sentinel = not sentinel_hidden
+        header_text = "CYBER SENTINEL — Enterprise Network Topology" if show_sentinel else "Enterprise Cyber Terrain Architecture"
+
+        svg_parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" style="background-color: #0b0f19; font-family: sans-serif;">',
+            f'<rect width="100%" height="100%" fill="#0b0f19"/>',
+            f'<text x="24" y="36" fill="#f8fafc" font-size="16" font-weight="bold">{header_text}</text>',
+            f'<text x="24" y="56" fill="#f59e0b" font-size="11">⚠ Logical Subnet Clustering (Physical switch topology unverified)</text>',
+        ]
+
+        y_offset = 90
+        for idx, h in enumerate(hosts):
+            open_count = sum(1 for p in h.ports if p.state == "open")
+            border = "#0ea5e9" if open_count > 0 else "#10b981"
+            bg = "#082f49" if open_count > 0 else "#022c22"
+
+            svg_parts.append(
+                f'<g transform="translate(40, {y_offset})">'
+                f'<rect width="720" height="60" rx="8" fill="{bg}" stroke="{border}" stroke-width="1.5"/>'
+                f'<circle cx="30" cy="30" r="18" fill="{border}"/>'
+                f'<text x="30" y="34" fill="#ffffff" font-size="11" font-weight="bold" text-anchor="middle">{open_count}p</text>'
+                f'<text x="60" y="26" fill="#f8fafc" font-size="13" font-weight="bold">{html.escape(h.ip)} ({html.escape(h.status.upper())})</text>'
+                f'<text x="60" y="44" fill="#94a3b8" font-size="11">Host: {html.escape(h.hostname or "No reverse DNS")} | OS: {html.escape(h.os_summary)} | MAC: {html.escape(h.mac_address or "N/A")}</text>'
+                f'</g>'
+            )
+            y_offset += 72
+
+        svg_parts.append('</svg>')
+        return "\n".join(svg_parts)
+
+    def export_svg(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Network Map as SVG", "network_map.svg", "SVG Files (*.svg)")
+        if filename:
+            svg_content = self.to_svg()
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(svg_content)
+            QMessageBox.information(self, "Export Succeeded", f"Network map diagram exported to:\n{filename}")
+
+    def export_png(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Network Map as PNG", "network_map.png", "PNG Images (*.png)")
+        if filename:
+            rect = self.scene.sceneRect()
+            img = QImage(int(rect.width()), int(rect.height()), QImage.Format_ARGB32)
+            img.fill(QColor("#0b0f19"))
+            p = QPainter(img)
+            self.scene.render(p)
+            p.end()
+            img.save(filename)
+            QMessageBox.information(self, "Export Succeeded", f"Network map image exported to:\n{filename}")

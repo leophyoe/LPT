@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CyberSecuritySuite Terminal</title>
+  <link rel="stylesheet" href="xterm.css">
+  <script src="xterm.js"></script>
+  <script src="xterm-addon-fit.js"></script>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background-color: #0b0d13;
+      overflow: hidden;
+    }
+    #terminal-container {
+      width: 100%;
+      height: 100%;
+      padding: 2px 4px;
+      box-sizing: border-box;
+    }
+    /* Custom scrollbar for xterm */
+    .xterm .xterm-viewport::-webkit-scrollbar {
+      width: 8px;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar-track {
+      background: #0b0d13;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+      background: #1e293b;
+      border-radius: 4px;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+      background: #334155;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal-container"></div>
+  <script>
+    const term = new Terminal({
+      cursorBlink: true,
+      cursorStyle: 'block',
+      fontFamily: '"JetBrains Mono", "Fira Code", monospace, "Courier New"',
+      fontSize: 13,
+      lineHeight: 1.25,
+      allowTransparency: false,
+      theme: {
+        background: '#0B1120',
+        foreground: '#F3F6FC',
+        cursor: '#2680FF',
+        cursorAccent: '#0B1120',
+        selectionBackground: '#2680FF',
+        selectionForeground: '#ffffff',
+        black: '#1C293B',
+        red: '#EF4444',
+        green: '#22C55E',
+        yellow: '#FFBF00',
+        blue: '#2680FF',
+        magenta: '#818cf8',
+        cyan: '#38bdf8',
+        white: '#F3F6FC',
+        brightBlack: '#4D4D4D',
+        brightRed: '#D91F26',
+        brightGreen: '#22C55E',
+        brightYellow: '#FFBF00',
+        brightBlue: '#5CA3FF',
+        brightMagenta: '#a855f7',
+        brightCyan: '#0ea5e9',
+        brightWhite: '#ffffff'
+      }
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('terminal-container'));
+
+    function resizeTerminal() {
+      try {
+        fitAddon.fit();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      } catch (e) {}
+    }
+
+    window.addEventListener('resize', resizeTerminal);
+
+    const params = new URLSearchParams(window.location.search);
+    const port = params.get('port');
+    const ws = new WebSocket('ws://127.0.0.1:' + port);
+
+    ws.onopen = () => {
+      resizeTerminal();
+      term.focus();
+    };
+
+    ws.onmessage = (event) => {
+      term.write(event.data);
+    };
+
+    ws.onclose = () => {
+      term.write('\r\n\x1b[31m[Terminal connection closed]\x1b[0m\r\n');
+    };
+
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', data: data }));
+      }
+    });
+  </script>
+</body>
+</html>
+

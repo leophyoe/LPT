@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_PRELOAD="$SCRIPT_DIR/libfakemkdir.so"
+REAL_JOHN="$(which -a john | grep -v "$SCRIPT_DIR/john" | head -n 1)"
+if [ -n "$REAL_JOHN" ]; then
+    exec "$REAL_JOHN" "$@"
+else
+    exec /usr/sbin/john "$@"
+fi

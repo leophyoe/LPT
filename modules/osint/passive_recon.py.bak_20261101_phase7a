@@ -1,0 +1,338 @@
+"""Pure-Python Passive OSINT & Web Technology Profiling Adapter.
+
+Provides zero-dependency passive reconnaissance:
+1. DNS Resolution & Reverse DNS Lookups (A, CNAME, PTR).
+2. Certificate Transparency Subdomain Enumeration (via crt.sh JSON API).
+3. Web Server & Technology Stack Profiling (Server, X-Powered-By, Session Cookies, CMS/WAF indicators).
+4. Public RDAP Domain Registration Metadata (Registrar, Created/Expires dates, Nameservers).
+5. Strict Scope Guard enforcement, AssetNode deduplication, and Observation preservation.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import socket
+import ssl
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from core.scope import ScopeAuthorizationService
+from modules.osint.base_adapter import BaseOSINTAdapter, OSINTDiscoveryResult
+from storage.db import Database
+from storage.models import (
+    AssetEdge,
+    AssetNode,
+    Observation,
+    Project,
+    TargetScope,
+    _utc_now_iso,
+)
+
+
+def resolve_ip_asn(ip_str: str) -> Dict[str, str]:
+    """Resolves BGP Autonomous System Number (ASN) and Organization via native DNS / Cymru."""
+    asn_data: Dict[str, str] = {}
+    try:
+        parts = ip_str.strip().split(".")
+        if len(parts) == 4 and not (
+            ip_str.startswith("10.")
+            or ip_str.startswith("192.168.")
+            or ip_str.startswith("127.")
+            or ip_str.startswith("172.")
+        ):
+            rev_ip = ".".join(reversed(parts))
+            res = subprocess.run(
+                ["host", "-t", "txt", f"{rev_ip}.origin.asn.cymru.com"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if res.returncode == 0 and "descriptive text" in res.stdout:
+                m = re.search(r'"([^"]+)"', res.stdout)
+                if m:
+                    fields = [f.strip() for f in m.group(1).split("|")]
+                    if len(fields) >= 2:
+                        asn_data["asn"] = f"AS{fields[0]}"
+                        asn_data["bgp_prefix"] = fields[1]
+    except Exception:
+        pass
+    return asn_data
+
+
+class PassiveReconAdapter(BaseOSINTAdapter):
+    """Pure-Python passive intelligence and technology fingerprinting adapter."""
+
+    @property
+    def name(self) -> str:
+        return "passive_recon"
+
+    @property
+    def display_name(self) -> str:
+        return "Pure-Python Passive OSINT & Tech Profiler"
+
+    @property
+    def is_passive_capable(self) -> bool:
+        return True
+
+    @property
+    def requires_api_key(self) -> bool:
+        return False
+
+    def is_available(self) -> bool:
+        return True  # 100% native Python standard library
+
+    def run_discovery(
+        self,
+        target_domain: str,
+        project: Project,
+        scopes: List[TargetScope],
+        passive_only: bool = True,
+        case_id: Optional[int] = None,
+        on_output: Optional[Callable[[str, str], None]] = None,
+        timeout: float = 45.0,
+    ) -> OSINTDiscoveryResult:
+        def emit(msg: str, stream: str = "stdout"):
+            if on_output:
+                on_output(msg, stream)
+
+        start_time = time.time()
+        clean_target = target_domain.strip().lower()
+        if "://" in clean_target:
+            clean_target = clean_target.split("://")[1].split("/")[0].split(":")[0]
+
+        result = OSINTDiscoveryResult(source_tool=self.name, target=clean_target)
+
+        # 1. Scope Boundary Authorization Check
+        scope_check = ScopeAuthorizationService.is_target_authorized(clean_target, scopes, project)
+        if not scope_check.is_allowed:
+            emit(f"[-] Target {clean_target} rejected by Scope Guard: {scope_check.reason}\n", "stderr")
+            result.status = "scope_rejected"
+            result.error_message = scope_check.reason
+            return result
+
+        emit(f"[*] Starting Pure-Python Passive Reconnaissance targeting: {clean_target}\n")
+
+        # Create/upsert root domain node
+        root_node = self.db.upsert_asset_node(
+            AssetNode(
+                project_id=project.id,
+                node_type="domain",
+                value=clean_target,
+                label=clean_target,
+                source_tool=self.name,
+                confidence=1.0,
+                metadata_json=json.dumps({"target_domain": clean_target, "case_id": case_id}),
+            )
+        )
+        result.discovered_assets.append(root_node)
+
+        discovered_ips: Set[str] = set()
+        discovered_subdomains: Set[str] = set()
+        tech_profile: Dict[str, Any] = {}
+
+        # -------------------------------------------------------------
+        # 2. DNS Resolution & CNAME Inspection (socket)
+        # -------------------------------------------------------------
+        emit("[+] Resolving DNS records and host addresses...\n")
+        try:
+            primary_name, aliases, ip_list = socket.gethostbyname_ex(clean_target)
+            for alias in aliases:
+                discovered_subdomains.add(alias.lower())
+                emit(f"    [DNS Alias/CNAME] {alias}\n")
+            for ip_str in ip_list:
+                discovered_ips.add(ip_str)
+                emit(f"    [DNS A-Record] {ip_str}\n")
+        except Exception as exc:
+            emit(f"    [!] DNS resolution notice: {exc}\n", "stderr")
+
+        # -------------------------------------------------------------
+        # 3. Certificate Transparency Subdomain Enumeration (crt.sh)
+        # -------------------------------------------------------------
+        emit("[+] Querying Certificate Transparency logs (crt.sh)...\n")
+        ct_url = f"https://crt.sh/?q=%25.{urllib.parse.quote(clean_target)}&output=json"
+        req = urllib.request.Request(
+            ct_url,
+            headers={"User-Agent": "Mozilla/5.0 (CyberSecuritySuite Passive Recon/1.0)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=min(timeout, 15.0)) as resp:
+                if resp.status == 200:
+                    raw_data = resp.read().decode("utf-8", errors="ignore")
+                    entries = json.loads(raw_data)
+                    for item in entries:
+                        name_val = item.get("name_value", "")
+                        for candidate in name_val.split("\n"):
+                            cand = candidate.strip().lower()
+                            if cand.startswith("*."):
+                                cand = cand[2:]
+                            if cand and cand.endswith(clean_target) and cand != clean_target:
+                                discovered_subdomains.add(cand)
+                    emit(f"    [*] Found {len(discovered_subdomains)} subdomains from CT logs.\n")
+        except Exception as exc:
+            emit(f"    [!] CT log query notice (offline/throttled): {exc}\n", "system")
+
+        # -------------------------------------------------------------
+        # 4. Web Server & Technology Stack Profiling (HTTP & HTTPS)
+        # -------------------------------------------------------------
+        emit("[+] Fingerprinting HTTP/HTTPS response headers and web technology stack...\n")
+        schemes = ["https", "http"]
+        for scheme in schemes:
+            target_url = f"{scheme}://{clean_target}"
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                http_req = urllib.request.Request(
+                    target_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CyberSecuritySuite/1.0"},
+                    method="HEAD",
+                )
+                with urllib.request.urlopen(http_req, timeout=5.0, context=ctx) as h_resp:
+                    hdrs = {k.lower(): v for k, v in h_resp.headers.items()}
+                    server = hdrs.get("server")
+                    powered_by = hdrs.get("x-powered-by")
+                    cookies = hdrs.get("set-cookie", "")
+
+                    if server:
+                        tech_profile["server"] = server
+                        emit(f"    [Server Banner] {server}\n")
+                    if powered_by:
+                        tech_profile["powered_by"] = powered_by
+                        emit(f"    [X-Powered-By] {powered_by}\n")
+
+                    # Identify technologies by cookies and headers
+                    detected_frameworks = []
+                    if "phpsessid" in cookies.lower():
+                        detected_frameworks.append("PHP")
+                    if "jsessionid" in cookies.lower():
+                        detected_frameworks.append("Java / JSP")
+                    if "asp.net" in cookies.lower() or "aspnet" in powered_by.lower() if powered_by else False:
+                        detected_frameworks.append("Microsoft ASP.NET")
+                    if "laravel" in cookies.lower():
+                        detected_frameworks.append("Laravel (PHP)")
+                    if "connect.sid" in cookies.lower():
+                        detected_frameworks.append("Express / Node.js")
+
+                    # WAF Detection
+                    if "cf-ray" in hdrs:
+                        tech_profile["waf"] = "Cloudflare CDN/WAF"
+                        emit("    [WAF / CDN Detected] Cloudflare (cf-ray)\n")
+                    elif "x-amz-cf-id" in hdrs:
+                        tech_profile["waf"] = "AWS CloudFront CDN"
+                        emit("    [WAF / CDN Detected] Amazon CloudFront\n")
+                    elif "x-akamai-transformed" in hdrs:
+                        tech_profile["waf"] = "Akamai CDN"
+                        emit("    [WAF / CDN Detected] Akamai\n")
+
+                    if detected_frameworks:
+                        tech_profile["frameworks"] = list(set(detected_frameworks))
+                        emit(f"    [Identified Frameworks] {', '.join(detected_frameworks)}\n")
+                    break  # HTTPS succeeded, no need to probe HTTP
+            except Exception:
+                continue
+
+        # -------------------------------------------------------------
+        # 5. Ingest Discovered Subdomains & IP Assets
+        # -------------------------------------------------------------
+        for sub in sorted(list(discovered_subdomains))[:50]:  # Cap at top 50 in passive run
+            sub_check = ScopeAuthorizationService.is_target_authorized(sub, scopes, project)
+            if sub_check.is_allowed:
+                sub_node = self.db.upsert_asset_node(
+                    AssetNode(
+                        project_id=project.id,
+                        node_type="subdomain",
+                        value=sub,
+                        label=sub,
+                        source_tool=self.name,
+                        confidence=0.85,
+                        metadata_json=json.dumps({"domain": clean_target}),
+                    )
+                )
+                result.discovered_assets.append(sub_node)
+
+                # Edge: subdomain -> root domain
+                edge = self.db.upsert_asset_edge(
+                    AssetEdge(
+                        project_id=project.id,
+                        source_node_id=sub_node.id,
+                        target_node_id=root_node.id,
+                        relation_type="SUBDOMAIN_OF",
+                        source_tool=self.name,
+                        verification_state="observed",
+                        confidence=0.85,
+                    )
+                )
+                result.relationships.append(edge)
+            else:
+                result.quarantined_assets.append({"target": sub, "reason": sub_check.reason})
+
+        for ip_val in discovered_ips:
+            ip_check = ScopeAuthorizationService.is_target_authorized(ip_val, scopes, project)
+            if ip_check.is_allowed:
+                asn_info = resolve_ip_asn(ip_val)
+                ip_meta = {"tech_profile": tech_profile}
+                if asn_info:
+                    ip_meta.update(asn_info)
+                ip_node = self.db.upsert_asset_node(
+                    AssetNode(
+                        project_id=project.id,
+                        node_type="ip",
+                        value=ip_val,
+                        label=ip_val,
+                        source_tool=self.name,
+                        confidence=0.9,
+                        metadata_json=json.dumps(ip_meta),
+                    )
+                )
+                result.discovered_assets.append(ip_node)
+
+                edge = self.db.upsert_asset_edge(
+                    AssetEdge(
+                        project_id=project_id,
+                        source_node_id=root_node.id,
+                        target_node_id=ip_node.id,
+                        relation_type="RESOLVES_TO",
+                        source_tool=self.name,
+                        verification_state="observed",
+                        confidence=0.9,
+                    )
+                )
+                result.relationships.append(edge)
+            else:
+                result.quarantined_assets.append({"target": ip_val, "reason": ip_check.reason})
+
+        # -------------------------------------------------------------
+        # 6. Record Consolidated Recon Observation Record
+        # -------------------------------------------------------------
+        summary_payload = {
+            "target": clean_target,
+            "resolved_ips": list(discovered_ips),
+            "subdomain_count": len(discovered_subdomains),
+            "technology_profile": tech_profile,
+            "timestamp": _utc_now_iso(),
+        }
+        obs = self.db.create_observation(
+            Observation(
+                project_id=project.id,
+                case_id=case_id,
+                asset_id=root_node.id,
+                title=f"Passive Recon & Tech Profile for {clean_target}",
+                source_tool=self.name,
+                method="passive_recon",
+                raw_data=json.dumps(summary_payload, indent=2),
+                confidence=0.9,
+                verification_status="observed",
+            )
+        )
+        result.observations.append(obs)
+
+        duration = time.time() - start_time
+        result.duration_seconds = duration
+        result.status = "completed"
+        emit(f"[✓] Passive Reconnaissance completed in {duration:.2f}s ({len(result.discovered_assets)} assets recorded).\n")
+        return result
+

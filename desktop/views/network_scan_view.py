@@ -1,0 +1,3587 @@
+"""Network assessment, Nmap scanning, and penetration testing workflow view.
+
+Provides a structured 6-step internal network penetration testing workflow:
+1. Footprinting & Local Network Discovery (ip addr, ip route, arp -a / ip neigh)
+2. Network Scanning & Live Host Discovery (Passive vs Active mode, subnet targeting, -sn zero-port visibility)
+3. OS & Service Fingerprinting / Enumeration (CPE 2.3, banners, OS accuracy %)
+4. Vulnerability Assessment & Observation Tracking (OBSERVED vs CONFIRMED, CVE/CPE correlation)
+5. Controlled Exploit Verification & CPENT Practical Labs (Non-destructive first, explicit safety guard)
+6. Reporting, Remediation & Retesting (Executive summary, SVG map, SHA-256 evidence integrity, HTML/MD/JSON)
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import logging
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.activity_logger import ActivityLogger
+from core.asset_inventory import AssetInventoryService
+from core.scope import ScopeAuthorizationService
+from desktop.theme import CPENTTheme, ThemeManager
+from desktop.widgets.network_map_view import NetworkMapView
+from desktop.widgets.pcap_analyzer_widget import PCAPAnalyzerWidget
+from desktop.widgets.tls_analyzer_widget import TLSAnalyzerWidget
+from modules.network.internal_footprint import (
+    InternalFootprintCollector,
+    InternalFootprintResult,
+)
+from modules.network.nmap_adapter import (
+    NmapAdapter,
+    NmapExecutionResult,
+    NmapScanOptions,
+    ScanProfile,
+)
+from modules.network.pentest_workflow import (
+    CPENT_LAB_CATALOG,
+    CPENTLabScenario,
+    NetworkPentestWorkflowManager,
+    StageStatus,
+    WorkflowStage,
+)
+from modules.vuln.verifier import VulnerabilityVerifier, VerificationResult
+from reports.builder import ReportBuilder
+from reports.cpent_engagement_pack import CPENTEngagementPackGenerator
+from storage.db import Database
+from storage.models import (
+    AssessmentSession,
+    ExecutionStatus,
+    Finding,
+    FindingSeverity,
+    Project,
+    ProjectStatus,
+    ScopeRuleType,
+    TargetScope,
+    TargetType,
+    ToolExecution,
+    ValidationStatus,
+    _utc_now_iso,
+)
+
+
+class WorkerSignals(QObject):
+    output_received = Signal(str, str)
+    scan_completed = Signal(object)
+    footprint_completed = Signal(object)
+
+
+class NetworkScanView(QWidget):
+    """Internal Network Penetration Testing Workspace with ordered 6-step workflow wizard."""
+
+    project_selected = Signal(object)
+    scan_completed = Signal(object)
+    assets_updated = Signal(object)
+    open_network_map_requested = Signal()
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.adapter = NmapAdapter(db)
+        self.footprint_collector = InternalFootprintCollector(db)
+        self.workflow = NetworkPentestWorkflowManager(db)
+        self.active_project: Optional[Project] = None
+        self.current_execution_result: Optional[NmapExecutionResult] = None
+        self.current_footprint: Optional[InternalFootprintResult] = None
+        self.current_session: Optional[AssessmentSession] = None
+        self._scan_project_id: Optional[int] = None
+        self.activity_logger = ActivityLogger(db)
+        self.asset_service = AssetInventoryService(db)
+
+        self.signals = WorkerSignals()
+        self.signals.output_received.connect(self._on_output_received)
+        self.signals.scan_completed.connect(self._on_scan_completed)
+        self.signals.footprint_completed.connect(self._on_footprint_completed)
+
+        self._init_ui()
+        self._populate_project_combo()
+
+    def set_active_project(self, project: Optional[Project]):
+        self.active_project = project
+        self.workflow = NetworkPentestWorkflowManager(self.db, project_id=project.id if project else None)
+        if project:
+            self.project_label.setText(f"Active Project: {project.name} (ID: {project.id})")
+        else:
+            self.project_label.setText("No project selected.")
+        self._refresh_workflow_tabs()
+        self._refresh_subnet_selector()
+        self._refresh_activity_log()
+        self._refresh_erp_dashboard()
+        self._refresh_assessment_combo()
+        self._refresh_vuln_table()
+        self._refresh_step5_findings_table()
+        self._refresh_reporting_summary()
+
+        if hasattr(self, "pcap_tab") and hasattr(self.pcap_tab, "set_active_project"):
+            self.pcap_tab.set_active_project(project)
+        if hasattr(self, "tls_tab") and hasattr(self.tls_tab, "set_active_project"):
+            self.tls_tab.set_active_project(project)
+
+        # Synchronize embedded Network Map View with project's persistent asset inventory
+        if hasattr(self, "map_view") and hasattr(self.map_view, "load_discovered_assets"):
+            if project:
+                try:
+                    self.map_view.load_discovered_assets(self.db, project.id)
+                except Exception as exc:
+                    logger.debug("Failed loading discovered assets in map_view: %s", exc)
+            else:
+                try:
+                    self.map_view.load_scan(None, [])
+                except Exception:
+                    pass
+
+        if hasattr(self, "project_combo") and not self.project_combo.signalsBlocked():
+            self.project_combo.blockSignals(True)
+            if project:
+                for i in range(self.project_combo.count()):
+                    p = self.project_combo.itemData(i)
+                    if p and hasattr(p, "id") and p.id == project.id:
+                        self.project_combo.setCurrentIndex(i)
+                        break
+            self.project_combo.blockSignals(False)
+
+    def _refresh_assessment_combo(self):
+        if not hasattr(self, "assessment_combo"):
+            return
+        self.assessment_combo.blockSignals(True)
+        self.assessment_combo.clear()
+        self.assessment_combo.addItem("Default (All Scopes)", None)
+        if self.active_project and self.active_project.id:
+            try:
+                assessments = self.db.list_assessments(self.active_project.id)
+                for asm in assessments:
+                    self.assessment_combo.addItem(f"{asm.name} [{asm.status.value}]", asm.id)
+            except Exception:
+                pass
+        self.assessment_combo.blockSignals(False)
+
+    def _get_selected_assessment_id(self) -> Optional[int]:
+        if hasattr(self, "assessment_combo"):
+            return self.assessment_combo.currentData()
+        return None
+
+    def _populate_project_combo(self):
+        """Populates the project dropdown from the database without triggering recursive updates."""
+        if not hasattr(self, "project_combo"):
+            return
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        projects = self.db.list_projects()
+        current_idx = -1
+        for idx, p in enumerate(projects):
+            label = f"{p.name} (#{p.id})"
+            self.project_combo.addItem(label, p)
+            if self.active_project and self.active_project.id == p.id:
+                current_idx = idx
+
+        if current_idx >= 0:
+            self.project_combo.setCurrentIndex(current_idx)
+        elif projects:
+            if not self.active_project:
+                self.project_combo.setCurrentIndex(0)
+                self.set_active_project(projects[0])
+        else:
+            self.project_combo.addItem("No projects available", None)
+
+        self.project_combo.blockSignals(False)
+
+    def _on_project_combo_changed(self, index: int):
+        proj = self.project_combo.itemData(index)
+        if proj and isinstance(proj, Project):
+            self.set_active_project(proj)
+            self.project_selected.emit(proj)
+
+    def _create_new_project_dialog(self):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "New Engagement Project", "Enter Project Name:")
+        if ok and name.strip():
+            proj = self.db.create_project(
+                Project(
+                    name=name.strip(),
+                    client_name="Internal Network",
+                    description="Manual engagement created from Network Workspace",
+                )
+            )
+            self.db.add_scope(
+                TargetScope(
+                    project_id=proj.id,
+                    target="127.0.0.1",
+                    target_type=TargetType.IP_ADDRESS,
+                    rule_type=ScopeRuleType.ALLOWED,
+                    is_authorized=True,
+                )
+            )
+            self._populate_project_combo()
+            self.set_active_project(proj)
+            self.project_selected.emit(proj)
+
+    def _ensure_active_project(self) -> bool:
+        """Ensures an active project is bound before running scans, auto-binding if needed."""
+        if self.active_project:
+            return True
+
+        projects = self.db.list_projects()
+        if projects:
+            self.set_active_project(projects[0])
+            self._populate_project_combo()
+            self.project_selected.emit(projects[0])
+            return True
+
+        # Database has 0 projects; auto-create a default engagement project
+        default_proj = self.db.create_project(
+            Project(
+                name="Local Assessment",
+                client_name="Local Network",
+                description="Auto-created engagement for local network pentesting",
+            )
+        )
+        self.db.add_scope(
+            TargetScope(
+                project_id=default_proj.id,
+                target="127.0.0.1",
+                target_type=TargetType.IP_ADDRESS,
+                rule_type=ScopeRuleType.ALLOWED,
+                is_authorized=True,
+            )
+        )
+        self.db.add_scope(
+            TargetScope(
+                project_id=default_proj.id,
+                target="192.168.0.0/16",
+                target_type=TargetType.CIDR_RANGE,
+                rule_type=ScopeRuleType.ALLOWED,
+                is_authorized=True,
+            )
+        )
+        self.set_active_project(default_proj)
+        self._populate_project_combo()
+        self.project_selected.emit(default_proj)
+        return True
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        # Top Header Bar: Title on left, Mode Switcher on right
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header = QLabel("Internal Network Penetration Testing Workspace")
+        header.setObjectName("viewHeader")
+        header.setStyleSheet("font-size: 16px; font-weight: 700;")
+        header_row.addWidget(header)
+        header_row.addStretch()
+
+        # Mode Toggle Button Group (ERP Single-Page Dashboard vs 6-Step Wizard)
+        mode_btn_box = QHBoxLayout()
+        mode_btn_box.setSpacing(6)
+
+        self.btn_view_erp = QPushButton("📊 Operations Dashboard")
+        self.btn_view_erp.setProperty("class", "action-primary")
+        self.btn_view_erp.setCheckable(True)
+        self.btn_view_erp.setChecked(True)
+        self.btn_view_erp.setFixedHeight(28)
+        self.btn_view_erp.setToolTip("View all targets, live assets, vulns, and scan controls in one ERP-style operational dashboard")
+        self.btn_view_erp.clicked.connect(lambda: self._set_view_mode("erp"))
+        mode_btn_box.addWidget(self.btn_view_erp)
+
+        self.btn_view_wizard = QPushButton("📋 6-Step Methodology")
+        self.btn_view_wizard.setProperty("class", "action-secondary")
+        self.btn_view_wizard.setCheckable(True)
+        self.btn_view_wizard.setChecked(False)
+        self.btn_view_wizard.setFixedHeight(28)
+        self.btn_view_wizard.setToolTip("Switch to the CPENT 6-step sequential methodology wizard")
+        self.btn_view_wizard.clicked.connect(lambda: self._set_view_mode("wizard"))
+        mode_btn_box.addWidget(self.btn_view_wizard)
+
+        header_row.addLayout(mode_btn_box)
+        layout.addLayout(header_row)
+
+        # Sub-Toolbar: Project Selector & Scope Controls
+        proj_container = QWidget()
+        proj_layout = QHBoxLayout(proj_container)
+        proj_layout.setContentsMargins(0, 0, 0, 0)
+        proj_layout.setSpacing(8)
+
+        proj_lbl = QLabel("Project:")
+        proj_lbl.setStyleSheet("font-size: 12px; font-weight: 600;")
+        proj_layout.addWidget(proj_lbl)
+
+        self.project_combo = QComboBox()
+        self.project_combo.setMinimumWidth(150)
+        self.project_combo.currentIndexChanged.connect(self._on_project_combo_changed)
+        proj_layout.addWidget(self.project_combo)
+
+        self.new_proj_btn = QPushButton("➕ New")
+        self.new_proj_btn.setProperty("class", "action-secondary")
+        self.new_proj_btn.setToolTip("Create a new assessment project")
+        self.new_proj_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_proj_btn.clicked.connect(self._create_new_project_dialog)
+        proj_layout.addWidget(self.new_proj_btn)
+
+        asm_lbl = QLabel("Assessment:")
+        asm_lbl.setStyleSheet("font-size: 12px; font-weight: 600;")
+        proj_layout.addWidget(asm_lbl)
+
+        self.assessment_combo = QComboBox()
+        self.assessment_combo.setMinimumWidth(160)
+        self.assessment_combo.setToolTip("Select the active assessment scope for findings, evidence, and reports")
+        proj_layout.addWidget(self.assessment_combo)
+
+        self.project_label = QLabel("No project selected.")
+        self.project_label.setWordWrap(True)
+        self.project_label.setStyleSheet(f"color: {CPENTTheme.RED_ACCENT}; font-weight: 600; font-size: 12px;")
+        proj_layout.addWidget(self.project_label)
+        proj_layout.addStretch()
+
+        layout.addWidget(proj_container)
+
+        # Main View Stack (Page 0 = ERP Single-Page Dashboard, Page 1 = 6-Step Wizard)
+        self.main_stack = QStackedWidget()
+
+        # Page 0: Single-Page ERP Operations Dashboard
+        self.erp_dashboard_page = self._create_erp_dashboard_page()
+        self.main_stack.addWidget(self.erp_dashboard_page)
+
+        # Page 1: 6-Step Methodology Wizard Container
+        self.wizard_container = QWidget()
+        wiz_layout = QVBoxLayout(self.wizard_container)
+        wiz_layout.setContentsMargins(0, 0, 0, 0)
+        wiz_layout.setSpacing(8)
+
+        # Wizard Stepper Bar (Steps 1 to 6)
+        self._create_stepper_bar(wiz_layout)
+
+        # Multi-Tab Assessment Workspace (6 Ordered Methodology Tabs + Network Map)
+        self.tab_widget = QTabWidget()
+        self.tab_widget.tabBar().hide()
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+
+        # Tab 0: Step 1 Footprinting & Interfaces
+        self.footprint_tab = self._create_footprint_tab()
+        self.tab_widget.addTab(self.footprint_tab, "🌐 Step 1: Footprinting")
+
+        # Tab 1: Step 2 Network Scanning & Live Discovery
+        self.discovery_tab = self._create_discovery_tab()
+        self.tab_widget.addTab(self.discovery_tab, "🖥 Step 2: Discovery")
+
+        # Tab 2: Step 3 OS & Service Fingerprinting
+        self.services_tab = self._create_fingerprint_tab()
+        self.tab_widget.addTab(self.services_tab, "🔌 Step 3: Fingerprinting")
+
+        # Tab 3: Step 4 Vulnerability Assessment & Observation Tracking
+        self.vuln_tab = self._create_vuln_assessment_tab()
+        self.tab_widget.addTab(self.vuln_tab, "🛡 Step 4: Vuln Assessment")
+
+        # Tab 4: Step 5 Controlled Exploit Verification & CPENT Practical Labs
+        self.workbench_tab = self._create_workbench_tab()
+        self.tab_widget.addTab(self.workbench_tab, "⚔ Step 5: Validation")
+
+        # Tab 5: Step 6 Reporting, Remediation & Retesting
+        self.reporting_tab = self._create_reporting_tab()
+        self.tab_widget.addTab(self.reporting_tab, "📋 Step 6: Report")
+
+        # Tab 6: Interactive Network Topology Asset Map (Linked with Unified Network Map)
+        map_tab_container = QWidget()
+        map_tab_layout = QVBoxLayout(map_tab_container)
+        map_tab_layout.setContentsMargins(0, 0, 0, 0)
+        map_tab_layout.setSpacing(4)
+
+        map_link_bar = QFrame()
+        map_link_bar.setStyleSheet("background-color: #0b0f19; border-bottom: 1px solid #1e293b; padding: 4px 8px;")
+        mlb_layout = QHBoxLayout(map_link_bar)
+        mlb_layout.setContentsMargins(8, 2, 8, 2)
+
+        lbl_mlb = QLabel("🛡️ Cyber Sentinel Live Topology & Device Intelligence")
+        lbl_mlb.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        mlb_layout.addWidget(lbl_mlb)
+
+        mlb_layout.addStretch()
+
+        btn_expand_unified = QPushButton("⤢ Open Full Unified Network Map (Designer & Scans)")
+        btn_expand_unified.setStyleSheet(
+            "background-color: #0284c7; color: white; font-weight: bold; font-size: 11px; "
+            "border-radius: 4px; padding: 4px 12px;"
+        )
+        btn_expand_unified.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_expand_unified.clicked.connect(lambda: self.open_network_map_requested.emit())
+        mlb_layout.addWidget(btn_expand_unified)
+
+        map_tab_layout.addWidget(map_link_bar)
+        self.map_view = NetworkMapView()
+        self.map_view.hide_sentinel_header()
+        map_tab_layout.addWidget(self.map_view)
+        self.tab_widget.addTab(map_tab_container, "🗺 Network Map")
+
+        # Tab 7: Integrated Activity Log & Provenance Audit Trail
+        self.evidence_tab = self._create_activity_tab()
+        self.tab_widget.addTab(self.evidence_tab, "📜 Activity & Evidence")
+
+        # Tab 8: Offline PCAP Protocol Analyzer & Traffic Dissector
+        self.pcap_tab = PCAPAnalyzerWidget(db=self.db)
+        self.pcap_tab.findings_synced.connect(self._on_pcap_synced)
+        self.tab_widget.addTab(self.pcap_tab, "📡 PCAP Protocol Analyzer")
+
+        # Tab 9: Live TLS/SSL Security & Cipher Suite Analyzer
+        self.tls_tab = TLSAnalyzerWidget(db=self.db)
+        self.tab_widget.addTab(self.tls_tab, "🔒 TLS / SSL Analyzer")
+
+        wiz_layout.addWidget(self.tab_widget)
+        self.main_stack.addWidget(self.wizard_container)
+
+        layout.addWidget(self.main_stack)
+        self.main_stack.setCurrentIndex(0)  # Default landing view: ERP Single-Page Dashboard!
+
+    # -----------------------------------------------------------------------
+    # Acumatica ERP-Style Single-Page Operations Dashboard Implementation
+    # -----------------------------------------------------------------------
+
+    def _set_view_mode(self, mode: str):
+        """Switches between ERP Single-Page Dashboard and CPENT 6-Step Methodology Wizard."""
+        if mode == "erp":
+            self.main_stack.setCurrentIndex(0)
+            self.btn_view_erp.setChecked(True)
+            self.btn_view_wizard.setChecked(False)
+            self._refresh_erp_dashboard()
+        else:
+            self.main_stack.setCurrentIndex(1)
+            self.btn_view_erp.setChecked(False)
+            self.btn_view_wizard.setChecked(True)
+
+    def _create_kpi_card(
+        self,
+        title: str,
+        icon: str,
+        val_attr: str,
+        sub_attr: str,
+        default_val: str,
+        default_sub: str,
+        bg_dark: str,
+        border_dark: str,
+        text_dark: str,
+        bg_light: str,
+        border_light: str,
+        text_light: str,
+    ) -> QFrame:
+        """Constructs a colored Acumatica-style KPI summary block."""
+        card = QFrame()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        is_light = ThemeManager.instance().is_light
+        bg = bg_light if is_light else bg_dark
+        border = border_light if is_light else border_dark
+        text_color = text_light if is_light else text_dark
+
+        card.setStyleSheet(
+            f"background-color: {bg}; border: 1px solid {border}; "
+            f"border-radius: 8px; padding: 8px 12px;"
+        )
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(4, 4, 4, 4)
+        card_layout.setSpacing(4)
+
+        top_row = QHBoxLayout()
+        lbl_title = QLabel(f"{icon}  {title}")
+        lbl_title.setWordWrap(True)
+        lbl_title.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {text_color}; letter-spacing: 0.5px;")
+        top_row.addWidget(lbl_title)
+        top_row.addStretch()
+        card_layout.addLayout(top_row)
+
+        lbl_val = QLabel(default_val)
+        lbl_val.setStyleSheet(f"font-size: 22px; font-weight: 800; color: {text_color};")
+        setattr(self, val_attr, lbl_val)
+        card_layout.addWidget(lbl_val)
+
+        lbl_sub = QLabel(default_sub)
+        lbl_sub.setWordWrap(True)
+        lbl_sub.setStyleSheet(f"font-size: 11px; font-weight: 600; color: {text_color};")
+        setattr(self, sub_attr, lbl_sub)
+        card_layout.addWidget(lbl_sub)
+
+        card.kpi_info = {
+            "title_lbl": lbl_title,
+            "val_lbl": lbl_val,
+            "sub_lbl": lbl_sub,
+            "bg_dark": bg_dark,
+            "border_dark": border_dark,
+            "text_dark": text_dark,
+            "bg_light": bg_light,
+            "border_light": border_light,
+            "text_light": text_light,
+        }
+
+        return card
+
+    def _update_all_kpi_cards_theme(self):
+        """Dynamically re-styles all 4 KPI cards to match current light/dark theme with maximum readability."""
+        is_light = ThemeManager.instance().is_light
+        for card_attr in ("card_scope", "card_hosts", "card_vulns", "card_ports"):
+            card = getattr(self, card_attr, None)
+            if card and hasattr(card, "kpi_info"):
+                info = card.kpi_info
+                bg = info["bg_light"] if is_light else info["bg_dark"]
+                border = info["border_light"] if is_light else info["border_dark"]
+                text_color = info["text_light"] if is_light else info["text_dark"]
+                sub_color = info["text_light"] if is_light else info["text_dark"]
+
+                card.setStyleSheet(
+                    f"background-color: {bg}; border: 1px solid {border}; "
+                    f"border-radius: 8px; padding: 8px 12px;"
+                )
+                info["title_lbl"].setStyleSheet(f"font-size: 11px; font-weight: bold; color: {text_color}; letter-spacing: 0.5px;")
+                info["val_lbl"].setStyleSheet(f"font-size: 22px; font-weight: 800; color: {text_color};")
+                info["sub_lbl"].setStyleSheet(f"font-size: 11px; font-weight: 600; color: {sub_color};")
+
+    def _create_severity_meter(self, label: str, color: str) -> Dict[str, Any]:
+        """Creates a visual progress meter for finding severity breakdown."""
+        row = QHBoxLayout()
+        lbl = QLabel(f"{label}:")
+        lbl.setFixedWidth(70)
+        lbl.setStyleSheet(f"font-size: 11px; font-weight: 600; color: {color};")
+        row.addWidget(lbl)
+
+        pbar = QProgressBar()
+        pbar.setFixedHeight(12)
+        pbar.setRange(0, 100)
+        pbar.setValue(0)
+        pbar.setTextVisible(False)
+        pbar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}")
+        row.addWidget(pbar, 1)
+
+        count_lbl = QLabel("0")
+        count_lbl.setFixedWidth(30)
+        count_lbl.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {color};")
+        row.addWidget(count_lbl)
+
+        return {"layout": row, "bar": pbar, "label": count_lbl}
+
+    def _create_erp_dashboard_page(self) -> QWidget:
+        """Constructs an Acumatica ERP-style single-page operations dashboard with full scrollability."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        container = QWidget()
+        container.setMinimumHeight(760)
+        container.setObjectName("erpScrollContainer")
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(12)
+
+        # 1. Top KPI Stat Cards (4 Columns matching ERP style)
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(10)
+
+        # Card 1: In-Scope Targets (Amber)
+        self.card_scope = self._create_kpi_card(
+            title="TARGET SCOPES",
+            icon="🎯",
+            val_attr="erp_kpi_scope_val",
+            sub_attr="erp_kpi_scope_sub",
+            default_val="0 Scopes",
+            default_sub="Active Engagement Targets",
+            bg_dark="#251c05",
+            border_dark="#b45309",
+            text_dark="#fef08a",
+            bg_light="#fef9c3",
+            border_light="#ca8a04",
+            text_light="#854d0e",
+        )
+        kpi_row.addWidget(self.card_scope, 1)
+
+        # Card 2: Live Assets (Green)
+        self.card_hosts = self._create_kpi_card(
+            title="LIVE ASSETS ONLINE",
+            icon="🖥️",
+            val_attr="erp_kpi_hosts_val",
+            sub_attr="erp_kpi_hosts_sub",
+            default_val="0 Hosts",
+            default_sub="Discovered via Ping & ARP",
+            bg_dark="#052414",
+            border_dark="#059669",
+            text_dark="#a7f3d0",
+            bg_light="#d1fae5",
+            border_light="#10b981",
+            text_light="#065f46",
+        )
+        kpi_row.addWidget(self.card_hosts, 1)
+
+        # Card 3: Urgent Issues (Red)
+        self.card_vulns = self._create_kpi_card(
+            title="URGENT VULNERABILITIES",
+            icon="🚨",
+            val_attr="erp_kpi_vulns_val",
+            sub_attr="erp_kpi_vulns_sub",
+            default_val="0 Issues",
+            default_sub="Critical & High Severity",
+            bg_dark="#2d0a0d",
+            border_dark="#dc2626",
+            text_dark="#fecaca",
+            bg_light="#fee2e2",
+            border_light="#ef4444",
+            text_light="#991b1b",
+        )
+        kpi_row.addWidget(self.card_vulns, 1)
+
+        # Card 4: Open Services (Blue)
+        self.card_ports = self._create_kpi_card(
+            title="OPEN SERVICES & PORTS",
+            icon="🔌",
+            val_attr="erp_kpi_ports_val",
+            sub_attr="erp_kpi_ports_sub",
+            default_val="0 Services",
+            default_sub="Fingerprinted TCP/UDP Ports",
+            bg_dark="#061f38",
+            border_dark="#0284c7",
+            text_dark="#bae6fd",
+            bg_light="#e0f2fe",
+            border_light="#0ea5e9",
+            text_light="#075985",
+        )
+        kpi_row.addWidget(self.card_ports, 1)
+
+        main_layout.addLayout(kpi_row)
+
+        # 2. Middle Row: Quick Execution Controller & Risk Distribution
+        middle_row = QHBoxLayout()
+        middle_row.setSpacing(10)
+
+        # Middle Left: Quick Penetration Testing Controls
+        ctrl_card = QFrame()
+        ctrl_card.setObjectName("erpCtrlCard")
+        ctrl_layout = QVBoxLayout(ctrl_card)
+        ctrl_layout.setContentsMargins(12, 10, 12, 10)
+        ctrl_layout.setSpacing(8)
+
+        ctrl_title = QLabel("⚡ Rapid Discovery & Scan Controller")
+        ctrl_title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        ctrl_layout.addWidget(ctrl_title)
+
+        target_row = QHBoxLayout()
+        lbl_target = QLabel("Target:")
+        lbl_target.setStyleSheet("font-size: 11px; font-weight: 600;")
+        target_row.addWidget(lbl_target)
+
+        self.erp_target_input = QLineEdit()
+        self.erp_target_input.setPlaceholderText("Enter target IP, CIDR subnet, or hostname (e.g. 192.168.1.0/24)")
+        self.erp_target_input.setStyleSheet("padding: 5px 8px; font-size: 11px;")
+        target_row.addWidget(self.erp_target_input, 1)
+
+        self.erp_profile_combo = QComboBox()
+        self.erp_profile_combo.addItem("Top Ports Scan (-sS -T4 -F)", ScanProfile.TOP_PORTS)
+        self.erp_profile_combo.addItem("Service & Version Detection (-sV -T4)", ScanProfile.SERVICE_VERSION)
+        self.erp_profile_combo.addItem("OS Fingerprint & Ports (-sS -O -T4)", ScanProfile.OS_FINGERPRINT)
+        self.erp_profile_combo.addItem("Firewall Ruleset Detection (-sA -T4 -Pn)", ScanProfile.FIREWALL_DETECTION)
+        self.erp_profile_combo.addItem("UDP Port Inventory (-sU -F -T4)", ScanProfile.UDP_SCAN)
+        self.erp_profile_combo.addItem("Ping Sweep Live Discovery (-sn)", ScanProfile.PING_DISCOVERY)
+        self.erp_profile_combo.setStyleSheet("padding: 4px 8px; font-size: 11px;")
+        target_row.addWidget(self.erp_profile_combo)
+
+        self.erp_pn_checkbox = QCheckBox("Skip Ping (-Pn)")
+        self.erp_pn_checkbox.setChecked(False)
+        self.erp_pn_checkbox.setToolTip("Treat host as online (skip ICMP ping). Recommended for firewalled targets, cloud VMs, and isolated hosts.")
+        self.erp_pn_checkbox.setStyleSheet("font-size: 11px; font-weight: 600; padding: 2px 4px;")
+        target_row.addWidget(self.erp_pn_checkbox)
+        ctrl_layout.addLayout(target_row)
+
+        btn_grid = QGridLayout()
+        btn_grid.setSpacing(8)
+
+        self.btn_erp_start_scan = QPushButton("🚀 Run Nmap Scan")
+        self.btn_erp_start_scan.setObjectName("btnErpStartScan")
+        self.btn_erp_start_scan.setFixedHeight(30)
+        self.btn_erp_start_scan.setStyleSheet("""
+            QPushButton#btnErpStartScan {
+                background-color: #dc2626;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #b91c1c;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton#btnErpStartScan:hover {
+                background-color: #ef4444;
+            }
+        """)
+        self.btn_erp_start_scan.clicked.connect(self._run_erp_scan)
+        btn_grid.addWidget(self.btn_erp_start_scan, 0, 0)
+
+        self.btn_erp_footprint = QPushButton("🔍 Local Footprint")
+        self.btn_erp_footprint.setObjectName("btnErpFootprint")
+        self.btn_erp_footprint.setFixedHeight(30)
+        self.btn_erp_footprint.setStyleSheet("""
+            QPushButton#btnErpFootprint {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #0369a1;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton#btnErpFootprint:hover {
+                background-color: #38bdf8;
+            }
+        """)
+        self.btn_erp_footprint.clicked.connect(self._collect_footprint)
+        btn_grid.addWidget(self.btn_erp_footprint, 0, 1)
+
+        self.btn_erp_import_xml = QPushButton("📥 Import Nmap XML")
+        self.btn_erp_import_xml.setObjectName("btnErpImportXml")
+        self.btn_erp_import_xml.setFixedHeight(30)
+        self.btn_erp_import_xml.setStyleSheet("""
+            QPushButton#btnErpImportXml {
+                background-color: #059669;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #047857;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton#btnErpImportXml:hover {
+                background-color: #10b981;
+            }
+        """)
+        self.btn_erp_import_xml.clicked.connect(self._import_xml)
+        btn_grid.addWidget(self.btn_erp_import_xml, 1, 0)
+
+        self.btn_erp_open_wizard = QPushButton("📋 CPENT 6-Step Wizard")
+        self.btn_erp_open_wizard.setObjectName("btnErpOpenWizard")
+        self.btn_erp_open_wizard.setFixedHeight(30)
+        self.btn_erp_open_wizard.setStyleSheet("""
+            QPushButton#btnErpOpenWizard {
+                background-color: #7c3aed;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #6d28d9;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton#btnErpOpenWizard:hover {
+                background-color: #8b5cf6;
+            }
+        """)
+        self.btn_erp_open_wizard.setToolTip("Switch to the 6-step guided methodology wizard")
+        self.btn_erp_open_wizard.clicked.connect(lambda: self._set_view_mode("wizard"))
+        btn_grid.addWidget(self.btn_erp_open_wizard, 1, 1)
+
+        ctrl_layout.addLayout(btn_grid)
+
+        status_row = QHBoxLayout()
+        self.erp_scan_status_label = QLabel("Status: Ready (Select a target to begin)")
+        self.erp_scan_status_label.setStyleSheet("font-size: 11px;")
+        status_row.addWidget(self.erp_scan_status_label, 1)
+
+        self.erp_progress_bar = QProgressBar()
+        self.erp_progress_bar.setFixedHeight(14)
+        self.erp_progress_bar.setRange(0, 100)
+        self.erp_progress_bar.setValue(0)
+        self.erp_progress_bar.setTextVisible(False)
+        status_row.addWidget(self.erp_progress_bar, 1)
+        ctrl_layout.addLayout(status_row)
+
+        middle_row.addWidget(ctrl_card, 6)
+
+        # Middle Right: Severity Breakdown & Scope Health
+        metric_card = QFrame()
+        metric_card.setObjectName("erpMetricCard")
+        metric_layout = QVBoxLayout(metric_card)
+        metric_layout.setContentsMargins(12, 10, 12, 10)
+        metric_layout.setSpacing(6)
+
+        metric_header = QHBoxLayout()
+        metric_title = QLabel("📊 Vulnerability & Scope Metrics")
+        metric_title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        metric_header.addWidget(metric_title)
+        metric_header.addStretch()
+
+        self.erp_scope_badge = QLabel("● Scope: Idle")
+        self.erp_scope_badge.setStyleSheet(f"color: {CPENTTheme.INFO_CYAN}; font-size: 11px; font-weight: bold;")
+        metric_header.addWidget(self.erp_scope_badge)
+        metric_layout.addLayout(metric_header)
+
+        # Risk breakdown meters
+        self.meter_crit_row = self._create_severity_meter("Critical", "#ef4444")
+        self.meter_high_row = self._create_severity_meter("High", "#f97316")
+        self.meter_med_row = self._create_severity_meter("Medium", "#eab308")
+        self.meter_low_row = self._create_severity_meter("Low / Info", "#06b6d4")
+
+        metric_layout.addLayout(self.meter_crit_row["layout"])
+        metric_layout.addLayout(self.meter_high_row["layout"])
+        metric_layout.addLayout(self.meter_med_row["layout"])
+        metric_layout.addLayout(self.meter_low_row["layout"])
+
+        middle_row.addWidget(metric_card, 4)
+        main_layout.addLayout(middle_row)
+
+        # 3. Bottom Master Grid: Comprehensive Discovered Assets & Services
+        grid_card = QFrame()
+        grid_card.setObjectName("erpGridCard")
+        grid_layout = QVBoxLayout(grid_card)
+        grid_layout.setContentsMargins(12, 10, 12, 10)
+        grid_layout.setSpacing(8)
+
+        grid_header = QHBoxLayout()
+        grid_title = QLabel("📋 Master Discovered Assets & Identified Ports")
+        grid_title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        grid_header.addWidget(grid_title)
+        grid_header.addStretch()
+
+        self.erp_filter_input = QLineEdit()
+        self.erp_filter_input.setPlaceholderText("🔍 Filter assets by IP, hostname, or port...")
+        self.erp_filter_input.setFixedWidth(240)
+        self.erp_filter_input.textChanged.connect(self._filter_erp_master_table)
+        grid_header.addWidget(self.erp_filter_input)
+
+        btn_refresh_grid = QPushButton("🔄 Refresh")
+        btn_refresh_grid.setFixedHeight(26)
+        btn_refresh_grid.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #ffffff;
+                font-weight: 600;
+                font-size: 11px;
+                border-radius: 4px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+            }
+        """)
+        btn_refresh_grid.clicked.connect(self._refresh_erp_dashboard)
+        grid_header.addWidget(btn_refresh_grid)
+        grid_layout.addLayout(grid_header)
+
+        # Table
+        self.erp_master_table = QTableWidget()
+        self.erp_master_table.setColumnCount(7)
+        self.erp_master_table.setHorizontalHeaderLabels([
+            "Target IP", "Status", "Hostname", "OS Summary", "MAC / Interface", "Open Ports", "Vulns"
+        ])
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.erp_master_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.erp_master_table.setAlternatingRowColors(True)
+        self.erp_master_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.erp_master_table.setMinimumHeight(280)
+        grid_layout.addWidget(self.erp_master_table)
+
+        # Action bar under table
+        actions_row = QHBoxLayout()
+        btn_fingerprint_sel = QPushButton("🔌 Fingerprint Selected Host")
+        btn_fingerprint_sel.setFixedHeight(28)
+        btn_fingerprint_sel.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-weight: 600;
+                font-size: 11px;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover {
+                background-color: #0ea5e9;
+            }
+        """)
+        btn_fingerprint_sel.clicked.connect(self._erp_fingerprint_selected)
+        actions_row.addWidget(btn_fingerprint_sel)
+
+        btn_copy_sel_ip = QPushButton("📋 Copy Selected IP")
+        btn_copy_sel_ip.setFixedHeight(28)
+        btn_copy_sel_ip.setStyleSheet("""
+            QPushButton {
+                background-color: #475569;
+                color: #ffffff;
+                font-weight: 600;
+                font-size: 11px;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover {
+                background-color: #64748b;
+            }
+        """)
+        btn_copy_sel_ip.clicked.connect(self._erp_copy_selected_ip)
+        actions_row.addWidget(btn_copy_sel_ip)
+
+        btn_ask_ai = QPushButton("🤖 Ask AI Assistant About Host")
+        btn_ask_ai.setFixedHeight(28)
+        btn_ask_ai.setStyleSheet("""
+            QPushButton {
+                background-color: #b91c1c;
+                color: #ffffff;
+                font-weight: 600;
+                font-size: 11px;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover {
+                background-color: #dc2626;
+            }
+        """)
+        btn_ask_ai.clicked.connect(self._erp_ask_ai_about_selected)
+        actions_row.addWidget(btn_ask_ai)
+
+        actions_row.addStretch()
+        grid_layout.addLayout(actions_row)
+
+        main_layout.addWidget(grid_card)
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _run_erp_scan(self):
+        """Starts an authorized scan from the ERP dashboard target controls."""
+        target = self.erp_target_input.text().strip()
+        if not target and self.active_project:
+            scopes = self.db.list_scopes(self.active_project.id)
+            if scopes:
+                target = scopes[0].target
+        if not target:
+            QMessageBox.warning(self, "Target Required", "Please enter a target IP, CIDR subnet, or hostname to scan.")
+            return
+
+        self.target_input.setText(target)
+        profile_data = self.erp_profile_combo.currentData()
+        idx = self.profile_combo.findData(profile_data)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+
+        self.erp_scan_status_label.setText(f"Status: Probing {target}...")
+        self.erp_progress_bar.setRange(0, 0)
+        self._start_scan()
+
+    def _refresh_erp_dashboard(self):
+        """Refreshes KPI metrics, risk breakdown progress bars, and the master data grid."""
+        if not hasattr(self, "erp_kpi_scope_val"):
+            return
+        self._update_all_kpi_cards_theme()
+        if not self.active_project:
+            self.erp_kpi_scope_val.setText("0 Scopes")
+            self.erp_kpi_hosts_val.setText("0 Hosts")
+            self.erp_kpi_vulns_val.setText("0 Issues")
+            self.erp_kpi_ports_val.setText("0 Services")
+            self.erp_scope_badge.setText("● No Active Project")
+            self.erp_master_table.setRowCount(0)
+            return
+
+        # 1. Scopes KPI
+        scopes = self.db.list_scopes(self.active_project.id)
+        auth_scopes = [s for s in scopes if s.is_authorized]
+        self.erp_kpi_scope_val.setText(f"{len(auth_scopes)} Targets")
+        if auth_scopes:
+            self.erp_kpi_scope_sub.setText(f"Primary: {auth_scopes[0].target}")
+            if not self.erp_target_input.text():
+                self.erp_target_input.setText(auth_scopes[0].target)
+            self.erp_scope_badge.setText("● Scope: Authorized")
+            self.erp_scope_badge.setStyleSheet(f"color: {CPENTTheme.SUCCESS_GREEN}; font-size: 11px; font-weight: bold;")
+        else:
+            self.erp_kpi_scope_sub.setText("No authorized targets registered")
+            self.erp_scope_badge.setText("○ Scope: Unset")
+            self.erp_scope_badge.setStyleSheet(f"color: {CPENTTheme.AMBER_ACCENT}; font-size: 11px; font-weight: bold;")
+
+        # 2. Findings & Risk Distribution
+        findings = self.db.list_findings(self.active_project.id)
+        crit_count = sum(1 for f in findings if f.severity == FindingSeverity.CRITICAL)
+        high_count = sum(1 for f in findings if f.severity == FindingSeverity.HIGH)
+        med_count = sum(1 for f in findings if f.severity == FindingSeverity.MEDIUM)
+        low_count = sum(1 for f in findings if f.severity in (FindingSeverity.LOW, FindingSeverity.INFORMATIONAL))
+
+        urgent_count = crit_count + high_count
+        self.erp_kpi_vulns_val.setText(f"{urgent_count} Urgent")
+        self.erp_kpi_vulns_sub.setText(f"{crit_count} Critical, {high_count} High")
+
+        total_findings = len(findings) or 1
+        self.meter_crit_row["bar"].setValue(int((crit_count / total_findings) * 100))
+        self.meter_crit_row["label"].setText(str(crit_count))
+        self.meter_high_row["bar"].setValue(int((high_count / total_findings) * 100))
+        self.meter_high_row["label"].setText(str(high_count))
+        self.meter_med_row["bar"].setValue(int((med_count / total_findings) * 100))
+        self.meter_med_row["label"].setText(str(med_count))
+        self.meter_low_row["bar"].setValue(int((low_count / total_findings) * 100))
+        self.meter_low_row["label"].setText(str(low_count))
+
+        # 3. Discovered Hosts and Open Ports (Persistent Authoritative Inventory from Database)
+        total_hosts = 0
+        total_open_ports = 0
+        self.erp_master_table.setRowCount(0)
+
+        # Merge active in-memory and persistent database assets keyed by IP
+        displayed_ips = set()
+
+        # A. First load persistent assets from database (Authoritative Source of Truth)
+        try:
+            asset_nodes = self.db.list_asset_nodes(self.active_project.id)
+            ip_node_map = {}
+            alias_nodes = []
+
+            for node in asset_nodes:
+                if node.node_type not in ("ip", "hostname", "host"):
+                    continue
+                meta = {}
+                try:
+                    meta = json.loads(node.metadata_json) if node.metadata_json else {}
+                except Exception:
+                    meta = {}
+
+                if node.node_type == "ip":
+                    ip_val = node.value.strip()
+                    hn_val = node.label if (node.label and node.label != node.value) else ""
+                    ip_node_map[ip_val] = {
+                        "ip": ip_val,
+                        "hostname": hn_val,
+                        "os": meta.get("os_match") or meta.get("os_summary") or "Unknown OS",
+                        "mac": meta.get("mac_address") or "—",
+                        "open_ports": meta.get("open_ports", []),
+                        "services": meta.get("services", []),
+                    }
+                else:
+                    alias_nodes.append((node, meta))
+
+            # Merge hostname and alias metadata into corresponding IP nodes
+            for node, meta in alias_nodes:
+                assoc_ip = meta.get("ip", "").strip()
+                if assoc_ip and assoc_ip in ip_node_map:
+                    if not ip_node_map[assoc_ip]["hostname"] or ip_node_map[assoc_ip]["hostname"] == "—":
+                        ip_node_map[assoc_ip]["hostname"] = node.value
+                elif any(info["hostname"] == node.value for info in ip_node_map.values()):
+                    # Hostname is already mapped to an existing discovered IP host
+                    continue
+                elif node.value not in ip_node_map:
+                    ip_node_map[node.value] = {
+                        "ip": assoc_ip or "—",
+                        "hostname": node.value,
+                        "os": meta.get("os_match") or meta.get("os_summary") or "Unknown OS",
+                        "mac": meta.get("mac_address") or "—",
+                        "open_ports": meta.get("open_ports", []),
+                        "services": meta.get("services", []),
+                    }
+
+            # Include live host discoveries from findings if not already present in ip_node_map
+            for f in findings:
+                asset_val = (f.affected_asset or "").strip()
+                if not asset_val or asset_val in ip_node_map:
+                    continue
+                if "." in asset_val or ":" in asset_val:
+                    ip_node_map[asset_val] = {
+                        "ip": asset_val,
+                        "hostname": "—",
+                        "os": "Discovered Host",
+                        "mac": "—",
+                        "open_ports": [],
+                        "services": [],
+                    }
+
+            for ip_key, dev_info in ip_node_map.items():
+                ip_val = dev_info["ip"]
+                hn_val = dev_info["hostname"] or "—"
+                os_val = dev_info["os"]
+                mac_val = dev_info["mac"]
+                open_ports = dev_info["open_ports"]
+                services = dev_info["services"]
+                total_open_ports += len(open_ports)
+
+                if services:
+                    ports_str = ", ".join([f"{s.get('port')}/{s.get('service') or s.get('proto') or 'tcp'}" for s in services if s.get('port')])
+                elif open_ports:
+                    ports_str = ", ".join([str(p) for p in open_ports])
+                else:
+                    ports_str = "None detected (Host UP)"
+
+                v_count = str(len([f for f in findings if f.affected_asset in (ip_val, hn_val)]))
+
+                row = self.erp_master_table.rowCount()
+                self.erp_master_table.insertRow(row)
+                displayed_ips.add(ip_val)
+                if hn_val != "—":
+                    displayed_ips.add(hn_val)
+
+                self.erp_master_table.setItem(row, 0, QTableWidgetItem(ip_val))
+                self.erp_master_table.setItem(row, 1, QTableWidgetItem("UP (Discovered)"))
+                self.erp_master_table.setItem(row, 2, QTableWidgetItem(hn_val))
+                self.erp_master_table.setItem(row, 3, QTableWidgetItem(os_val))
+                self.erp_master_table.setItem(row, 4, QTableWidgetItem(mac_val))
+                self.erp_master_table.setItem(row, 5, QTableWidgetItem(ports_str))
+                self.erp_master_table.setItem(row, 6, QTableWidgetItem(v_count))
+        except Exception as exc:
+            logger.debug("Failed loading asset nodes for ERP: %s", exc)
+
+        # B. If hosts_table has active in-memory scan targets not yet in DB, include them
+        if hasattr(self, "hosts_table") and self.hosts_table.rowCount() > 0:
+            for r in range(self.hosts_table.rowCount()):
+                ip = self.hosts_table.item(r, 0).text() if self.hosts_table.item(r, 0) else "—"
+                if ip in displayed_ips and ip != "—":
+                    continue
+                displayed_ips.add(ip)
+                row = self.erp_master_table.rowCount()
+                self.erp_master_table.insertRow(row)
+                status = self.hosts_table.item(r, 1).text() if self.hosts_table.item(r, 1) else "UP"
+                host = self.hosts_table.item(r, 2).text() if self.hosts_table.item(r, 2) else "—"
+                os_guess = self.hosts_table.item(r, 3).text() if self.hosts_table.item(r, 3) else "—"
+                mac = self.hosts_table.item(r, 4).text() if self.hosts_table.item(r, 4) else "—"
+                ports_count = self.hosts_table.item(r, 5).text() if self.hosts_table.item(r, 5) else "0"
+                try:
+                    total_open_ports += int(ports_count)
+                except ValueError:
+                    pass
+                vulns_count = self.hosts_table.item(r, 7).text() if self.hosts_table.item(r, 7) else "0"
+                self.erp_master_table.setItem(row, 0, QTableWidgetItem(ip))
+                self.erp_master_table.setItem(row, 1, QTableWidgetItem(status))
+                self.erp_master_table.setItem(row, 2, QTableWidgetItem(host))
+                self.erp_master_table.setItem(row, 3, QTableWidgetItem(os_guess))
+                self.erp_master_table.setItem(row, 4, QTableWidgetItem(mac))
+                self.erp_master_table.setItem(row, 5, QTableWidgetItem(f"{ports_count} port(s)"))
+                self.erp_master_table.setItem(row, 6, QTableWidgetItem(vulns_count))
+
+        total_hosts = self.erp_master_table.rowCount()
+        self.erp_kpi_hosts_val.setText(f"{total_hosts} Hosts")
+        self.erp_kpi_ports_val.setText(f"{total_open_ports} Services")
+
+        # Synchronize embedded Network Map View with persistent inventory
+        if hasattr(self, "map_view") and hasattr(self.map_view, "load_discovered_assets") and self.active_project:
+            try:
+                self.map_view.load_discovered_assets(self.db, self.active_project.id)
+            except Exception as exc:
+                logger.debug("Failed updating embedded map_view from ERP: %s", exc)
+
+    def _filter_erp_master_table(self, query: str):
+        """Filters master data table rows based on user search term."""
+        q = query.strip().lower()
+        for r in range(self.erp_master_table.rowCount()):
+            match = False
+            for col in range(self.erp_master_table.columnCount()):
+                item = self.erp_master_table.item(r, col)
+                if item and q in item.text().lower():
+                    match = True
+                    break
+            self.erp_master_table.setRowHidden(r, not match if q else False)
+
+    def _erp_fingerprint_selected(self):
+        """Triggers service fingerprinting on the currently selected asset in the master table."""
+        row = self.erp_master_table.currentRow()
+        if row < 0 or row >= self.erp_master_table.rowCount():
+            QMessageBox.information(self, "Select Host", "Please select an asset row to fingerprint.")
+            return
+        ip = self.erp_master_table.item(row, 0).text()
+        self.erp_target_input.setText(ip)
+        idx = self.erp_profile_combo.findData(ScanProfile.SERVICE_VERSION)
+        if idx >= 0:
+            self.erp_profile_combo.setCurrentIndex(idx)
+        self._run_erp_scan()
+
+    def _erp_copy_selected_ip(self):
+        """Copies selected asset IP to clipboard."""
+        row = self.erp_master_table.currentRow()
+        if row >= 0:
+            ip = self.erp_master_table.item(row, 0).text()
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(ip)
+            QMessageBox.information(self, "IP Copied", f"Copied target IP to clipboard: {ip}")
+
+    def _erp_ask_ai_about_selected(self):
+        """Sends targeted context about selected host directly to the right-docked AI Assistant."""
+        row = self.erp_master_table.currentRow()
+        if row < 0 or row >= self.erp_master_table.rowCount():
+            QMessageBox.information(self, "Select Host", "Please select an asset row first.")
+            return
+        ip = self.erp_master_table.item(row, 0).text()
+        host = self.erp_master_table.item(row, 2).text()
+        os_name = self.erp_master_table.item(row, 3).text()
+        ports = self.erp_master_table.item(row, 5).text()
+
+        query = (
+            f"Can you analyze target host {ip} ({host}, OS: {os_name}) with open services '{ports}', "
+            f"identify high-risk attack surfaces, and suggest safe reconnaissance and validation commands?"
+        )
+        window = self.window()
+        if hasattr(window, "ai_chat_view") and hasattr(window, "_focus_ai_panel"):
+            window._focus_ai_panel()
+            window.ai_chat_view.input_edit.setText(query)
+            window.ai_chat_view._on_send_clicked()
+
+    # -----------------------------------------------------------------------
+    # Stepper Navigation Bar
+    # -----------------------------------------------------------------------
+    def _create_stepper_bar(self, parent_layout: QVBoxLayout):
+        """Creates an interactive 6-stage workflow stepper bar with Step X/6 indicators."""
+        self.stepper_frame = QFrame()
+        self.stepper_frame.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; border: 1px solid {CPENTTheme.BORDER}; "
+            "border-radius: 6px; padding: 3px;"
+        )
+        bar = QHBoxLayout(self.stepper_frame)
+        bar.setContentsMargins(8, 4, 8, 4)
+        bar.setSpacing(4)
+
+        self.step_counter_label = QLabel("Step 1 / 6")
+        self.step_counter_label.setStyleSheet(
+            f"font-size: 13px; font-weight: bold; color: {CPENTTheme.RED_ACCENT}; padding-right: 6px;"
+        )
+        bar.addWidget(self.step_counter_label)
+
+        self.stepper_buttons: Dict[WorkflowStage, QPushButton] = {}
+        stages = [
+            (WorkflowStage.STAGE_1_FOOTPRINTING, "① Footprint", 0),
+            (WorkflowStage.STAGE_2_DISCOVERY, "② Discovery", 1),
+            (WorkflowStage.STAGE_3_FINGERPRINTING, "③ Fingerprint", 2),
+            (WorkflowStage.STAGE_4_VULNERABILITY, "④ Vuln Assess", 3),
+            (WorkflowStage.STAGE_5_EXPLOITATION, "⑤ Validation", 4),
+            (WorkflowStage.STAGE_6_REPORTING, "⑥ Report", 5),
+        ]
+
+        for i, (stage, title, tab_idx) in enumerate(stages):
+            if i > 0:
+                sep = QLabel("›")
+                sep.setStyleSheet(f"color: {CPENTTheme.BORDER_LIGHT}; font-weight: bold; font-size: 13px; padding: 0 1px;")
+                bar.addWidget(sep)
+
+            btn = QPushButton(f"{title}: Idle")
+            btn.setStyleSheet(
+                f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+                f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 5px 10px; font-weight: 500; font-size: 12px;"
+            )
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, idx=tab_idx: self.tab_widget.setCurrentIndex(idx))
+            self.stepper_buttons[stage] = btn
+            bar.addWidget(btn)
+
+        bar.addSpacing(8)
+        v_sep = QLabel("|")
+        v_sep.setStyleSheet(f"color: {CPENTTheme.BORDER};")
+        bar.addWidget(v_sep)
+        bar.addSpacing(6)
+
+        # Utility Views: Network Map & Activity Log
+        self.btn_nav_map = QPushButton("🗺️ Network Map")
+        self.btn_nav_map.setToolTip("View interactive network topology map")
+        self.btn_nav_map.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+            f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 5px 10px; font-size: 12px;"
+        )
+        self.btn_nav_map.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_nav_map.clicked.connect(self._on_nav_map_clicked)
+        bar.addWidget(self.btn_nav_map)
+
+        self.btn_nav_telemetry = QPushButton("📜 Activity & Evidence")
+        self.btn_nav_telemetry.setToolTip("View scan output, activity logs, and evidence")
+        self.btn_nav_telemetry.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+            f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 5px 10px; font-size: 12px;"
+        )
+        self.btn_nav_telemetry.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_nav_telemetry.clicked.connect(lambda: self.tab_widget.setCurrentIndex(7))
+        bar.addWidget(self.btn_nav_telemetry)
+
+        bar.addStretch()
+
+        # Step navigation arrows
+        self.prev_step_btn = QPushButton("◀ Prev")
+        self.prev_step_btn.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+            f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 5px 12px; font-size: 12px; font-weight: 500;"
+        )
+        self.prev_step_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_step_btn.clicked.connect(self._goto_prev_step)
+        bar.addWidget(self.prev_step_btn)
+
+        self.next_step_btn = QPushButton("Next ▶")
+        self.next_step_btn.setStyleSheet(
+            f"background-color: {CPENTTheme.RED_ACCENT}; color: #FFFFFF; "
+            f"border: none; border-radius: 4px; padding: 5px 14px; font-size: 12px; font-weight: bold;"
+        )
+        self.next_step_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.next_step_btn.clicked.connect(self._goto_next_step)
+        bar.addWidget(self.next_step_btn)
+
+        stepper_scroll = QScrollArea()
+        stepper_scroll.setWidgetResizable(True)
+        stepper_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        stepper_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        stepper_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        stepper_scroll.setFixedHeight(48)
+        stepper_scroll.setWidget(self.stepper_frame)
+        parent_layout.addWidget(stepper_scroll)
+
+    def _on_nav_map_clicked(self):
+        """Switches to the Unified Network Map workspace."""
+        self.open_network_map_requested.emit()
+        self.tab_widget.setCurrentIndex(6)
+
+    def _goto_prev_step(self):
+        cur = self.tab_widget.currentIndex()
+        if cur > 0:
+            self.tab_widget.setCurrentIndex(cur - 1)
+
+    def _goto_next_step(self):
+        cur = self.tab_widget.currentIndex()
+        if cur < 5:
+            self.tab_widget.setCurrentIndex(cur + 1)
+
+    def _on_tab_changed(self, idx: int):
+        if idx <= 5:
+            self.step_counter_label.setText(f"Step {idx + 1} / 6")
+            self.step_counter_label.setStyleSheet(
+                f"font-size: 11px; font-weight: bold; color: {CPENTTheme.PRIMARY_BLUE}; padding-right: 6px;"
+            )
+            self.prev_step_btn.setEnabled(idx > 0)
+            self.next_step_btn.setEnabled(idx < 5)
+        elif idx == 6:
+            self.step_counter_label.setText("Network Map")
+            self.step_counter_label.setStyleSheet(
+                f"font-size: 11px; font-weight: bold; color: {CPENTTheme.INFO_CYAN}; padding-right: 6px;"
+            )
+        elif idx == 7:
+            self.step_counter_label.setText("Activity & Evidence")
+            self.step_counter_label.setStyleSheet(
+                f"font-size: 11px; font-weight: bold; color: {CPENTTheme.SECONDARY_TEXT}; padding-right: 6px;"
+            )
+
+        if hasattr(self, "btn_nav_map"):
+            if idx == 6:
+                self.btn_nav_map.setStyleSheet(
+                    f"background-color: rgba(6, 182, 212, 0.2); color: {CPENTTheme.INFO_CYAN}; "
+                    f"border: 1px solid {CPENTTheme.INFO_CYAN}; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;"
+                )
+            else:
+                self.btn_nav_map.setStyleSheet(
+                    f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+                    f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 4px 8px; font-size: 11px;"
+                )
+
+        if hasattr(self, "btn_nav_telemetry"):
+            if idx == 7:
+                self.btn_nav_telemetry.setStyleSheet(
+                    f"background-color: rgba(148, 163, 184, 0.2); color: #FFFFFF; "
+                    f"border: 1px solid {CPENTTheme.BORDER_LIGHT}; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;"
+                )
+            else:
+                self.btn_nav_telemetry.setStyleSheet(
+                    f"background-color: {CPENTTheme.PANEL_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+                    f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 4px 8px; font-size: 11px;"
+                )
+
+        if idx == 7:
+            self._refresh_activity_log()
+            self._refresh_erp_dashboard()
+
+        self._refresh_workflow_tabs()
+
+    def _refresh_workflow_tabs(self):
+        """Updates the stepper labels and color badges based on workflow state."""
+        labels = {
+            WorkflowStage.STAGE_1_FOOTPRINTING: "① Footprint",
+            WorkflowStage.STAGE_2_DISCOVERY: "② Discovery",
+            WorkflowStage.STAGE_3_FINGERPRINTING: "③ Fingerprint",
+            WorkflowStage.STAGE_4_VULNERABILITY: "④ Vuln Assess",
+            WorkflowStage.STAGE_5_EXPLOITATION: "⑤ Validation",
+            WorkflowStage.STAGE_6_REPORTING: "⑥ Report",
+        }
+        current_idx = self.tab_widget.currentIndex() if hasattr(self, "tab_widget") else 0
+        for idx, (stage, btn) in enumerate(self.stepper_buttons.items()):
+            rec = self.workflow.get_stage(stage)
+            status_txt = rec.status.value.replace("_", " ").upper()
+            if rec.items_count > 0:
+                status_txt = f"{status_txt} ({rec.items_count})"
+
+            is_active = (idx == current_idx)
+            is_light = ThemeManager.instance().is_light
+            if rec.status == StageStatus.COMPLETED:
+                bg = "#DCFCE7" if is_light else "#0f3822"
+                fg = "#15803D" if is_light else CPENTTheme.SUCCESS_GREEN
+                border = "#16A34A" if is_light else CPENTTheme.SUCCESS_GREEN
+                icon_prefix = "✓ "
+                status_display = f": {status_txt}"
+            elif rec.status == StageStatus.RUNNING:
+                bg = "#E0F2FE" if is_light else "#102538"
+                fg = "#0369A1" if is_light else CPENTTheme.PRIMARY_BLUE
+                border = "#0284C7" if is_light else CPENTTheme.PRIMARY_BLUE
+                icon_prefix = "⏳ "
+                status_display = ": RUNNING"
+            elif rec.status == StageStatus.BLOCKED:
+                bg = "#FEE2E2" if is_light else "#381010"
+                fg = "#B91C1C" if is_light else CPENTTheme.RED_ACCENT
+                border = "#DC2626" if is_light else CPENTTheme.RED_ACCENT
+                icon_prefix = "🚫 "
+                status_display = ": BLOCKED"
+            elif rec.status == StageStatus.NEEDS_REVIEW:
+                bg = "#FEF3C7" if is_light else "#382c10"
+                fg = "#B45309" if is_light else CPENTTheme.WARNING_AMBER
+                border = "#D97706" if is_light else CPENTTheme.WARNING_AMBER
+                icon_prefix = "⚠ "
+                status_display = ": REVIEW"
+            elif is_active:
+                bg = "rgba(211, 47, 47, 0.12)" if is_light else "rgba(0, 180, 216, 0.18)"
+                fg = CPENTTheme.PRIMARY_TEXT
+                border = CPENTTheme.RED_ACCENT if is_light else CPENTTheme.PRIMARY_BLUE
+                icon_prefix = "● "
+                status_display = " (Active)"
+            else:
+                bg = CPENTTheme.PANEL_BG
+                fg = CPENTTheme.SECONDARY_TEXT
+                border = CPENTTheme.BORDER
+                icon_prefix = ""
+                status_display = ""
+
+            btn.setText(f"{icon_prefix}{labels[stage]}{status_display}")
+            btn.setStyleSheet(
+                f"background-color: {bg}; color: {fg}; border: 1px solid {border}; "
+                "border-radius: 4px; padding: 4px 8px; font-weight: 600; font-size: 11px;"
+            )
+
+    def update_theme(self, mode: Optional[str] = None):
+        """Updates internal styling and steppers when application theme changes."""
+        self._update_all_kpi_cards_theme()
+        self._refresh_workflow_tabs()
+        self._refresh_activity_log()
+        self._refresh_erp_dashboard()
+
+    # -----------------------------------------------------------------------
+    # Step 1: Footprinting & Interfaces Tab
+    # -----------------------------------------------------------------------
+    def _create_footprint_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        # Footprint Action Bar
+        action_bar = QHBoxLayout()
+        action_bar.setSpacing(10)
+
+        self.collect_footprint_btn = QPushButton("🔍  Collect Local Footprint")
+        self.collect_footprint_btn.setProperty("class", "action-primary")
+        self.collect_footprint_btn.setToolTip("Queries local network interfaces, routing tables, and passive ARP neighbor cache")
+        self.collect_footprint_btn.clicked.connect(self._collect_footprint)
+        action_bar.addWidget(self.collect_footprint_btn)
+
+        self.footprint_status_label = QLabel("Footprint: Not collected")
+        self.footprint_status_label.setStyleSheet(
+            f"background-color: {CPENTTheme.INPUT_BG}; color: {CPENTTheme.SECONDARY_TEXT}; "
+            f"border: 1px solid {CPENTTheme.BORDER}; border-radius: 4px; padding: 6px 12px; font-size: 11px;"
+        )
+        action_bar.addWidget(self.footprint_status_label)
+        action_bar.addStretch()
+
+        self.pass_subnets_btn = QPushButton("Send Subnets to Step 2 Scope  ▶")
+        self.pass_subnets_btn.setProperty("class", "action-secondary")
+        self.pass_subnets_btn.setToolTip("Forward discovered local subnets directly into Step 2 Live Discovery")
+        self.pass_subnets_btn.clicked.connect(self._pass_subnets_to_step2)
+        action_bar.addWidget(self.pass_subnets_btn)
+        layout.addLayout(action_bar)
+
+        # Methodology Information Notice
+        passive_banner = QLabel(
+            "ℹ  <b>Passive Observation Notice:</b> ARP and neighbour cache entries are passive historical records (Confidence: 0.7). "
+            "They reflect recent local communications only. Proceed to Step 2 for active network discovery."
+        )
+        passive_banner.setWordWrap(True)
+        passive_banner.setStyleSheet(
+            f"background-color: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); "
+            f"border-left: 3px solid {CPENTTheme.INFO_CYAN}; color: {CPENTTheme.PRIMARY_TEXT}; "
+            f"padding: 8px 12px; border-radius: 4px; font-size: 13px; line-height: 1.4;"
+        )
+        layout.addWidget(passive_banner)
+
+        # Grouped Sub-Tabs for Step 1
+        self.footprint_subtabs = QTabWidget()
+
+        # Sub-Tab 1: Interfaces Table
+        tab_ifaces = QWidget()
+        l_ifaces = QVBoxLayout(tab_ifaces)
+        l_ifaces.setContentsMargins(6, 6, 6, 6)
+        self.interfaces_table = QTableWidget()
+        self.interfaces_table.setColumnCount(6)
+        self.interfaces_table.setHorizontalHeaderLabels([
+            "Interface", "IPv4 Addresses", "IPv6 Addresses", "MAC Address", "Status", "Scope"
+        ])
+        self.interfaces_table.verticalHeader().setVisible(False)
+        self.interfaces_table.verticalHeader().setDefaultSectionSize(36)
+        self.interfaces_table.setAlternatingRowColors(True)
+        self.interfaces_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        h_ifaces = self.interfaces_table.horizontalHeader()
+        h_ifaces.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h_ifaces.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h_ifaces.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        h_ifaces.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h_ifaces.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        h_ifaces.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        l_ifaces.addWidget(self.interfaces_table)
+        self.footprint_subtabs.addTab(tab_ifaces, "🖥  Network Interfaces")
+
+        # Sub-Tab 2: Routes Table
+        tab_routes = QWidget()
+        l_routes = QVBoxLayout(tab_routes)
+        l_routes.setContentsMargins(6, 6, 6, 6)
+        self.routes_table = QTableWidget()
+        self.routes_table.setColumnCount(5)
+        self.routes_table.setHorizontalHeaderLabels([
+            "Destination", "Gateway", "Interface", "Metric", "Scope"
+        ])
+        self.routes_table.verticalHeader().setVisible(False)
+        self.routes_table.verticalHeader().setDefaultSectionSize(36)
+        self.routes_table.setAlternatingRowColors(True)
+        self.routes_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        h_routes = self.routes_table.horizontalHeader()
+        h_routes.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        h_routes.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h_routes.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h_routes.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h_routes.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        l_routes.addWidget(self.routes_table)
+        self.footprint_subtabs.addTab(tab_routes, "🛣  Routing Table & Gateway")
+
+        # Sub-Tab 3: Passive Neighbor Cache Table
+        tab_neighbors = QWidget()
+        l_neighbors = QVBoxLayout(tab_neighbors)
+        l_neighbors.setContentsMargins(6, 6, 6, 6)
+        self.neighbors_table = QTableWidget()
+        self.neighbors_table.setColumnCount(7)
+        self.neighbors_table.setHorizontalHeaderLabels([
+            "Target IP", "MAC Address", "Interface", "State", "Collection Method", "Confidence", "Scope Status"
+        ])
+        self.neighbors_table.verticalHeader().setVisible(False)
+        self.neighbors_table.verticalHeader().setDefaultSectionSize(36)
+        self.neighbors_table.setAlternatingRowColors(True)
+        self.neighbors_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        h_neighbors = self.neighbors_table.horizontalHeader()
+        h_neighbors.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h_neighbors.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        h_neighbors.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h_neighbors.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h_neighbors.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        h_neighbors.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        h_neighbors.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        l_neighbors.addWidget(self.neighbors_table)
+        self.footprint_subtabs.addTab(tab_neighbors, "📡  Passive ARP / Neighbor Cache")
+
+        layout.addWidget(self.footprint_subtabs)
+        return tab
+
+    def _collect_footprint(self):
+        """Triggers asynchronous collection of local network interfaces, routes, and ARP data."""
+        if not self._ensure_active_project():
+            return
+        self.collect_footprint_btn.setEnabled(False)
+        self.footprint_status_label.setText("Footprint: Querying local network interfaces...")
+        self.workflow.update_stage(WorkflowStage.STAGE_1_FOOTPRINTING, StageStatus.RUNNING)
+        self._refresh_workflow_tabs()
+
+        scopes = self.db.list_scopes(self.active_project.id) if self.active_project else []
+
+        def worker():
+            res = self.footprint_collector.collect_footprint(
+                project=self.active_project,
+                scopes=scopes,
+                evidence_dir=Path("storage/evidence"),
+            )
+            self.signals.footprint_completed.emit(res)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    @Slot(object)
+    def _on_footprint_completed(self, result: InternalFootprintResult):
+        self.collect_footprint_btn.setEnabled(True)
+        self.current_footprint = result
+
+        gw_str = result.default_gateway or "None"
+        subnets_str = ", ".join(result.discovered_subnets) or "None"
+        self.footprint_status_label.setText(
+            f"Gateway: {gw_str} | Discovered Subnets: {subnets_str} (SHA-256: {result.evidence_hash[:8]}...)"
+        )
+
+        # Populate Interfaces Table
+        self.interfaces_table.setRowCount(0)
+        for row, iface in enumerate(result.interfaces):
+            self.interfaces_table.insertRow(row)
+            self.interfaces_table.setItem(row, 0, QTableWidgetItem(iface.name))
+            self.interfaces_table.setItem(row, 1, QTableWidgetItem(", ".join(iface.ipv4_addresses) or "—"))
+            self.interfaces_table.setItem(row, 2, QTableWidgetItem(", ".join(iface.ipv6_addresses) or "—"))
+            self.interfaces_table.setItem(row, 3, QTableWidgetItem(iface.mac_address or "—"))
+            self.interfaces_table.setItem(row, 4, QTableWidgetItem("UP" if iface.is_up else "DOWN"))
+            self.interfaces_table.setItem(row, 5, QTableWidgetItem(iface.scope_status))
+
+        # Populate Routes Table
+        self.routes_table.setRowCount(0)
+        for row, r in enumerate(result.routes):
+            self.routes_table.insertRow(row)
+            dest_label = f"{r.destination} (Default Gateway)" if r.is_default_gateway else r.destination
+            self.routes_table.setItem(row, 0, QTableWidgetItem(dest_label))
+            self.routes_table.setItem(row, 1, QTableWidgetItem(r.gateway or "Direct Link"))
+            self.routes_table.setItem(row, 2, QTableWidgetItem(r.interface))
+            self.routes_table.setItem(row, 3, QTableWidgetItem(str(r.metric) if r.metric is not None else "—"))
+            self.routes_table.setItem(row, 4, QTableWidgetItem(r.scope_status))
+
+        # Populate Passive Neighbor Cache Table
+        self.neighbors_table.setRowCount(0)
+        for row, n in enumerate(result.neighbors):
+            self.neighbors_table.insertRow(row)
+            self.neighbors_table.setItem(row, 0, QTableWidgetItem(n.ip_address))
+            self.neighbors_table.setItem(row, 1, QTableWidgetItem(n.mac_address))
+            self.neighbors_table.setItem(row, 2, QTableWidgetItem(n.interface))
+            self.neighbors_table.setItem(row, 3, QTableWidgetItem(n.state))
+            self.neighbors_table.setItem(row, 4, QTableWidgetItem(n.collection_method))
+            self.neighbors_table.setItem(row, 5, QTableWidgetItem(f"{n.confidence} (Passive)"))
+            self.neighbors_table.setItem(row, 6, QTableWidgetItem(n.scope_status))
+
+        # Update Sub-Tab Badges with Item Counts
+        if hasattr(self, "footprint_subtabs"):
+            self.footprint_subtabs.setTabText(0, f"🖥  Network Interfaces ({len(result.interfaces)})")
+            self.footprint_subtabs.setTabText(1, f"🛣  Routing Table ({len(result.routes)})")
+            self.footprint_subtabs.setTabText(2, f"📡  Passive ARP / Neighbor Cache ({len(result.neighbors)})")
+
+        # Update Workflow Stepper
+        items_cnt = len(result.interfaces) + len(result.neighbors)
+        self.workflow.update_stage(
+            WorkflowStage.STAGE_1_FOOTPRINTING,
+            StageStatus.COMPLETED,
+            summary=f"Discovered {len(result.interfaces)} interface(s) and {len(result.neighbors)} passive ARP entry(ies).",
+            count=items_cnt,
+            evidence_hash=result.evidence_hash,
+        )
+
+        # Sync discovered footprint assets with AssetInventoryService
+        if self.active_project:
+            try:
+                scopes = self.db.list_scopes(self.active_project.id)
+                session_id = self.current_session.session_id if self.current_session else None
+                evidence_id = getattr(result, "evidence_id", None)
+                self.asset_service.sync_footprint_assets(
+                    project_id=self.active_project.id,
+                    footprint=result,
+                    scopes=scopes,
+                    session_id=session_id,
+                    source_tool="footprint",
+                    evidence_id=evidence_id,
+                )
+                self.map_view.load_discovered_assets(self.db, self.active_project.id)
+                window = self.window()
+                if hasattr(window, "topology_view") and hasattr(window.topology_view, "load_discovered_assets"):
+                    try:
+                        window.topology_view.load_discovered_assets(self.db, self.active_project.id)
+                    except Exception as exc:
+                        logger.debug("Failed syncing window topology_view from footprint: %s", exc)
+            except Exception as exc:
+                logger.warning("Failed to sync footprint assets to inventory: %s", exc)
+
+        self._refresh_workflow_tabs()
+        self._refresh_subnet_selector()
+        self._refresh_activity_log()
+        self._refresh_erp_dashboard()
+
+    def _pass_subnets_to_step2(self):
+        """Passes Step 1 discovered subnets directly into Step 2."""
+        self._refresh_subnet_selector()
+        if self.current_footprint and self.current_footprint.discovered_subnets:
+            first_sub = self.current_footprint.discovered_subnets[0]
+            idx = self.subnet_combo.findText(first_sub)
+            if idx >= 0:
+                self.subnet_combo.setCurrentIndex(idx)
+            else:
+                self.subnet_combo.setEditText(first_sub)
+        self.tab_widget.setCurrentIndex(1)
+
+    def _on_pcap_synced(self, count: int):
+        """Refreshes master grid and network map when PCAP analysis findings/endpoints are synced."""
+        self._refresh_erp_dashboard()
+        if self.active_project and hasattr(self, "map_view") and hasattr(self.map_view, "load_discovered_assets"):
+            try:
+                self.map_view.load_discovered_assets(self.db, self.active_project.id)
+            except Exception:
+                pass
+        window = self.window()
+        if hasattr(window, "topology_view") and hasattr(window.topology_view, "load_discovered_assets") and self.active_project:
+            try:
+                window.topology_view.load_discovered_assets(self.db, self.active_project.id)
+            except Exception:
+                pass
+        if hasattr(window, "_on_terminal_project_data_updated"):
+            try:
+                window._on_terminal_project_data_updated()
+            except Exception:
+                pass
+
+    # -----------------------------------------------------------------------
+    # Step 2: Network Scanning & Live Discovery Tab
+    # -----------------------------------------------------------------------
+    def _create_discovery_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        # Discovery Mode & Subnet Scope Configuration Group
+        disc_group = QGroupBox("Network Discovery Configuration (Passive vs Active Mode)")
+        disc_form = QFormLayout(disc_group)
+
+        # Mode Radio Buttons (Passive vs Active)
+        mode_box = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self.passive_radio = QRadioButton("Passive / Existing network data (Neighbor cache & inventory)")
+        self.active_radio = QRadioButton("Active / Authorized host discovery (Nmap -sn Ping Sweep)")
+        self.active_radio.setChecked(True)
+        self.mode_group.addButton(self.passive_radio)
+        self.mode_group.addButton(self.active_radio)
+        self.passive_radio.toggled.connect(self._on_discovery_mode_changed)
+        mode_box.addWidget(self.passive_radio)
+        mode_box.addWidget(self.active_radio)
+        mode_box.addStretch()
+        disc_form.addRow("Discovery Mode:", mode_box)
+
+        # Authorized Subnet Selector
+        subnet_box = QHBoxLayout()
+        self.subnet_combo = QComboBox()
+        self.subnet_combo.setEditable(True)
+        self.subnet_combo.currentIndexChanged.connect(self._on_subnet_selected)
+        subnet_box.addWidget(self.subnet_combo, 1)
+
+        self.refresh_subnets_btn = QPushButton("🔄 Refresh Subnets")
+        self.refresh_subnets_btn.clicked.connect(self._refresh_subnet_selector)
+        subnet_box.addWidget(self.refresh_subnets_btn)
+        disc_form.addRow("Authorized Subnet:", subnet_box)
+
+        # Selected Workflow Status Summary Card
+        self.workflow_summary_label = QLabel(
+            "Selected Workflow: Mode: Active discovery | Scope: None | "
+            "Real execution independently validates authorization and target scope fail-closed."
+        )
+        self.workflow_summary_label.setWordWrap(True)
+        self.workflow_summary_label.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; border: 1px solid {CPENTTheme.BORDER}; "
+            f"border-radius: 4px; padding: 8px 12px; color: {CPENTTheme.SECONDARY_TEXT}; font-size: 13px; line-height: 1.4;"
+        )
+        disc_form.addRow(self.workflow_summary_label)
+
+        # Consolidated Action Buttons
+        btn_bar = QHBoxLayout()
+        self.full_scan_btn = QPushButton("⚡ Full Subnet Discovery & Port Scan (-sV -O)")
+        self.full_scan_btn.setProperty("class", "action-primary")
+        self.full_scan_btn.setToolTip("One-click pipeline: Sweeps subnet for live hosts AND fingerprints services/OS simultaneously")
+        self.full_scan_btn.clicked.connect(self._execute_full_subnet_scan)
+        btn_bar.addWidget(self.full_scan_btn)
+
+        self.execute_discovery_btn = QPushButton("▶ Live Ping Sweep (-sn)")
+        self.execute_discovery_btn.setProperty("class", "action-secondary")
+        self.execute_discovery_btn.setToolTip("Quick discovery sweep: Finds reachable live hosts without port scanning")
+        self.execute_discovery_btn.clicked.connect(self._execute_discovery)
+        btn_bar.addWidget(self.execute_discovery_btn)
+
+        self.discovery_status_label = QLabel("Status: Idle")
+        self.discovery_status_label.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-size: 11px;")
+        btn_bar.addWidget(self.discovery_status_label)
+        btn_bar.addStretch()
+
+        self.pass_hosts_btn = QPushButton("🚀 Send Discovered Live Hosts to Step 3 ▶")
+        self.pass_hosts_btn.setProperty("class", "action-secondary")
+        self.pass_hosts_btn.clicked.connect(self._pass_hosts_to_step3)
+        btn_bar.addWidget(self.pass_hosts_btn)
+        disc_form.addRow(btn_bar)
+
+        layout.addWidget(disc_group)
+
+        # Discovered Hosts Table (Zero-port visibility preserved!)
+        hosts_box = QGroupBox("Discovered Hosts & Reachability Results (Displays 0-port hosts & ping sweeps)")
+        hb_layout = QVBoxLayout(hosts_box)
+        self.hosts_table = QTableWidget()
+        self.hosts_table.setColumnCount(8)
+        self.hosts_table.setHorizontalHeaderLabels([
+            "Host IP", "Status", "Hostname", "OS Fingerprint", "MAC / Vendor", "Open Ports", "Latency (ms)", "Findings"
+        ])
+        self.hosts_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.hosts_table.verticalHeader().setVisible(False)
+        self.hosts_table.verticalHeader().setDefaultSectionSize(36)
+        self.hosts_table.setAlternatingRowColors(True)
+        self.hosts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.hosts_table.cellDoubleClicked.connect(self._on_host_row_double_clicked)
+        hb_layout.addWidget(self.hosts_table)
+
+        # Host Action Strip
+        host_action_bar = QHBoxLayout()
+        self.scan_selected_host_btn = QPushButton("⚡ Fingerprint Selected Host (-sV -O)")
+        self.scan_selected_host_btn.setProperty("class", "action-secondary")
+        self.scan_selected_host_btn.setToolTip("Fingerprint open ports and services for the highlighted host")
+        self.scan_selected_host_btn.clicked.connect(self._scan_selected_host)
+        host_action_bar.addWidget(self.scan_selected_host_btn)
+
+        self.btn_view_asset_history = QPushButton("📜 View Asset History")
+        self.btn_view_asset_history.setProperty("class", "action-secondary")
+        self.btn_view_asset_history.setToolTip("View normalized asset details, historical scan observations, and evidence")
+        self.btn_view_asset_history.clicked.connect(self._show_asset_history_dialog)
+        host_action_bar.addWidget(self.btn_view_asset_history)
+
+        hint_label = QLabel("💡 <i>Tip: Double-click any host to run service & OS fingerprinting</i>")
+        hint_label.setStyleSheet(f"color: {CPENTTheme.MUTED_TEXT}; font-size: 11px;")
+        host_action_bar.addWidget(hint_label)
+        host_action_bar.addStretch()
+
+        self.step2_to_vuln_btn = QPushButton("Proceed to Step 4 Vuln Assess ▶")
+        self.step2_to_vuln_btn.setProperty("class", "action-primary")
+        self.step2_to_vuln_btn.clicked.connect(lambda: self.tab_widget.setCurrentIndex(3))
+        host_action_bar.addWidget(self.step2_to_vuln_btn)
+
+        hb_layout.addLayout(host_action_bar)
+        layout.addWidget(hosts_box)
+
+        return tab
+
+    def _refresh_subnet_selector(self):
+        """Populates the subnet dropdown with Step 1 discovered subnets and authorized scopes."""
+        self.subnet_combo.clear()
+        subnets = set()
+
+        if self.current_footprint:
+            for s in self.current_footprint.discovered_subnets:
+                subnets.add(s)
+
+        if self.active_project:
+            for sc in self.db.list_scopes(self.active_project.id):
+                if sc.is_authorized and "/" in sc.target:
+                    subnets.add(sc.target)
+
+        if not subnets:
+            self.subnet_combo.addItem("192.168.100.0/24 (Example)")
+        else:
+            for s in sorted(list(subnets)):
+                self.subnet_combo.addItem(s)
+
+        self._on_subnet_selected()
+
+    def _on_discovery_mode_changed(self):
+        self._on_subnet_selected()
+
+    def _on_subnet_selected(self):
+        mode = "Passive discovery (No packets sent)" if self.passive_radio.isChecked() else "Active host discovery"
+        subnet = self.subnet_combo.currentText().strip()
+        self.workflow_summary_label.setText(
+            f"Selected Workflow: Mode: <b>{mode}</b> | Scope: <code>{subnet}</code> | "
+            "Real execution independently validates authorization and target scope fail-closed."
+        )
+
+    def _execute_discovery(self):
+        """Executes either passive collection or active Nmap ping sweep."""
+        if not self._ensure_active_project():
+            return
+
+        subnet = self.subnet_combo.currentText().strip()
+        if not subnet:
+            QMessageBox.warning(self, "Input Error", "Please select or enter a target subnet.")
+            return
+
+        if self.passive_radio.isChecked():
+            # Passive mode: Populate hosts table directly from neighbor cache
+            if not self.current_footprint or not self.current_footprint.neighbors:
+                QMessageBox.information(
+                    self,
+                    "Passive Mode Notice",
+                    "No passive neighbor cache entries available. Please run Step 1 Footprinting first."
+                )
+                return
+
+            self.hosts_table.setRowCount(0)
+            row = 0
+            for n in self.current_footprint.neighbors:
+                self.hosts_table.insertRow(row)
+                self.hosts_table.setItem(row, 0, QTableWidgetItem(n.ip_address))
+                self.hosts_table.setItem(row, 1, QTableWidgetItem("OBSERVED (Passive)"))
+                self.hosts_table.setItem(row, 2, QTableWidgetItem(n.hostname or "None"))
+                self.hosts_table.setItem(row, 3, QTableWidgetItem("Unverified (Passive Cache)"))
+                self.hosts_table.setItem(row, 4, QTableWidgetItem(n.mac_address))
+                self.hosts_table.setItem(row, 5, QTableWidgetItem("0"))
+                self.hosts_table.setItem(row, 6, QTableWidgetItem("—"))
+                self.hosts_table.setItem(row, 7, QTableWidgetItem("0"))
+                row += 1
+
+            self.discovery_status_label.setText(f"Status: Loaded {row} passive host(s)")
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_2_DISCOVERY,
+                StageStatus.COMPLETED,
+                summary=f"Loaded {row} passive host observation(s).",
+                count=row,
+            )
+            self._refresh_workflow_tabs()
+        else:
+            # Active mode: Run ping sweep -sn
+            # Scope check
+            scopes = self.db.list_scopes(self.active_project.id)
+            is_allowed, reason = ScopeAuthorizationService.is_target_authorized(
+                subnet, scopes, project=self.active_project
+            )
+            if not is_allowed:
+                reply = QMessageBox.question(
+                    self,
+                    "Scope Authorization Required",
+                    f"Target subnet '{subnet}' is not currently authorized in active project '{self.active_project.name}'.\n\n"
+                    f"Reason: {reason}\n\n"
+                    f"Would you like to authorize '{subnet}' for penetration testing now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    is_cidr = "/" in subnet
+                    target_type = TargetType.CIDR_RANGE if is_cidr else TargetType.IP_ADDRESS
+                    self.db.add_scope(
+                        TargetScope(
+                            project_id=self.active_project.id,
+                            target=subnet,
+                            target_type=target_type,
+                            rule_type=ScopeRuleType.ALLOWED,
+                            is_authorized=True,
+                        )
+                    )
+                    self._refresh_subnet_selector()
+                else:
+                    return
+
+            self.target_input.setText(subnet)
+            self.profile_combo.setCurrentIndex(1)  # Ping sweep
+            self._start_scan()
+
+    def _execute_full_subnet_scan(self):
+        """One-click consolidated discovery & port/service fingerprinting for the entire subnet."""
+        if not self._ensure_active_project():
+            return
+
+        subnet = self.subnet_combo.currentText().strip()
+        if not subnet:
+            QMessageBox.warning(self, "Input Error", "Please select or enter a target subnet.")
+            return
+
+        # Check scope authorization
+        scopes = self.db.list_scopes(self.active_project.id)
+        is_allowed, reason = ScopeAuthorizationService.is_target_authorized(
+            subnet, scopes, project=self.active_project
+        )
+        if not is_allowed:
+            reply = QMessageBox.question(
+                self,
+                "Scope Authorization Required",
+                f"Target subnet '{subnet}' is not currently authorized in active project '{self.active_project.name}'.\n\n"
+                f"Reason: {reason}\n\n"
+                f"Would you like to authorize '{subnet}' for penetration testing now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                is_cidr = "/" in subnet
+                target_type = TargetType.CIDR_RANGE if is_cidr else TargetType.IP_ADDRESS
+                self.db.add_scope(
+                    TargetScope(
+                        project_id=self.active_project.id,
+                        target=subnet,
+                        target_type=target_type,
+                        rule_type=ScopeRuleType.ALLOWED,
+                        is_authorized=True,
+                    )
+                )
+                self._refresh_subnet_selector()
+            else:
+                return
+
+        # Set target and profile to OS & Service Fingerprinting
+        self.target_input.setText(subnet)
+        self.profile_combo.setCurrentIndex(2)  # Service & Version Detection (-sV -T4)
+        self._start_scan()
+
+    def _scan_selected_host(self):
+        """Fingerprints open ports and services for the currently selected host in hosts_table."""
+        selected_rows = self.hosts_table.selectionModel().selectedRows()
+        if not selected_rows:
+            row = self.hosts_table.currentRow()
+            if row < 0:
+                QMessageBox.information(self, "Select Host", "Please select a host from the table first.")
+                return
+        else:
+            row = selected_rows[0].row()
+
+        ip_item = self.hosts_table.item(row, 0)
+        if not ip_item:
+            return
+
+        host_ip = ip_item.text().strip()
+        self._fingerprint_single_host(host_ip)
+
+    def _on_host_row_double_clicked(self, row: int, col: int):
+        ip_item = self.hosts_table.item(row, 0)
+        if ip_item:
+            self._fingerprint_single_host(ip_item.text().strip())
+
+    def _fingerprint_single_host(self, host_ip: str):
+        if not self._ensure_active_project():
+            return
+
+        scopes = self.db.list_scopes(self.active_project.id)
+        is_allowed, reason = ScopeAuthorizationService.is_target_authorized(
+            host_ip, scopes, project=self.active_project
+        )
+        if not is_allowed:
+            reply = QMessageBox.question(
+                self,
+                "Scope Authorization Required",
+                f"Target host '{host_ip}' is not registered in active project scope.\n\n"
+                f"Would you like to authorize '{host_ip}' now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.db.add_scope(
+                    TargetScope(
+                        project_id=self.active_project.id,
+                        target=host_ip,
+                        target_type=TargetType.IP_ADDRESS,
+                        rule_type=ScopeRuleType.ALLOWED,
+                        is_authorized=True,
+                    )
+                )
+            else:
+                return
+
+        self.target_input.setText(host_ip)
+        self.profile_combo.setCurrentIndex(2)  # Service & Version Detection
+        self._start_scan()
+
+    def _pass_hosts_to_step3(self):
+        """Passes live hosts from Step 2 into Step 3 target input."""
+        live_ips = []
+        for row in range(self.hosts_table.rowCount()):
+            item = self.hosts_table.item(row, 0)
+            if item:
+                live_ips.append(item.text())
+
+        if live_ips:
+            # Default to first host or joined list
+            self.target_input.setText(live_ips[0])
+        self.tab_widget.setCurrentIndex(2)
+
+    # -----------------------------------------------------------------------
+    # Step 3: OS & Service Fingerprinting Tab
+    # -----------------------------------------------------------------------
+    def _create_fingerprint_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        # Scan Configuration & Scope Guard Group
+        config_group = QGroupBox("Scan Configuration & Scope Guard")
+        form = QFormLayout(config_group)
+
+        self.target_input = QLineEdit()
+        self.target_input.setPlaceholderText("Enter target IP, CIDR, or Hostname (e.g. 192.168.100.1, 192.168.100.0/24)")
+        form.addRow("Target Address *:", self.target_input)
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItem("Top Ports Fast Scan (-F -T4)", ScanProfile.TOP_PORTS)
+        self.profile_combo.addItem("Ping Sweep Discovery (-sn)", ScanProfile.PING_DISCOVERY)
+        self.profile_combo.addItem("Service & Version Detection (-sV -T4)", ScanProfile.SERVICE_VERSION)
+        self.profile_combo.addItem("OS & Service Fingerprinting (-O -sV -T4)", ScanProfile.OS_FINGERPRINT)
+        self.profile_combo.addItem("Firewall Ruleset Detection (-sA -T4 -Pn)", ScanProfile.FIREWALL_DETECTION)
+        self.profile_combo.addItem("UDP Port Inventory (-sU -F -T4)", ScanProfile.UDP_SCAN)
+        self.profile_combo.addItem("Custom Ports Scan", ScanProfile.CUSTOM)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        form.addRow("Scan Profile:", self.profile_combo)
+
+        self.ports_input = QLineEdit()
+        self.ports_input.setPlaceholderText("e.g. 21,22,80,443,8080 or 1-1000")
+        self.ports_input.setEnabled(False)
+        form.addRow("Custom Ports:", self.ports_input)
+
+        btn_bar = QHBoxLayout()
+        self.scan_btn = QPushButton("Execute Authorized Scan")
+        self.scan_btn.setProperty("class", "action-primary")
+        self.scan_btn.clicked.connect(self._start_scan)
+        btn_bar.addWidget(self.scan_btn)
+
+        self.import_btn = QPushButton("📥 Import Nmap XML")
+        self.import_btn.setProperty("class", "action-secondary")
+        self.import_btn.clicked.connect(self._import_xml)
+        btn_bar.addWidget(self.import_btn)
+
+        self.cancel_btn = QPushButton("Cancel Scan")
+        self.cancel_btn.setProperty("class", "action-secondary")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_scan)
+        btn_bar.addWidget(self.cancel_btn)
+
+        btn_bar.addStretch()
+        self.status_label = QLabel("Status: Idle")
+        btn_bar.addWidget(self.status_label)
+
+        self.pass_services_btn = QPushButton("🚀 Send Services to Step 4 Vuln Assess ▶")
+        self.pass_services_btn.setProperty("class", "action-secondary")
+        self.pass_services_btn.clicked.connect(lambda: self.tab_widget.setCurrentIndex(3))
+        btn_bar.addWidget(self.pass_services_btn)
+
+        form.addRow(btn_bar)
+        layout.addWidget(config_group)
+
+        # Services & Ports Table
+        services_box = QGroupBox("Discovered Services & Version Fingerprints (CPE 2.3 & Exact Banners)")
+        sb_layout = QVBoxLayout(services_box)
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(7)
+        self.results_table.setHorizontalHeaderLabels([
+            "Host IP", "Port", "Protocol", "State", "Service Name", "Product & Version", "CPE Identifiers"
+        ])
+        self.results_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        sb_layout.addWidget(self.results_table)
+        layout.addWidget(services_box)
+
+        return tab
+
+    # -----------------------------------------------------------------------
+    # Step 4: Vulnerability Assessment Tab
+    # -----------------------------------------------------------------------
+    def _create_vuln_assessment_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        # Methodology Notice
+        notice = QLabel(
+            "<b>Vulnerability Assessment Pipeline:</b> Open ports and detected service versions are classified strictly as "
+            "security observations (<code>OBSERVED</code>). They are NEVER automatically marked as confirmed vulnerabilities "
+            "without controlled verification proof."
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; border: 1px solid {CPENTTheme.BORDER}; "
+            "border-radius: 4px; padding: 10px; font-size: 13px; line-height: 1.4;"
+        )
+        layout.addWidget(notice)
+
+        # Findings Table
+        findings_box = QGroupBox("Security Observations & Correlation Matrix")
+        fb_layout = QVBoxLayout(findings_box)
+        self.vuln_findings_table = QTableWidget()
+        self.vuln_findings_table.setColumnCount(6)
+        self.vuln_findings_table.setHorizontalHeaderLabels([
+            "ID", "Severity", "CVSS", "Observation Title", "Affected Asset", "Validation Status"
+        ])
+        self.vuln_findings_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        fb_layout.addWidget(self.vuln_findings_table)
+
+        btn_bar = QHBoxLayout()
+        self.refresh_vulns_btn = QPushButton("🔄 Refresh Observations")
+        self.refresh_vulns_btn.clicked.connect(self._refresh_vuln_table)
+        btn_bar.addWidget(self.refresh_vulns_btn)
+
+        self.run_vuln_audit_btn = QPushButton("🛡️ Run Pure-Python Vulnerability Audit")
+        self.run_vuln_audit_btn.setProperty("class", "action-secondary")
+        self.run_vuln_audit_btn.clicked.connect(self._run_vuln_audit)
+        btn_bar.addWidget(self.run_vuln_audit_btn)
+
+        btn_bar.addStretch()
+        self.pass_vulns_btn = QPushButton("🚀 Proceed to Step 5 Exploit Verification ▶")
+        self.pass_vulns_btn.setProperty("class", "action-primary")
+        self.pass_vulns_btn.clicked.connect(lambda: self.tab_widget.setCurrentIndex(4))
+        btn_bar.addWidget(self.pass_vulns_btn)
+        fb_layout.addLayout(btn_bar)
+
+        layout.addWidget(findings_box)
+        return tab
+
+    def _run_vuln_audit(self):
+        if not self.active_project:
+            QMessageBox.warning(self, "No Project", "Select an active engagement project first.")
+            return
+
+        from modules.vuln.vuln_scanner import PythonVulnScanner
+        from PySide6.QtCore import QTimer
+        scanner = PythonVulnScanner(self.db)
+        scopes = self.db.list_scopes(self.active_project.id)
+
+        nodes = [n for n in self.db.list_asset_nodes(self.active_project.id) if n.node_type == "ip"]
+        if not nodes:
+            QMessageBox.information(
+                self,
+                "No Discovered Assets",
+                "No active IP assets found in project inventory. Run Step 2 Discovery first or add targets.",
+            )
+            return
+
+        self.run_vuln_audit_btn.setEnabled(False)
+        self.run_vuln_audit_btn.setText("⏳ Auditing Assets...")
+
+        def _worker():
+            total_findings = 0
+            for node in nodes:
+                try:
+                    open_ports = []
+                    if node.metadata_json:
+                        meta = json.loads(node.metadata_json)
+                        open_ports = meta.get("open_ports", [])
+                    new_findings = scanner.audit_target(
+                        project_id=self.active_project.id,
+                        target_ip=node.value,
+                        open_ports=open_ports,
+                        scopes=scopes,
+                    )
+                    total_findings += len(new_findings)
+                except Exception:
+                    pass
+            QTimer.singleShot(0, lambda: self._on_vuln_audit_finished(total_findings))
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_vuln_audit_finished(self, total_findings: int):
+        self.run_vuln_audit_btn.setEnabled(True)
+        self.run_vuln_audit_btn.setText("🛡️ Run Pure-Python Vulnerability Audit")
+        self._refresh_vuln_table()
+        QMessageBox.information(
+            self,
+            "Vulnerability Audit Completed",
+            f"Pure-Python Vulnerability Audit identified and recorded {total_findings} security observation(s)!",
+        )
+
+    def _refresh_vuln_table(self):
+        if not self.active_project:
+            return
+        findings = self.db.list_findings(self.active_project.id)
+        self.vuln_findings_table.setRowCount(0)
+        for row, f in enumerate(findings):
+            self.vuln_findings_table.insertRow(row)
+            self.vuln_findings_table.setItem(row, 0, QTableWidgetItem(f"#{f.id}"))
+            self.vuln_findings_table.setItem(row, 1, QTableWidgetItem(f.severity.value.upper()))
+            self.vuln_findings_table.setItem(row, 2, QTableWidgetItem(f"{f.cvss_score:.1f}" if f.cvss_score else "—"))
+            self.vuln_findings_table.setItem(row, 3, QTableWidgetItem(f.title))
+            self.vuln_findings_table.setItem(row, 4, QTableWidgetItem(f.affected_asset))
+            self.vuln_findings_table.setItem(row, 5, QTableWidgetItem(f.validation_status.value))
+        self._refresh_step5_findings_table()
+        self._refresh_reporting_summary()
+
+    # -----------------------------------------------------------------------
+    # Step 5: Exploit Verification & CPENT Labs Tab
+    # -----------------------------------------------------------------------
+    def _create_workbench_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        wb_header = QLabel("CPENT-Aligned 6-Step Network Penetration Testing Workflow")
+        wb_header.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {CPENTTheme.PRIMARY_BLUE};")
+        layout.addWidget(wb_header)
+
+        # Methodology cards
+        steps_text = QLabel(
+            "<b>1. Information Gathering:</b> Define project scope, verify client RoE authorization, and map network blocks.<br>"
+            "<b>2. Host & Port Discovery:</b> Execute ping sweeps (-sn) and port scans without inferring absent firewalls.<br>"
+            "<b>3. OS & Service Fingerprinting:</b> Extract exact banners, OS accuracy metrics, and CPE 2.3 identifiers.<br>"
+            "<b>4. Vulnerability Assessment:</b> Classify open services as security observations (OBSERVED). Never auto-mark as confirmed.<br>"
+            "<b>5. Controlled Exploit Verification:</b> Require explicit tester approval for intrusive actions; verify safely in isolated labs.<br>"
+            "<b>6. Reporting & Retesting:</b> Generate tamper-evident audit reports with cryptographic SHA-256 evidence hashes."
+        )
+        steps_text.setWordWrap(True)
+        steps_text.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; border: 1px solid {CPENTTheme.BORDER}; "
+            "border-radius: 6px; padding: 10px; line-height: 1.4; font-size: 13px;"
+        )
+        layout.addWidget(steps_text)
+
+        # Verification Safety Control Box
+        safety_group = QGroupBox("Controlled Exploit Verification Guard")
+        sg_layout = QVBoxLayout(safety_group)
+
+        self.safety_status = QLabel(
+            "🛡 Fail-Closed Exploit Safety: Intrusive actions require isolated lab confirmation.\n"
+            "Raw scanner outputs and zero-exit codes are never treated as proof of exploitation."
+        )
+        self.safety_status.setWordWrap(True)
+        self.safety_status.setStyleSheet(f"color: {CPENTTheme.WARNING_AMBER}; font-weight: 600; font-size: 12px; line-height: 1.4;")
+        sg_layout.addWidget(self.safety_status)
+
+        # Candidate Observations Table in Step 5
+        self.step5_findings_table = QTableWidget()
+        self.step5_findings_table.setColumnCount(7)
+        self.step5_findings_table.setHorizontalHeaderLabels([
+            "ID", "Severity", "CVSS", "Candidate Observation Title", "Affected Asset", "Validation Status", "Verification Method"
+        ])
+        self.step5_findings_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.step5_findings_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.step5_findings_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.step5_findings_table.setMinimumHeight(180)
+        sg_layout.addWidget(self.step5_findings_table)
+
+        verify_btn_bar = QHBoxLayout()
+        self.verify_finding_btn = QPushButton("🛡️ Verify Selected Finding Safely")
+        self.verify_finding_btn.setProperty("class", "action-primary")
+        self.verify_finding_btn.clicked.connect(self._verify_selected_finding)
+        verify_btn_bar.addWidget(self.verify_finding_btn)
+
+        self.mark_false_positive_btn = QPushButton("Mark as False Positive")
+        self.mark_false_positive_btn.setProperty("class", "action-secondary")
+        self.mark_false_positive_btn.clicked.connect(self._mark_false_positive)
+        verify_btn_bar.addWidget(self.mark_false_positive_btn)
+
+        self.refresh_step5_btn = QPushButton("🔄 Refresh Candidates")
+        self.refresh_step5_btn.setProperty("class", "action-secondary")
+        self.refresh_step5_btn.clicked.connect(self._refresh_step5_findings_table)
+        verify_btn_bar.addWidget(self.refresh_step5_btn)
+
+        verify_btn_bar.addStretch()
+        sg_layout.addLayout(verify_btn_bar)
+        layout.addWidget(safety_group)
+
+        # CPENT Practical Lab Scenarios Group
+        lab_group = QGroupBox("CPENT Practical Lab Curriculum & Safe Verification Scenarios")
+        lab_layout = QVBoxLayout(lab_group)
+
+        selector_bar = QHBoxLayout()
+        selector_bar.addWidget(QLabel("Select Lab Scenario:"))
+        self.lab_combo = QComboBox()
+        for lab in CPENT_LAB_CATALOG:
+            self.lab_combo.addItem(f"{lab.id}: {lab.title} ({lab.difficulty})", lab.id)
+        self.lab_combo.currentIndexChanged.connect(self._on_lab_scenario_changed)
+        selector_bar.addWidget(self.lab_combo, 1)
+
+        self.lab_verify_btn = QPushButton("🛡 Verify Lab Scope & Prerequisites")
+        self.lab_verify_btn.setProperty("class", "action-secondary")
+        self.lab_verify_btn.clicked.connect(self._verify_lab_scope)
+        selector_bar.addWidget(self.lab_verify_btn)
+
+        self.btn_open_exam_sim = QPushButton("🏆 Launch 24-Hour CPENT Exam Simulator")
+        self.btn_open_exam_sim.setProperty("class", "action-primary")
+        self.btn_open_exam_sim.clicked.connect(self._launch_exam_simulator)
+        selector_bar.addWidget(self.btn_open_exam_sim)
+        lab_layout.addLayout(selector_bar)
+
+        self.lab_details_text = QLabel()
+        self.lab_details_text.setWordWrap(True)
+        self.lab_details_text.setStyleSheet(
+            f"background-color: {CPENTTheme.PANEL_BG}; border: 1px solid {CPENTTheme.BORDER}; "
+            "border-radius: 4px; padding: 10px; font-size: 11px; line-height: 1.4;"
+        )
+        lab_layout.addWidget(self.lab_details_text)
+        self._on_lab_scenario_changed()
+
+        layout.addWidget(lab_group)
+
+        # Forward button
+        forward_bar = QHBoxLayout()
+        forward_bar.addStretch()
+        self.to_report_btn = QPushButton("🚀 Proceed to Step 6 Final Report ▶")
+        self.to_report_btn.setProperty("class", "action-primary")
+        self.to_report_btn.clicked.connect(lambda: self.tab_widget.setCurrentIndex(5))
+        forward_bar.addWidget(self.to_report_btn)
+        layout.addLayout(forward_bar)
+
+        return tab
+
+    # -----------------------------------------------------------------------
+    # Step 6: Reporting, Remediation & Retesting Tab
+    # -----------------------------------------------------------------------
+    def _create_reporting_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        rep_header = QLabel("Assessment Report Generation, Evidence Vault & Retesting")
+        rep_header.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {CPENTTheme.PRIMARY_BLUE};")
+        layout.addWidget(rep_header)
+
+        # Methodology summary
+        sum_box = QGroupBox("Engagement Workflow Status & Retest Progress")
+        s_layout = QVBoxLayout(sum_box)
+        self.report_summary_text = QLabel("Select an active project to view engagement status.")
+        self.report_summary_text.setWordWrap(True)
+        self.report_summary_text.setStyleSheet(
+            "background-color: #0f172a; border: 1px solid #334155; border-radius: 6px; "
+            "padding: 14px; color: #f8fafc; font-size: 13px; line-height: 1.6;"
+        )
+        s_layout.addWidget(self.report_summary_text)
+        layout.addWidget(sum_box)
+
+        # Export Buttons Group
+        exp_box = QGroupBox("Generate & Export Assessment Reports")
+        eb_layout = QHBoxLayout(exp_box)
+
+        self.export_html_btn = QPushButton("📥 Export HTML Report")
+        self.export_html_btn.setProperty("class", "action-primary")
+        self.export_html_btn.clicked.connect(lambda: self._export_report("html"))
+        eb_layout.addWidget(self.export_html_btn)
+
+        self.export_md_btn = QPushButton("📥 Export Markdown Report")
+        self.export_md_btn.setProperty("class", "action-secondary")
+        self.export_md_btn.clicked.connect(lambda: self._export_report("markdown"))
+        eb_layout.addWidget(self.export_md_btn)
+
+        self.export_json_btn = QPushButton("📥 Export JSON Report")
+        self.export_json_btn.setProperty("class", "action-secondary")
+        self.export_json_btn.clicked.connect(lambda: self._export_report("json"))
+        eb_layout.addWidget(self.export_json_btn)
+
+        self.export_pdf_btn = QPushButton("📄 Export PDF Report")
+        self.export_pdf_btn.setProperty("class", "action-secondary")
+        self.export_pdf_btn.clicked.connect(lambda: self._export_report("pdf"))
+        eb_layout.addWidget(self.export_pdf_btn)
+
+        self.export_cpent_pack_btn = QPushButton("📦 Export CPENT Master Engagement Pack (.zip)")
+        self.export_cpent_pack_btn.setProperty("class", "action-primary")
+        self.export_cpent_pack_btn.clicked.connect(self._export_cpent_engagement_pack)
+        eb_layout.addWidget(self.export_cpent_pack_btn)
+
+        eb_layout.addStretch()
+        layout.addWidget(exp_box)
+
+        layout.addStretch()
+        return tab
+
+    def _export_report(self, fmt: str):
+        if not self._ensure_active_project():
+            return
+
+        try:
+            builder = ReportBuilder(self.db)
+            out_dir = Path("storage/reports")
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            if fmt == "html":
+                p = out_dir / f"report_{self.active_project.id}.html"
+                builder.generate_html(self.active_project.id, output_path=p)
+            elif fmt == "markdown":
+                p = out_dir / f"report_{self.active_project.id}.md"
+                builder.generate_markdown(self.active_project.id, output_path=p)
+            elif fmt == "pdf":
+                p = out_dir / f"report_{self.active_project.id}.pdf"
+                builder.generate_pdf(self.active_project.id, output_path=p)
+            else:
+                p = out_dir / f"report_{self.active_project.id}.json"
+                builder.generate_json(self.active_project.id, output_path=p)
+
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_6_REPORTING,
+                StageStatus.COMPLETED,
+                summary=f"Exported {fmt.upper()} assessment report.",
+            )
+            self._refresh_workflow_tabs()
+
+            self.activity_logger.log(
+                project_id=self.active_project.id,
+                action="report_exported",
+                outcome="success",
+                session_id=self.current_session.session_id if self.current_session else None,
+                details={"format": fmt, "path": str(p.resolve())},
+            )
+            self._refresh_activity_log()
+            self._refresh_erp_dashboard()
+
+            QMessageBox.information(
+                self,
+                "Report Generated",
+                f"Successfully generated {fmt.upper()} report:\n\n{p.resolve()}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Report Export Error", f"Failed to generate report: {exc}")
+
+    def _get_or_create_session(self, tool_name: str = "nmap") -> AssessmentSession:
+        """Retrieves active assessment session or initializes a new recorded session."""
+        if self.current_session and self.current_session.status in ("pending", "in_progress"):
+            return self.current_session
+        sess_uuid = f"ASM-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+        scope_str = "Authorized Target Scope"
+        if self.active_project:
+            scopes = self.db.list_scopes(self.active_project.id)
+            scope_str = ", ".join(s.target for s in scopes if s.is_authorized) or "Default Scope"
+        session = AssessmentSession(
+            project_id=self.active_project.id if self.active_project else 1,
+            session_id=sess_uuid,
+            authorized_scope=scope_str,
+            selected_tools=json.dumps([tool_name]),
+            status="in_progress",
+        )
+        self.current_session = self.db.create_assessment_session(session)
+        return self.current_session
+
+    def _create_activity_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Toolbar
+        bar = QHBoxLayout()
+        title = QLabel("Activity & Evidence Audit Trail")
+        title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {CPENTTheme.PRIMARY_TEXT};")
+        bar.addWidget(title)
+        bar.addStretch()
+
+        self.btn_refresh_activity = QPushButton("🔄 Refresh Log")
+        self.btn_refresh_activity.clicked.connect(self._refresh_activity_log)
+        bar.addWidget(self.btn_refresh_activity)
+
+        self.btn_toggle_raw = QPushButton("📜 View Raw Telemetry")
+        self.btn_toggle_raw.setCheckable(True)
+        self.btn_toggle_raw.toggled.connect(self._toggle_raw_telemetry)
+        bar.addWidget(self.btn_toggle_raw)
+        layout.addLayout(bar)
+
+        # Splitter with Activity Table on top and Details / Raw Telemetry on bottom
+        splitter = QSplitter(Qt.Vertical)
+
+        # Activity Table
+        self.activity_table = QTableWidget()
+        self.activity_table.setColumnCount(5)
+        self.activity_table.setHorizontalHeaderLabels(["Timestamp (UTC)", "Action", "Actor", "Session ID", "Details / Outcome"])
+        self.activity_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.activity_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.activity_table.itemSelectionChanged.connect(self._on_activity_row_selected)
+        splitter.addWidget(self.activity_table)
+
+        # Details Box (contains Details JSON / text and raw XML output)
+        det_box = QWidget()
+        det_layout = QVBoxLayout(det_box)
+        det_layout.setContentsMargins(0, 4, 0, 0)
+        det_layout.setSpacing(4)
+
+        self.activity_detail_label = QLabel("Select an activity log event to view provenance details:")
+        self.activity_detail_label.setStyleSheet(f"color: {CPENTTheme.SECONDARY_TEXT}; font-size: 11px; font-weight: 600;")
+        det_layout.addWidget(self.activity_detail_label)
+
+        self.activity_detail_text = QPlainTextEdit()
+        self.activity_detail_text.setReadOnly(True)
+        self.activity_detail_text.setStyleSheet(f"font-family: {CPENTTheme.FONT_FAMILY_MONO}; font-size: 11px;")
+        det_layout.addWidget(self.activity_detail_text)
+
+        self.raw_output_text = QPlainTextEdit()
+        self.raw_output_text.setReadOnly(True)
+        self.raw_output_text.setStyleSheet(f"font-family: {CPENTTheme.FONT_FAMILY_MONO}; font-size: 11px;")
+        self.raw_output_text.setPlaceholderText("Raw scan XML/command output will appear here...")
+        self.raw_output_text.setVisible(False)
+        det_layout.addWidget(self.raw_output_text)
+
+        splitter.addWidget(det_box)
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 4)
+
+        layout.addWidget(splitter)
+        return widget
+
+    def _toggle_raw_telemetry(self, checked: bool):
+        if hasattr(self, "raw_output_text"):
+            self.raw_output_text.setVisible(checked)
+            self.activity_detail_text.setVisible(not checked)
+            if checked:
+                self.btn_toggle_raw.setText("📋 View Activity Details")
+            else:
+                self.btn_toggle_raw.setText("📜 View Raw Telemetry")
+
+    def _on_activity_row_selected(self):
+        items = self.activity_table.selectedItems()
+        if not items:
+            return
+        row = items[0].row()
+        detail_item = self.activity_table.item(row, 4)
+        if detail_item:
+            raw_text = detail_item.data(Qt.UserRole) or detail_item.text()
+            try:
+                parsed = json.loads(raw_text)
+                self.activity_detail_text.setPlainText(json.dumps(parsed, indent=2))
+            except Exception:
+                self.activity_detail_text.setPlainText(raw_text)
+
+    def _refresh_activity_log(self):
+        if not hasattr(self, "activity_table") or not self.active_project:
+            return
+        logs = self.db.list_audit_logs(self.active_project.id)
+        self.activity_table.setRowCount(len(logs))
+        for row_idx, entry in enumerate(logs):
+            self.activity_table.setItem(row_idx, 0, QTableWidgetItem(entry.timestamp))
+            self.activity_table.setItem(row_idx, 1, QTableWidgetItem(entry.action))
+            self.activity_table.setItem(row_idx, 2, QTableWidgetItem(entry.actor))
+
+            sess_id = ""
+            details_str = entry.details
+            try:
+                d = json.loads(entry.details) if entry.details else {}
+                sess_id = d.get("session_id", "")
+                if "outcome" in d:
+                    details_str = f"[{d.get('outcome', '').upper()}] " + ", ".join(f"{k}={v}" for k, v in d.items() if k not in ("action_type", "session_id"))
+            except Exception:
+                pass
+
+            item_sess = QTableWidgetItem(sess_id)
+            item_det = QTableWidgetItem(details_str)
+            item_det.setData(Qt.UserRole, entry.details)
+            self.activity_table.setItem(row_idx, 3, item_sess)
+            self.activity_table.setItem(row_idx, 4, item_det)
+
+    # -----------------------------------------------------------------------
+    # Nmap Execution and Import Handlers
+    # -----------------------------------------------------------------------
+    def _on_profile_changed(self):
+        is_custom = self.profile_combo.currentData() == ScanProfile.CUSTOM
+        self.ports_input.setEnabled(is_custom)
+
+    def _start_scan(self):
+        if not self._ensure_active_project():
+            return
+
+        target = self.target_input.text().strip()
+        if not target:
+            QMessageBox.warning(self, "Input Error", "Please specify a target IP, CIDR, or hostname.")
+            return
+
+        # 1. Project Lifecycle Guard: Archived or Completed engagements cannot run active scans
+        if self.active_project.status in (ProjectStatus.ARCHIVED, ProjectStatus.COMPLETED):
+            status_name = self.active_project.status.value.replace("_", " ").title()
+            QMessageBox.critical(
+                self,
+                f"Engagement {status_name}",
+                f"Engagement '{self.active_project.name}' is currently in '{status_name}' status (read-only).\n\n"
+                "Scanning cannot be initiated on archived or completed engagements.\n\n"
+                "To conduct scans, please explicitly reactivate the engagement via the Projects workspace.",
+            )
+            self.erp_scan_status_label.setText(f"Status: Engagement is {status_name.lower()} (read-only).")
+            self.erp_progress_bar.setRange(0, 100)
+            self.erp_progress_bar.setValue(0)
+            return
+
+        # 2. Scope Exclusions Guard: Check if target is strictly EXCLUDED before any prompts
+        scopes = self.db.list_scopes(self.active_project.id)
+        for s in scopes:
+            if s.rule_type == ScopeRuleType.EXCLUDED:
+                scope_res = ScopeAuthorizationService.is_target_authorized(target, [s])
+                if not scope_res.is_allowed and "EXCLUDED" in scope_res.reason.upper():
+                    QMessageBox.critical(
+                        self,
+                        "Target Excluded from Scope",
+                        f"Target '{target}' is strictly EXCLUDED from assessment scope:\n\n{scope_res.reason}\n\n"
+                        "Scanning excluded targets is prohibited by Rules of Engagement.",
+                    )
+                    self.erp_scan_status_label.setText("Status: Target strictly excluded from scope.")
+                    self.erp_progress_bar.setRange(0, 100)
+                    self.erp_progress_bar.setValue(0)
+                    return
+
+        # 3. Project Activation Guard: Explicit confirmation required for non-active states
+        if self.active_project.status != ProjectStatus.ACTIVE:
+            status_name = self.active_project.status.value.replace("_", " ").title()
+            act_reply = QMessageBox.question(
+                self,
+                "Engagement Activation Required",
+                f"Engagement '{self.active_project.name}' is currently in '{status_name}' status.\n\n"
+                "Active engagement authorization is required before launching network probes.\n\n"
+                "Would you like to explicitly activate this engagement to ACTIVE status now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if act_reply == QMessageBox.StandardButton.Yes:
+                self.active_project.status = ProjectStatus.ACTIVE
+                self.db.update_project(self.active_project)
+                self.project_label.setText(f"Active Project: {self.active_project.name} (ID: {self.active_project.id})")
+            else:
+                self.status_label.setText("Status: Engagement activation declined.")
+                self.erp_scan_status_label.setText("Status: Engagement activation declined.")
+                self.erp_progress_bar.setRange(0, 100)
+                self.erp_progress_bar.setValue(0)
+                return
+
+        # 4. Target Authorization Guard: Fail-closed if target is not in authorized scopes
+        is_allowed, reason = ScopeAuthorizationService.is_target_authorized(
+            target, scopes, project=self.active_project
+        )
+        if not is_allowed:
+            reply = QMessageBox.question(
+                self,
+                "Scope Authorization Required",
+                f"Target '{target}' is not registered in active project scope '{self.active_project.name}'.\n\n"
+                f"Reason: {reason}\n\n"
+                f"Would you like to authorize '{target}' for penetration testing now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                is_cidr = "/" in target
+                target_type = TargetType.CIDR_RANGE if is_cidr else TargetType.IP_ADDRESS
+                self.db.add_scope(
+                    TargetScope(
+                        project_id=self.active_project.id,
+                        target=target,
+                        target_type=target_type,
+                        rule_type=ScopeRuleType.ALLOWED,
+                        is_authorized=True,
+                    )
+                )
+                scopes = self.db.list_scopes(self.active_project.id)
+                self._refresh_subnet_selector()
+                self._refresh_erp_dashboard()
+            else:
+                self.status_label.setText("Status: Scope authorization declined.")
+                self.erp_scan_status_label.setText("Status: Scope authorization declined.")
+                self.erp_progress_bar.setRange(0, 100)
+                self.erp_progress_bar.setValue(0)
+                return
+
+        profile = ScanProfile(self.profile_combo.currentData())
+        ports = self.ports_input.text().strip() if profile == ScanProfile.CUSTOM else None
+        skip_host_discovery = bool(getattr(self, "erp_pn_checkbox", None) and self.erp_pn_checkbox.isChecked())
+
+        # Explicit confirmation before scan
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Assessment Scan Execution",
+            f"Launch {profile.value.upper()} discovery scan against target:\n\n{target}\n\n"
+            f"Active Project: {self.active_project.name}\n"
+            f"Skip Ping (-Pn): {'Yes' if skip_host_discovery else 'No'}\n\n"
+            "Do you confirm that this target is authorized and within scope?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self.status_label.setText("Status: Scan cancelled by user.")
+            self.erp_scan_status_label.setText("Status: Scan cancelled by user.")
+            self.erp_progress_bar.setRange(0, 100)
+            self.erp_progress_bar.setValue(0)
+            return
+
+        options = NmapScanOptions(
+            target=target,
+            profile=profile,
+            ports=ports,
+            skip_host_discovery=skip_host_discovery,
+        )
+
+        session = self._get_or_create_session("nmap")
+        selected_asm_id = self._get_selected_assessment_id()
+        scan_project = self.active_project
+        project_id = scan_project.id
+        self._scan_project_id = project_id
+
+        self.scan_btn.setEnabled(False)
+        self.import_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText(f"Status: Scanning {target}...")
+        self.discovery_status_label.setText(f"Status: Scanning {target}...")
+        if hasattr(self, "erp_scan_status_label"):
+            self.erp_scan_status_label.setText(f"Status: Scanning {target}...")
+        if hasattr(self, "erp_progress_bar"):
+            self.erp_progress_bar.setRange(0, 0)
+
+        self.workflow.update_stage(WorkflowStage.STAGE_2_DISCOVERY, StageStatus.RUNNING)
+        self._refresh_workflow_tabs()
+
+        window = self.window()
+        if hasattr(window, "terminal_widget"):
+            try:
+                built_cmd = " ".join(self.adapter.build_command(options))
+                window.terminal_widget.append_output(
+                    f"\n[+] [Nmap Engine] Starting {profile.value} scan against '{target}' (SkipPing: {skip_host_discovery})...\n"
+                    f"[+] [Nmap Engine] Command: {built_cmd}\n",
+                    stream="system",
+                )
+            except Exception:
+                pass
+
+        def worker():
+            evidence_dir = Path(__file__).resolve().parents[2] / "storage" / "evidence"
+            try:
+                res = self.adapter.execute_scan(
+                    project_id=project_id,
+                    options=options,
+                    scopes=scopes,
+                    project=scan_project,
+                    on_output=lambda chunk, stream: self.signals.output_received.emit(chunk, stream),
+                    evidence_dir=evidence_dir,
+                    session_id=session.session_id,
+                    assessment_id=selected_asm_id,
+                )
+                try:
+                    self.signals.scan_completed.emit(res)
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                logger.exception("Nmap scan worker failed with unhandled exception: %s", exc)
+                err_exec = ToolExecution(
+                    project_id=project_id,
+                    tool_name="nmap",
+                    command=f"nmap {target}",
+                    status=ExecutionStatus.FAILED,
+                    exit_code=1,
+                    raw_output_path="",
+                )
+                fail_res = NmapExecutionResult(
+                    is_authorized=True,
+                    execution=err_exec,
+                    scan_result=None,
+                    findings=[],
+                    scope_reason=str(exc),
+                )
+                try:
+                    self.signals.scan_completed.emit(fail_res)
+                except RuntimeError:
+                    pass
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def _import_xml(self):
+        """Import externally generated Nmap XML scan file."""
+        if not self._ensure_active_project():
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import External Nmap XML Scan",
+            "",
+            "Nmap XML Files (*.xml);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        session = self._get_or_create_session("nmap_import")
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                xml_content = f.read()
+
+            scopes = self.db.list_scopes(self.active_project.id)
+            evidence_dir = Path(__file__).resolve().parents[2] / "storage" / "evidence"
+            selected_asm_id = self._get_selected_assessment_id()
+            res = self.adapter.import_nmap_xml(
+                project_id=self.active_project.id,
+                xml_content=xml_content,
+                scopes=scopes,
+                source_filename=Path(file_path).name,
+                evidence_dir=evidence_dir,
+                session_id=session.session_id,
+                assessment_id=selected_asm_id,
+            )
+            self._on_scan_completed(res)
+
+            if res.is_authorized:
+                QMessageBox.information(
+                    self,
+                    "Import Completed",
+                    f"External scan successfully imported.\n\n{res.scope_reason}\n"
+                    f"Discovered: {len(res.scan_result.hosts if res.scan_result else 0)} host(s)."
+                )
+        except Exception as exc:
+            logger.exception("Failed to import Nmap XML: %s", exc)
+            QMessageBox.critical(self, "Import Failed", f"Failed to import Nmap XML:\n\n{exc}")
+
+    def _cancel_scan(self):
+        self.adapter.runner.cancel()
+        self.status_label.setText("Status: Cancellation requested...")
+        self.discovery_status_label.setText("Status: Cancellation requested...")
+        self.cancel_btn.setEnabled(False)
+
+    @Slot(str, str)
+    def _on_output_received(self, chunk: str, stream: str):
+        window = self.window()
+        if hasattr(window, "terminal_widget"):
+            window.terminal_widget.append_output(chunk, stream)
+
+    @Slot(object)
+    def _on_scan_completed(self, result: NmapExecutionResult):
+        self.scan_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.current_execution_result = result
+
+        if (
+            self._scan_project_id is not None
+            and self.active_project
+            and self.active_project.id != self._scan_project_id
+        ):
+            self.status_label.setText(
+                f"Status: Scan saved to project #{self._scan_project_id}; select that project to view results."
+            )
+            self.discovery_status_label.setText(self.status_label.text())
+            return
+
+        if not result.is_authorized:
+            if self.current_session:
+                self.current_session.status = "blocked"
+                self.current_session.ended_at = _utc_now_iso()
+                self.db.update_assessment_session(self.current_session)
+            self._refresh_activity_log()
+            self._refresh_erp_dashboard()
+
+            self.status_label.setText("Status: Scope Check Blocked!")
+            self.discovery_status_label.setText("Status: Scope Check Blocked!")
+            if hasattr(self, "erp_scan_status_label"):
+                self.erp_scan_status_label.setText(f"Status: Scope Guard Blocked ({result.scope_reason})")
+            if hasattr(self, "erp_progress_bar"):
+                self.erp_progress_bar.setRange(0, 100)
+                self.erp_progress_bar.setValue(0)
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_2_DISCOVERY,
+                StageStatus.BLOCKED,
+                blocker_reason=result.scope_reason,
+            )
+            self._refresh_workflow_tabs()
+            QMessageBox.critical(
+                self,
+                "Unauthorized Target Scope",
+                f"Execution blocked by Scope Guard:\n\n{result.scope_reason}\n\n"
+                "Please add this target to the authorized project scopes first.",
+            )
+            return
+
+        status_text = "Completed"
+        if result.execution:
+            status_text = (
+                f"Finished ({result.execution.status.value}) in {result.execution.duration_seconds or 0}s"
+            )
+        self.status_label.setText(f"Status: {status_text}")
+        self.discovery_status_label.setText(f"Status: {status_text}")
+
+        if result.execution and result.execution.status != ExecutionStatus.COMPLETED:
+            execution_status = result.execution.status
+            self.status_label.setText(f"Status: Scan {execution_status.value}")
+            self.discovery_status_label.setText(f"Status: Scan {execution_status.value}")
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_2_DISCOVERY,
+                StageStatus.FAILED,
+                summary=f"Nmap execution {execution_status.value}.",
+            )
+            self._refresh_workflow_tabs()
+            if self.current_session:
+                self.current_session.status = execution_status.value
+                self.current_session.ended_at = _utc_now_iso()
+                self.db.update_assessment_session(self.current_session)
+            self._refresh_activity_log()
+            self._refresh_erp_dashboard()
+            if hasattr(self, "erp_progress_bar"):
+                self.erp_progress_bar.setRange(0, 100)
+                self.erp_progress_bar.setValue(0)
+            if hasattr(self, "erp_scan_status_label"):
+                self.erp_scan_status_label.setText(f"Status: Scan {execution_status.value}")
+            return
+
+        # 1. Populate Discovered Hosts Table (Zero-port & ping sweep visibility)
+        self.hosts_table.setRowCount(0)
+        self.results_table.setRowCount(0)
+
+        total_open_ports = 0
+        target_scanned = (
+            self.target_input.text().strip()
+            or (result.execution.command.split()[-1] if result.execution else "Target")
+        )
+
+        if result.scan_result and result.scan_result.hosts:
+            # Hosts Table
+            for row, host in enumerate(result.scan_result.hosts):
+                open_ports = [p for p in host.ports if p.state == "open"]
+                total_open_ports += len(open_ports)
+                f_count = sum(1 for f in result.findings if f.affected_asset == host.ip)
+
+                self.hosts_table.insertRow(row)
+                self.hosts_table.setItem(row, 0, QTableWidgetItem(host.ip))
+                self.hosts_table.setItem(row, 1, QTableWidgetItem(host.status.upper()))
+                self.hosts_table.setItem(row, 2, QTableWidgetItem(host.hostname or "None"))
+                self.hosts_table.setItem(row, 3, QTableWidgetItem(host.os_summary))
+
+                mac_text = host.mac_address or "Unknown"
+                if host.vendor:
+                    mac_text += f" ({host.vendor})"
+                self.hosts_table.setItem(row, 4, QTableWidgetItem(mac_text))
+                self.hosts_table.setItem(row, 5, QTableWidgetItem(str(len(open_ports))))
+                self.hosts_table.setItem(row, 6, QTableWidgetItem(str(host.latency_ms) if host.latency_ms is not None else "-"))
+                self.hosts_table.setItem(row, 7, QTableWidgetItem(str(f_count)))
+
+            # Services Table
+            svc_row = 0
+            for host in result.scan_result.hosts:
+                if host.ports:
+                    for port in host.ports:
+                        self.results_table.insertRow(svc_row)
+                        self.results_table.setItem(svc_row, 0, QTableWidgetItem(host.ip))
+                        self.results_table.setItem(svc_row, 1, QTableWidgetItem(str(port.port_id)))
+                        self.results_table.setItem(svc_row, 2, QTableWidgetItem(port.protocol))
+                        self.results_table.setItem(svc_row, 3, QTableWidgetItem(port.state))
+                        self.results_table.setItem(svc_row, 4, QTableWidgetItem(port.service_name or "-"))
+                        self.results_table.setItem(svc_row, 5, QTableWidgetItem(port.service_summary or "-"))
+                        cpe_str = ", ".join(port.cpe_list) if port.cpe_list else "-"
+                        self.results_table.setItem(svc_row, 6, QTableWidgetItem(cpe_str))
+                        svc_row += 1
+                else:
+                    self.results_table.insertRow(svc_row)
+                    self.results_table.setItem(svc_row, 0, QTableWidgetItem(host.ip))
+                    self.results_table.setItem(svc_row, 1, QTableWidgetItem("-"))
+                    self.results_table.setItem(svc_row, 2, QTableWidgetItem("-"))
+                    self.results_table.setItem(svc_row, 3, QTableWidgetItem(host.status))
+                    self.results_table.setItem(svc_row, 4, QTableWidgetItem("Ping Sweep / No Port Scan"))
+                    self.results_table.setItem(svc_row, 5, QTableWidgetItem("Host is alive; 0 port records returned"))
+                    self.results_table.setItem(svc_row, 6, QTableWidgetItem("-"))
+                    svc_row += 1
+
+            # 2. Update Interactive Network Topology Map
+            self.map_view.load_scan(result.scan_result, result.findings)
+
+            # 2.5 Sync discovered scan assets with AssetInventoryService (Phase 2 Integration)
+            if self.active_project and result.scan_result and result.is_authorized:
+                try:
+                    scopes = self.db.list_scopes(self.active_project.id)
+                    session_id = self.current_session.session_id if self.current_session else None
+                    evidence_id = result.evidence.id if getattr(result, "evidence", None) else None
+                    self.asset_service.sync_scan_assets(
+                        project_id=self.active_project.id,
+                        scan_result=result.scan_result,
+                        scopes=scopes,
+                        session_id=session_id,
+                        source_tool="nmap",
+                        evidence_id=evidence_id,
+                    )
+                    self.map_view.load_discovered_assets(self.db, self.active_project.id)
+                    window = self.window()
+                    if hasattr(window, "topology_view") and hasattr(window.topology_view, "load_discovered_assets"):
+                        try:
+                            window.topology_view.load_discovered_assets(self.db, self.active_project.id)
+                        except Exception as exc:
+                            logger.debug("Failed syncing window topology_view: %s", exc)
+                except Exception as exc:
+                    logger.warning("Failed to sync scan assets to inventory: %s", exc)
+        elif result.scan_result and not result.scan_result.hosts:
+            # Target was scanned but returned 0 live hosts (offline or dropping ICMP ping)
+            row = 0
+            self.hosts_table.insertRow(row)
+            self.hosts_table.setItem(row, 0, QTableWidgetItem(target_scanned))
+            self.hosts_table.setItem(row, 1, QTableWidgetItem("DOWN (0 replied)"))
+            self.hosts_table.setItem(row, 2, QTableWidgetItem("None"))
+            self.hosts_table.setItem(row, 3, QTableWidgetItem("Target offline or dropping ping probes"))
+            self.hosts_table.setItem(row, 4, QTableWidgetItem("—"))
+            self.hosts_table.setItem(row, 5, QTableWidgetItem("0"))
+            self.hosts_table.setItem(row, 6, QTableWidgetItem("-"))
+            self.hosts_table.setItem(row, 7, QTableWidgetItem("0"))
+
+        # 3. Update Raw Output Tab
+        if result.scan_result:
+            discovered_hosts_count = len(result.scan_result.hosts) if result.scan_result.hosts else 0
+            raw_text = (
+                f"=== Nmap Execution Telemetry ===\n"
+                f"Command: {result.execution.command if result.execution else 'Imported XML'}\n"
+                f"Status: {result.execution.status.value if result.execution else 'Completed'}\n"
+                f"Duration: {(result.execution.duration_seconds or 0) if result.execution else 0}s\n"
+                f"Discovered Hosts: {discovered_hosts_count}\n\n"
+                f"=== Raw XML Output ===\n"
+                f"{result.scan_result.raw_xml[:10000]}"
+            )
+            if len(result.scan_result.raw_xml) > 10000:
+                raw_text += f"\n... [Truncated, full size: {len(result.scan_result.raw_xml)} bytes]"
+            self.raw_output_text.setPlainText(raw_text)
+
+        # Update Workflow Stepper for Discovery, Fingerprinting, and Findings
+        host_count = len(result.scan_result.hosts) if result.scan_result else 0
+        finding_count = len(result.findings)
+        self.workflow.update_stage(
+            WorkflowStage.STAGE_2_DISCOVERY,
+            StageStatus.COMPLETED,
+            summary=f"Discovered {host_count} active host(s).",
+            count=host_count,
+        )
+        self.workflow.update_stage(
+            WorkflowStage.STAGE_3_FINGERPRINTING,
+            StageStatus.COMPLETED,
+            summary=f"Fingerprinted {total_open_ports} open port(s).",
+            count=total_open_ports,
+        )
+        if finding_count > 0:
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_4_VULNERABILITY,
+                StageStatus.NEEDS_REVIEW,
+                summary=f"Identified {finding_count} candidate observation(s).",
+                count=finding_count,
+            )
+        self._refresh_workflow_tabs()
+        self._refresh_vuln_table()
+
+        # Update Step 6 summary
+        self.report_summary_text.setText(
+            f"<b>Engagement:</b> {self.active_project.name if self.active_project else 'None'}<br>"
+            f"• Discovered Hosts: <b>{host_count}</b><br>"
+            f"• Open Ports / Services: <b>{total_open_ports}</b><br>"
+            f"• Security Observations: <b>{finding_count}</b>"
+        )
+
+        if self.current_session:
+            self.current_session.status = "completed"
+            self.current_session.ended_at = _utc_now_iso()
+            self.db.update_assessment_session(self.current_session)
+        self._refresh_activity_log()
+        self._refresh_erp_dashboard()
+        if hasattr(self, "erp_progress_bar"):
+            self.erp_progress_bar.setRange(0, 100)
+            self.erp_progress_bar.setValue(100)
+        if hasattr(self, "erp_scan_status_label"):
+            if host_count == 0:
+                self.erp_scan_status_label.setText(
+                    f"Status: Scan Finished (0 hosts up) — Target '{target_scanned}' is offline or dropping ping. Try 'Skip Ping (-Pn)'."
+                )
+            else:
+                self.erp_scan_status_label.setText(f"Status: Scan {status_text} — {host_count} host(s) discovered")
+
+        window = self.window()
+        if hasattr(window, "terminal_widget"):
+            if host_count == 0:
+                window.terminal_widget.append_output(
+                    f"\n[*] [Nmap Engine] Finished in {(result.execution.duration_seconds or 0) if result.execution else 0}s. 0 hosts responded to ping.\n"
+                    f"[*] [Nmap Engine] Note: Target '{target_scanned}' may have a firewall dropping ICMP echo requests. Check 'Skip Ping (-Pn)' to scan TCP ports directly.\n",
+                    stream="system",
+                )
+            else:
+                window.terminal_widget.append_output(
+                    f"\n[+] [Nmap Engine] Scan completed successfully in {(result.execution.duration_seconds or 0) if result.execution else 0}s. Discovered {host_count} host(s) and {total_open_ports} open port(s).\n",
+                    stream="success",
+                )
+
+        # Notify Findings View
+        window = self.window()
+        if hasattr(window, "findings_view") and self.active_project:
+            window.findings_view.load_findings(self.active_project.id)
+
+        # Emit scan completion signals for live Network Map sync
+        self.scan_completed.emit(result)
+        if self.active_project:
+            self.assets_updated.emit(self.active_project.id)
+
+    # -----------------------------------------------------------------------
+    # Step 5 Lab Scenario Verification Handlers
+    # -----------------------------------------------------------------------
+    def _on_lab_scenario_changed(self):
+        lab_id = self.lab_combo.currentData()
+        lab = self.workflow.get_cpent_lab(lab_id)
+        if not lab:
+            return
+
+        prereqs = "<br>• " + "<br>• ".join(lab.prerequisites)
+        objs = "<br>• " + "<br>• ".join(lab.learning_objectives)
+        steps = "<br>• " + "<br>• ".join(lab.verification_steps)
+        scoring = "<br>• " + "<br>• ".join(lab.scoring_criteria)
+        ranges = ", ".join(lab.target_ranges)
+
+        text = (
+            f"<b>Module:</b> {lab.module} | <b>Difficulty:</b> {lab.difficulty} | <b>Target Ranges:</b> <code>{ranges}</code><br><br>"
+            f"<b>Description:</b> {lab.description}<br><br>"
+            f"<b>Prerequisites:</b>{prereqs}<br><br>"
+            f"<b>Learning Objectives:</b>{objs}<br><br>"
+            f"<b>Verification Protocol:</b>{steps}<br><br>"
+            f"<b>Scoring Breakdown:</b>{scoring}<br><br>"
+            f"<b>Cleanup & Reset:</b> {lab.cleanup_procedure}<br>"
+            f"<span style='color: {CPENTTheme.WARNING_AMBER};'><b>Safety Protocol:</b> {lab.safety_warning}</span>"
+        )
+        self.lab_details_text.setText(text)
+
+    def _verify_lab_scope(self):
+        """Verifies if the selected lab scenario's target ranges are authorized under active scope."""
+        if not self._ensure_active_project():
+            return
+
+        lab_id = self.lab_combo.currentData()
+        lab = self.workflow.get_cpent_lab(lab_id)
+        if not lab:
+            return
+
+        scopes = self.db.list_scopes(self.active_project.id)
+        allowed = []
+        blocked = []
+
+        for rng in lab.target_ranges:
+            res = ScopeAuthorizationService.is_target_authorized(rng, scopes, self.active_project)
+            if res.is_allowed:
+                allowed.append(rng)
+            else:
+                blocked.append(f"{rng} ({res.reason})")
+
+        if blocked and not allowed:
+            reply = QMessageBox.question(
+                self,
+                "Authorize Lab Targets",
+                f"CPENT Lab '{lab.title}' targets are not registered in the active project scope:\n\n"
+                f"Targets:\n" + "\n".join(lab.target_ranges) + "\n\n"
+                "Would you like to authorize these lab subnets in the project scope now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                for rng in lab.target_ranges:
+                    is_cidr = "/" in rng
+                    target_type = TargetType.CIDR_RANGE if is_cidr else TargetType.IP_ADDRESS
+                    self.db.add_scope(
+                        TargetScope(
+                            project_id=self.active_project.id,
+                            target=rng,
+                            target_type=target_type,
+                            rule_type=ScopeRuleType.ALLOWED,
+                            is_authorized=True,
+                        )
+                    )
+                self._refresh_subnet_selector()
+                QMessageBox.information(
+                    self,
+                    "Lab Scope Authorized",
+                    f"Lab targets for '{lab.title}' have been added to active project scope."
+                )
+                return
+            else:
+                return
+        elif blocked and allowed:
+            QMessageBox.warning(
+                self,
+                "Partial Lab Scope Authorization",
+                f"Authorized Ranges:\n" + "\n".join(allowed) + "\n\n"
+                f"Blocked Ranges:\n" + "\n".join(blocked)
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Lab Scope Preflight Passed",
+                f"All lab targets for '{lab.title}' are authorized under active project scope:\n\n"
+                + "\n".join(allowed) + "\n\n"
+                "Prerequisites verified. Safe non-destructive testing may proceed."
+            )
+
+    def _refresh_step5_findings_table(self):
+        """Populates Step 5 candidates table with findings requiring verification."""
+        if not hasattr(self, "step5_findings_table"):
+            return
+        if not self.active_project:
+            self.step5_findings_table.setRowCount(0)
+            return
+
+        findings = self.db.list_findings(self.active_project.id)
+        self.step5_findings_table.setRowCount(0)
+
+        for row, f in enumerate(findings):
+            self.step5_findings_table.insertRow(row)
+            self.step5_findings_table.setItem(row, 0, QTableWidgetItem(f"#{f.id}"))
+            self.step5_findings_table.setItem(row, 1, QTableWidgetItem(f.severity.value.upper() if hasattr(f.severity, "value") else str(f.severity)))
+            self.step5_findings_table.setItem(row, 2, QTableWidgetItem(f"{f.cvss_score:.1f}" if f.cvss_score else "—"))
+            self.step5_findings_table.setItem(row, 3, QTableWidgetItem(f.title))
+            self.step5_findings_table.setItem(row, 4, QTableWidgetItem(f.affected_asset))
+
+            st_val = f.validation_status.value.upper() if hasattr(f.validation_status, "value") else str(f.validation_status).upper()
+            status_item = QTableWidgetItem(st_val)
+            if st_val in ("CONFIRMED", "VERIFIED"):
+                status_item.setForeground(QColor("#22c55e"))
+            elif st_val == "FALSE_POSITIVE":
+                status_item.setForeground(QColor("#64748b"))
+            else:
+                status_item.setForeground(QColor("#f59e0b"))
+            self.step5_findings_table.setItem(row, 5, status_item)
+            self.step5_findings_table.setItem(row, 6, QTableWidgetItem(f.validation_method or "Pending Verification"))
+
+    def _refresh_reporting_summary(self):
+        """Computes and updates engagement readiness metrics for Step 6."""
+        if not hasattr(self, "report_summary_text"):
+            return
+        if not self.active_project:
+            self.report_summary_text.setText("Select an active project to view engagement status.")
+            return
+
+        proj_id = self.active_project.id
+        scopes = self.db.list_scopes(proj_id)
+        nodes = self.db.list_asset_nodes(proj_id)
+        findings = self.db.list_findings(proj_id)
+        evidence = self.db.list_evidence(proj_id)
+
+        observed_cnt = sum(1 for f in findings if f.validation_status in (ValidationStatus.OBSERVED, ValidationStatus.NEEDS_VALIDATION))
+        verified_cnt = sum(1 for f in findings if f.validation_status == ValidationStatus.CONFIRMED)
+        fp_cnt = sum(1 for f in findings if f.validation_status == ValidationStatus.FALSE_POSITIVE)
+
+        total_ports = 0
+        for n in nodes:
+            if n.metadata_json:
+                try:
+                    meta = json.loads(n.metadata_json)
+                    total_ports += len(meta.get("ports", []))
+                except Exception:
+                    pass
+
+        status_color = "#22c55e" if (verified_cnt > 0 or len(nodes) > 0) else "#f59e0b"
+        status_text = "READY FOR REPORTING" if (len(nodes) > 0 and (verified_cnt > 0 or len(findings) > 0)) else "DISCOVERY IN PROGRESS"
+
+        summary_html = (
+            f"<b>Active Engagement:</b> {self.active_project.name} (Client: {self.active_project.client_name or 'Internal Scope'})<br>"
+            f"<b>Readiness:</b> <span style='color: {status_color}; font-weight: bold;'>{status_text}</span><br><br>"
+            f"• Authorized Target Scopes: <b>{len(scopes)}</b> target range(s)<br>"
+            f"• Inventory Assets Discovered: <b>{len(nodes)}</b> host(s) / node(s)<br>"
+            f"• Network Services Fingerprinted: <b>{total_ports}</b> service port(s)<br>"
+            f"• Security Observations (OBSERVED): <b>{observed_cnt}</b> candidate observation(s)<br>"
+            f"• Controlled Exploit Proofs (CONFIRMED): <b>{verified_cnt}</b> verified finding(s)<br>"
+            f"• False Positives Filtered: <b>{fp_cnt}</b> observation(s)<br>"
+            f"• Tamper-Evident Evidence Vault: <b>{len(evidence)}</b> SHA-256 cryptographic artifact(s)"
+        )
+        self.report_summary_text.setText(summary_html)
+
+    def _launch_exam_simulator(self):
+        """Switches to 24-Hour CPENT Exam Simulator tab in CPENTLabsView."""
+        window = self.window()
+        if hasattr(window, "sidebar_nav"):
+            window.sidebar_nav.select_item("exploit_lab")
+        elif hasattr(window, "view_stack") and hasattr(window, "btn_cpent_labs"):
+            window.view_stack.setCurrentIndex(3)
+            window.btn_cpent_labs.setChecked(True)
+            if hasattr(window, "cpent_view") and hasattr(window.cpent_view, "tabs"):
+                window.cpent_view.tabs.setCurrentIndex(5)
+
+    def _export_cpent_engagement_pack(self):
+        """Generates and exports the standardized CPENT Master Engagement Pack zip archive."""
+        if not self._ensure_active_project():
+            return
+
+        try:
+            generator = CPENTEngagementPackGenerator(self.db)
+            out_dir = Path("storage/reports")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            pack_name = f"CPENT_PACK_Project_{self.active_project.id}.zip"
+            target_zip = out_dir / pack_name
+            out_zip = generator.generate_pack_zip(self.active_project.id, target_zip)
+
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_6_REPORTING,
+                StageStatus.COMPLETED,
+                summary=f"CPENT Master Engagement Pack exported: {out_zip.name}",
+            )
+            self._refresh_workflow_tabs()
+            QMessageBox.information(
+                self,
+                "CPENT Pack Exported",
+                f"Successfully compiled official CPENT Master Engagement Pack:\n\n{out_zip.resolve()}\n\n"
+                f"Includes complete administrative structure, evidence manifest, and multi-format reports.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Failed to generate CPENT Engagement Pack:\n{exc}")
+
+    def _verify_selected_finding(self):
+        """Controlled verification workflow with explicit confirmation and non-destructive proof."""
+        if not self.active_project:
+            return
+
+        selected_finding: Optional[Finding] = None
+        if hasattr(self, "step5_findings_table"):
+            row = self.step5_findings_table.currentRow()
+            if row >= 0:
+                item = self.step5_findings_table.item(row, 0)
+                if item and item.text().startswith("#"):
+                    try:
+                        fid = int(item.text().lstrip("#"))
+                        selected_finding = self.db.get_finding(fid, project_id=self.active_project.id)
+                    except Exception:
+                        selected_finding = None
+
+        if not selected_finding:
+            findings = self.db.list_findings(self.active_project.id)
+            observed = [f for f in findings if f.validation_status in (ValidationStatus.OBSERVED, ValidationStatus.NEEDS_VALIDATION)]
+            if not observed:
+                QMessageBox.information(
+                    self,
+                    "Verification Notice",
+                    "No observed or unvalidated findings available for controlled verification."
+                )
+                return
+            selected_finding = observed[0]
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Controlled Verification",
+            f"Are you authorized to verify candidate observation:\n\n"
+            f"'{selected_finding.title}' on {selected_finding.affected_asset}?\n\n"
+            "Safety Protocol:\n"
+            "1. Non-destructive service probing will be performed.\n"
+            "2. Destructive or intrusive exploit payloads are blocked.\n"
+            "3. Tamper-evident evidence will be recorded with SHA-256 digest.\n\n"
+            "Proceed with controlled verification?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        verifier = VulnerabilityVerifier(self.db)
+        scopes = self.db.list_scopes(self.active_project.id)
+        res = verifier.verify_finding(selected_finding, self.active_project, scopes)
+
+        if res.is_verified:
+            self.workflow.update_stage(
+                WorkflowStage.STAGE_5_EXPLOITATION,
+                StageStatus.COMPLETED,
+                summary=f"Verified finding #{selected_finding.id} via non-destructive probe.",
+                count=1,
+            )
+            self._refresh_workflow_tabs()
+            self._refresh_vuln_table()
+            self._refresh_step5_findings_table()
+            self._refresh_reporting_summary()
+
+            ev_name = res.evidence_file.name if res.evidence_file else "evidence_transcript.txt"
+            QMessageBox.information(
+                self,
+                "Verification Success & Proof Created",
+                f"Finding #{selected_finding.id} status updated to CONFIRMED.\n\n"
+                f"SHA-256 Proof Digest:\n{res.sha256_hash}\n\n"
+                f"Evidence logged in Audit Vault:\n{ev_name}"
+            )
+            window = self.window()
+            if hasattr(window, "findings_view"):
+                window.findings_view.load_findings(self.active_project.id)
+        else:
+            QMessageBox.warning(
+                self,
+                "Verification Inconclusive",
+                f"Controlled verification probe did not confirm vulnerability:\n\n{res.error_message}"
+            )
+
+    def _mark_false_positive(self):
+        if not self.active_project:
+            return
+
+        selected_finding: Optional[Finding] = None
+        if hasattr(self, "step5_findings_table"):
+            row = self.step5_findings_table.currentRow()
+            if row >= 0:
+                item = self.step5_findings_table.item(row, 0)
+                if item and item.text().startswith("#"):
+                    try:
+                        fid = int(item.text().lstrip("#"))
+                        selected_finding = self.db.get_finding(fid, project_id=self.active_project.id)
+                    except Exception:
+                        selected_finding = None
+
+        if not selected_finding:
+            findings = self.db.list_findings(self.active_project.id)
+            if not findings:
+                return
+            selected_finding = findings[0]
+
+        selected_finding.validation_status = ValidationStatus.FALSE_POSITIVE
+        self.db.update_finding(selected_finding)
+        self._refresh_vuln_table()
+        self._refresh_step5_findings_table()
+        self._refresh_reporting_summary()
+
+        QMessageBox.information(self, "Updated", f"Finding '{selected_finding.title}' marked as FALSE_POSITIVE.")
+        window = self.window()
+        if hasattr(window, "findings_view"):
+            window.findings_view.load_findings(self.active_project.id)
+
+    def _show_asset_history_dialog(self):
+        if not self.active_project:
+            QMessageBox.information(self, "No Project", "Please select an active project first.")
+            return
+
+        selected_rows = self.hosts_table.selectionModel().selectedRows()
+        if selected_rows:
+            row = selected_rows[0].row()
+        else:
+            row = self.hosts_table.currentRow()
+
+        if row < 0 or row >= self.hosts_table.rowCount():
+            QMessageBox.information(
+                self,
+                "Select Asset",
+                "Please select an asset from the Discovered Hosts table to view its history."
+            )
+            return
+
+        ip_item = self.hosts_table.item(row, 0)
+        if not ip_item or not ip_item.text().strip():
+            return
+        target_ip = ip_item.text().strip()
+
+        nodes = self.db.list_asset_nodes(self.active_project.id)
+        matched_node = next((n for n in nodes if n.value == target_ip or (n.label and n.label == target_ip)), None)
+        if not matched_node:
+            QMessageBox.information(
+                self,
+                "Asset History",
+                f"No persistent inventory node found for target: {target_ip}.\n"
+                "Run a discovery scan or import scan results to establish inventory provenance."
+            )
+            return
+
+        history = self.asset_service.get_asset_history(self.active_project.id, matched_node.id)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Asset History & Observations — {matched_node.value}")
+        dialog.resize(750, 480)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        info_group = QGroupBox("Asset Inventory Details")
+        info_layout = QFormLayout(info_group)
+        info_layout.addRow("Normalized Identifier:", QLabel(f"<b>{matched_node.value}</b> ({matched_node.node_type})"))
+        info_layout.addRow("Label / Hostname:", QLabel(matched_node.label or "None"))
+        info_layout.addRow("Discovery Source:", QLabel(matched_node.source_tool or "nmap"))
+        info_layout.addRow("Inventory Node ID:", QLabel(str(matched_node.id)))
+        layout.addWidget(info_group)
+
+        obs_label = QLabel(f"<b>Historical Observations Timeline ({len(history)} recorded observation(s)):</b>")
+        layout.addWidget(obs_label)
+
+        obs_table = QTableWidget()
+        obs_table.setColumnCount(5)
+        obs_table.setHorizontalHeaderLabels(["ID", "Timestamp", "Tool / Method", "Confidence", "Observation Summary"])
+        obs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        obs_table.setRowCount(len(history))
+
+        for idx, obs in enumerate(history):
+            obs_table.setItem(idx, 0, QTableWidgetItem(str(obs.id or "-")))
+            obs_table.setItem(idx, 1, QTableWidgetItem(obs.created_at[:19] if obs.created_at else "-"))
+            method_str = f"{obs.source_tool} ({obs.method})" if obs.method else obs.source_tool
+            obs_table.setItem(idx, 2, QTableWidgetItem(method_str))
+            obs_table.setItem(idx, 3, QTableWidgetItem(f"{int(obs.confidence * 100)}%"))
+            obs_table.setItem(idx, 4, QTableWidgetItem(obs.title))
+
+        layout.addWidget(obs_table)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dialog.accept)
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+        dialog.exec()

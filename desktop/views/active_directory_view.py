@@ -1,0 +1,95 @@
+"""Active Directory Assessment & Exploitation Workspace.
+
+Provides dedicated operational testing capabilities for enterprise Active Directory environments:
+1. Weak Password Auditor: KnowBe4-standard account policy analysis, donut charts, and finding synchronization.
+2. Exploit & Attack Playbooks: Kerberoasting, AS-REP Roasting, BloodHound enumeration, DCSync, Pass-the-Hash,
+   and ProxyChains-compatible pivot execution.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from desktop.widgets.ad_ldap_enumerator_widget import ADLDAPLiveEnumeratorWidget
+from desktop.widgets.ad_password_auditor_widget import ADPasswordAuditorWidget
+from desktop.widgets.ad_playbook_widget import ADPlaybookWidget
+from storage.db import Database
+from storage.models import Project
+
+
+class ActiveDirectoryView(QWidget):
+    """Dedicated Active Directory Assessment workspace."""
+
+    command_to_shell_requested = Signal(str)
+    project_data_updated = Signal()
+
+    def __init__(self, db: Optional[Database] = None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.db = db
+        self.active_project: Optional[Project] = None
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # Header Banner
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("Active Directory Penetration Testing & Credential Auditor")
+        title.setObjectName("viewHeader")
+        subtitle = QLabel("Enterprise domain reconnaissance, Kerberos exploitation, weak password audits, and privilege escalation.")
+        subtitle.setObjectName("viewSubtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box)
+        header.addStretch()
+
+        self.project_badge = QLabel("Active Project: None")
+        self.project_badge.setStyleSheet("font-size: 11px; padding: 4px 10px; background: rgba(38,128,255,0.15); border: 1px solid #0284c7; border-radius: 4px; color: #38bdf8;")
+        header.addWidget(self.project_badge)
+        layout.addLayout(header)
+
+        # Tabs: Live LDAP Enumeration, Weak Password Auditor & Exploit Playbooks
+        self.tabs = QTabWidget()
+        self.tab_ldap = ADLDAPLiveEnumeratorWidget(db=self.db)
+        self.tab_auditor = ADPasswordAuditorWidget(db=self.db)
+        self.tab_playbooks = ADPlaybookWidget(db=self.db)
+
+        # Relay shell requests and data update signals
+        if hasattr(self.tab_playbooks, "command_to_shell_requested"):
+            self.tab_playbooks.command_to_shell_requested.connect(self.command_to_shell_requested.emit)
+        if hasattr(self.tab_ldap, "project_data_updated"):
+            self.tab_ldap.project_data_updated.connect(self.project_data_updated.emit)
+
+        self.tabs.addTab(self.tab_ldap, "🔍 Live LDAP / Active Directory Enumerator")
+        self.tabs.addTab(self.tab_auditor, "🏢 Weak Password Auditor (KnowBe4 Style)")
+        self.tabs.addTab(self.tab_playbooks, "⚔️ Exploit & Attack Playbooks")
+
+        layout.addWidget(self.tabs, 1)
+
+    def set_active_project(self, project: Optional[Project]):
+        self.active_project = project
+        if project:
+            self.project_badge.setText(f"Active Project: {project.name} (ID: {project.id})")
+        else:
+            self.project_badge.setText("Active Project: None")
+
+        if hasattr(self.tab_ldap, "set_active_project"):
+            self.tab_ldap.set_active_project(project)
+        if hasattr(self.tab_auditor, "set_active_project"):
+            self.tab_auditor.set_active_project(project)
+        if hasattr(self.tab_playbooks, "set_active_project"):
+            self.tab_playbooks.set_active_project(project)
+

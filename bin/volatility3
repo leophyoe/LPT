@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""CyberSecuritySuite standalone wrapper for Volatility 3."""
+import os
+import sys
+from pathlib import Path
+import runpy
+
+ROOT = Path(__file__).resolve().parent.parent
+VOL_DIR = ROOT / "source" / "system" / "volatility3"
+TARGET = VOL_DIR / "vol.py"
+
+if not TARGET.exists():
+    sys.stderr.write(f"[-] Error: vol.py not found at {TARGET}\n")
+    sys.exit(127)
+
+sys.path.insert(0, str(VOL_DIR))
+sys.argv = [str(TARGET)] + sys.argv[1:]
+
+try:
+    runpy.run_path(str(TARGET), run_name="__main__")
+except SystemExit as exc:
+    sys.exit(exc.code)

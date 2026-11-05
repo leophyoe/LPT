@@ -1,0 +1,88 @@
+1
+00:00:00,840 --> 00:00:06,000
+Hello everyone my name is Sam and I will be your instructor during this course.
+
+2
+00:00:06,000 --> 00:00:12,090
+I have seven years experience an offensive and defensive security and I'm a certified Russian pistol
+
+3
+00:00:12,210 --> 00:00:20,930
+from Sun's nowadays security solutions like firewall's IP s and sandboxing are becoming more and more
+
+4
+00:00:20,930 --> 00:00:25,730
+advanced to prevent and detect cyber attacks.
+
+5
+00:00:25,740 --> 00:00:32,940
+So being an advanced hacker requires you to code your own script and tools to bypass the security solutions
+
+6
+00:00:33,120 --> 00:00:35,670
+before jumping into course details.
+
+7
+00:00:35,970 --> 00:00:40,830
+Let's talk about the problem with the most online hacking courses.
+
+8
+00:00:40,890 --> 00:00:48,870
+Now most of them assume that your target is running a legacy unpatched Windows XP where anti-virus is
+
+9
+00:00:48,870 --> 00:00:58,230
+disabled firewall is turned off and IP s maybe is not any place and after all you may or may not hack
+
+10
+00:00:58,260 --> 00:01:00,190
+into their systems.
+
+11
+00:01:00,270 --> 00:01:06,190
+Now we both know that this is definitely not the area where penetration testing.
+
+12
+00:01:06,440 --> 00:01:13,580
+Well if you are an ethical hacker who get bored from theory and basic courses which repeat the same
+
+13
+00:01:13,580 --> 00:01:21,030
+tools and techniques over and over again then you have come to the right place in this best selling
+
+14
+00:01:21,030 --> 00:01:28,690
+course you will learn how to code your own refastened and also make an anonymous shell.
+
+15
+00:01:28,910 --> 00:01:35,270
+Also you will learn how to hack passwords and how to perform privilege escalation on Windows.
+
+16
+00:01:35,450 --> 00:01:39,670
+Since the course is completely hands on real war scenarios.
+
+17
+00:01:39,830 --> 00:01:45,610
+So you will learn how to set up your own hacking enviroment in virtual box.
+
+18
+00:01:45,630 --> 00:01:50,660
+Finally you're going to challenge yourself with entresol exercises.
+
+19
+00:01:50,660 --> 00:01:57,350
+If that sounds interesting please take your time to view the video samples and let me know if you got
+
+20
+00:01:57,380 --> 00:01:59,900
+any questions in my courses.
+
+21
+00:01:59,900 --> 00:02:02,980
+You will never see an answer to the question.
+
+22
+00:02:03,020 --> 00:02:05,660
+Thanks for your time and I hope you are going to join me.
+

@@ -1,0 +1,533 @@
+"""VS Code-like Interactive PTY Terminal Widget for CyberSecuritySuite.
+
+Uses xterm.js inside QWebEngineView connected to a real Linux Pseudo-Terminal (PTY)
+via local loopback WebSocket server. Provides full ANSI color support, tab completion,
+interactive cursor navigation, and full-screen TUI support (nano, htop, msfconsole).
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import pty
+import struct
+import subprocess
+import termios
+import threading
+from pathlib import Path
+from typing import Optional
+
+# Ensure Chromium WebEngine initializes cleanly without sandbox issues in Linux container/desktop
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
+
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtNetwork import QHostAddress
+from PySide6.QtWebSockets import QWebSocket, QWebSocketServer
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from desktop.theme import CPENTTheme
+from storage.db import Database
+from storage.models import Project
+from terminal.recorder import TerminalSessionRecorder, strip_ansi
+
+
+class PTYSignals(QObject):
+    data_received = Signal(str)
+    process_exited = Signal(int)
+
+
+class VSCodeTerminal(QWidget):
+    """Real interactive pseudo-terminal running xterm.js over a Linux PTY."""
+
+    project_data_updated = Signal()
+
+    def __init__(self, cwd: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd or os.getcwd()
+        self.master_fd: Optional[int] = None
+        self.process: Optional[subprocess.Popen] = None
+        self._closed: bool = False
+        self._reader_thread: Optional[threading.Thread] = None
+
+        self.client_socket: Optional[QWebSocket] = None
+        self.server: Optional[QWebSocketServer] = None
+        self.signals = PTYSignals()
+        self.signals.data_received.connect(self._on_pty_data)
+
+        self.active_project: Optional[Project] = None
+        self.db: Optional[Database] = None
+        self.recorder = TerminalSessionRecorder()
+        self._terminal_buffer: List[str] = []
+        self._current_input_line: str = ""
+        self._recent_commands: List[str] = []
+
+        self._init_server()
+        self._init_pty()
+        self._init_ui()
+
+    def _init_server(self):
+        """Starts a local loopback WebSocket server for xterm.js bridge."""
+        self.server = QWebSocketServer(
+            "CyberSecuritySuiteTerminalBridge",
+            QWebSocketServer.SslMode.NonSecureMode,
+            self,
+        )
+        self.server.listen(QHostAddress.SpecialAddress.LocalHost, 0)
+        self.server.newConnection.connect(self._on_client_connected)
+
+    def _init_pty(self):
+        """Spawns an interactive login shell inside a Linux pseudo-terminal."""
+        self.master_fd, slave_fd = pty.openpty()
+
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+
+        shell_bin = os.environ.get("SHELL", "/bin/bash")
+
+        self.process = subprocess.Popen(
+            [shell_bin],
+            preexec_fn=os.setsid,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            cwd=self.cwd,
+            env=env,
+        )
+        os.close(slave_fd)
+
+        def pty_reader():
+            while not self._closed and self.master_fd is not None:
+                try:
+                    fd = self.master_fd
+                    if fd is None or self._closed:
+                        break
+                    data = os.read(fd, 4096)
+                    if not data or self._closed:
+                        break
+                    text = data.decode("utf-8", errors="replace")
+                    if not self._closed and hasattr(self, "signals") and self.signals is not None:
+                        try:
+                            self.signals.data_received.emit(text)
+                        except (RuntimeError, AttributeError):
+                            break
+                except (OSError, ValueError):
+                    break
+
+        self._reader_thread = threading.Thread(target=pty_reader, daemon=True)
+        self._reader_thread.start()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header bar
+        header = QHBoxLayout()
+        header.setContentsMargins(6, 4, 6, 4)
+
+        title = QLabel("🖥️ Linux Pseudo-Terminal (xterm.js + PTY)")
+        title.setStyleSheet("font-weight: bold; color: #38bdf8; font-size: 11px;")
+        header.addWidget(title)
+
+        status = QLabel("● Live Bash Session")
+        status.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: 500;")
+        header.addWidget(status)
+
+        self.lbl_record_status = QLabel("⚪ Recording: Disabled (No Project)")
+        self.lbl_record_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        header.addWidget(self.lbl_record_status)
+
+        header.addStretch()
+
+        self.btn_toggle_record = QPushButton("🔴 Start Recording")
+        self.btn_toggle_record.setFixedHeight(22)
+        self.btn_toggle_record.clicked.connect(self.toggle_recording)
+        header.addWidget(self.btn_toggle_record)
+
+        self.btn_save_evidence = QPushButton("💾 Save Evidence")
+        self.btn_save_evidence.setFixedHeight(22)
+        self.btn_save_evidence.setStyleSheet("background-color: #0369a1; color: #ffffff; font-weight: bold;")
+        self.btn_save_evidence.clicked.connect(self.save_session_evidence)
+        header.addWidget(self.btn_save_evidence)
+
+        self.btn_sync_output = QPushButton("📥 Ingest Terminal Output")
+        self.btn_sync_output.setObjectName("btnSyncPtyOutput")
+        self.btn_sync_output.setFixedHeight(22)
+        self.btn_sync_output.setToolTip("Parse and synchronize recent terminal scan output (Nmap, Nikto, etc.) into Master Grid and Network Map")
+        self.btn_sync_output.setStyleSheet("background-color: #0d9488; color: #ffffff; font-weight: bold;")
+        self.btn_sync_output.clicked.connect(self.sync_terminal_output)
+        header.addWidget(self.btn_sync_output)
+
+        self.btn_restart = QPushButton("Restart Shell")
+        self.btn_restart.setFixedHeight(22)
+        self.btn_restart.clicked.connect(self.restart_shell)
+        header.addWidget(self.btn_restart)
+
+        layout.addLayout(header)
+
+        # WebEngine View
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+
+        self.web_view = QWebEngineView()
+        self.web_view.setStyleSheet("background-color: #0b0d13;")
+
+        # HTML file path
+        html_file = Path(__file__).parent.parent / "resources" / "terminal" / "terminal.html"
+        port = self.server.serverPort()
+
+        url = QUrl.fromLocalFile(str(html_file.resolve()))
+        url.setQuery(f"port={port}")
+        self.web_view.load(url)
+
+        layout.addWidget(self.web_view)
+
+    @Slot()
+    def _on_client_connected(self):
+        self.client_socket = self.server.nextPendingConnection()
+        self.client_socket.textMessageReceived.connect(self._on_message_from_xterm)
+        self.client_socket.disconnected.connect(self._on_client_disconnected)
+
+    @Slot(str)
+    def _on_message_from_xterm(self, msg: str):
+        if not self.master_fd or self._closed:
+            return
+
+        try:
+            payload = json.loads(msg)
+            msg_type = payload.get("type")
+
+            if msg_type == "input":
+                data = payload.get("data", "")
+                if self.recorder.is_recording:
+                    self.recorder.record_input(data)
+                if data in ("\r", "\n"):
+                    cmd = self._current_input_line.strip()
+                    if cmd:
+                        self._recent_commands.append(cmd)
+                        if self.recorder.is_recording:
+                            self.recorder.record_command(cmd)
+                    self._current_input_line = ""
+                elif data == "\x7f":
+                    self._current_input_line = self._current_input_line[:-1]
+                elif len(data) == 1 and data.isprintable():
+                    self._current_input_line += data
+                os.write(self.master_fd, data.encode("utf-8"))
+            elif msg_type == "resize":
+                cols = int(payload.get("cols", 80))
+                rows = int(payload.get("rows", 24))
+                # Set PTY window size using TIOCSWINSZ ioctl
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
+
+    @Slot()
+    def _on_client_disconnected(self):
+        self.client_socket = None
+
+    @Slot(str)
+    def _on_pty_data(self, text: str):
+        """Sends data read from Linux PTY to the xterm.js client."""
+        self._terminal_buffer.append(text)
+        if sum(len(c) for c in self._terminal_buffer) > 500000:
+            self._terminal_buffer = self._terminal_buffer[-200:]
+
+        if self.recorder.is_recording:
+            self.recorder.record_output(text)
+            self.lbl_record_status.setText(f"🔴 Recording: Active ({len(self.recorder.events)} events)")
+
+        # Auto-synchronize in real time when scanner completion marker is detected
+        if "Nmap done:" in text and self.active_project and self.db:
+            QTimer.singleShot(250, self._trigger_auto_ingest)
+
+        if self.client_socket and self.client_socket.isValid():
+            self.client_socket.sendTextMessage(text)
+
+    def _trigger_auto_ingest(self):
+        """Silently parses and ingests completed scanner output in real time."""
+        if not self.active_project or not self.db:
+            return
+        buffered_text = "".join(self._terminal_buffer).strip()
+        recorded_text = self.recorder.get_raw_content().strip()
+        raw_text = buffered_text if len(buffered_text) >= len(recorded_text) else recorded_text
+        if not raw_text:
+            return
+
+        plain_text = strip_ansi(raw_text)
+        from terminal.ingest import TerminalIngestEngine
+        try:
+            ingest_res = TerminalIngestEngine.ingest_session(
+                db=self.db,
+                project_id=self.active_project.id,
+                execution_id=None,
+                output=plain_text,
+                evidence_id=None,
+                tool_name="pty_terminal",
+                command="pty_session",
+            )
+            if ingest_res.tools_detected and (ingest_res.hosts_synced > 0 or ingest_res.findings):
+                self.project_data_updated.emit()
+        except Exception:
+            pass
+
+    def set_context(self, project: Optional[Project], db: Optional[Database]):
+        """Sets active project and database context for session evidence recording."""
+        self.active_project = project
+        self.db = db
+        if project:
+            if not self.recorder.is_recording:
+                self.lbl_record_status.setText("⚪ Recording: Off")
+                self.lbl_record_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        else:
+            self.lbl_record_status.setText("⚪ Recording: Disabled (No Project)")
+            self.lbl_record_status.setStyleSheet(
+                f"color: {CPENTTheme.MUTED_TEXT}; font-size: 11px;"
+            )
+
+    @Slot()
+    def toggle_recording(self):
+        """Toggles session recording on or off."""
+        if not self.active_project:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project in Projects & Scope before recording a terminal session.",
+            )
+            return
+
+        if not self.recorder.is_recording:
+            self.recorder.start(project_id=self.active_project.id, cwd=self.cwd)
+            self.btn_toggle_record.setText("⏹️ Stop Recording")
+            self.lbl_record_status.setText("🔴 Recording: Active (0 events)")
+            self.lbl_record_status.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+        else:
+            self.recorder.stop(exit_status=0)
+            self.btn_toggle_record.setText("🔴 Start Recording")
+            self.lbl_record_status.setText(f"⚪ Recording: Stopped ({len(self.recorder.events)} events)")
+            self.lbl_record_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+
+    @Slot()
+    def save_session_evidence(self):
+        """Saves current PTY recording as project evidence and parses scanner results."""
+        if not self.active_project or not self.db:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project first in Projects & Scope.",
+            )
+            return
+
+        if not self.recorder.events and not self.recorder.get_raw_content().strip():
+            # If explicit recording was not started, use current buffered terminal output if available
+            buffered_text = "".join(self._terminal_buffer).strip()
+            if buffered_text:
+                self.recorder.start(project_id=self.active_project.id, cwd=self.cwd)
+                self.recorder.record_output(buffered_text)
+                if self._recent_commands:
+                    for cmd in self._recent_commands[-10:]:
+                        self.recorder.record_command(cmd)
+                self.recorder.stop(exit_status=0)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Empty Session",
+                    "No terminal session activity recorded yet. Execute commands or scans in the terminal first.",
+                )
+                return
+
+        try:
+            res = self.recorder.save_session_as_evidence(db=self.db, project_id=self.active_project.id)
+
+            # Ingest targets and findings from vaulted session
+            ingest_res = None
+            try:
+                plain_text = Path(res.plain_path).read_text(encoding="utf-8", errors="replace")
+                from terminal.ingest import TerminalIngestEngine
+                ingest_res = TerminalIngestEngine.ingest_session(
+                    db=self.db,
+                    project_id=self.active_project.id,
+                    execution_id=res.evidence.execution_id,
+                    output=plain_text,
+                    evidence_id=res.evidence.id,
+                    tool_name="pty_terminal",
+                    command="pty_session",
+                )
+                self.project_data_updated.emit()
+            except Exception:
+                pass
+
+            dup_msg = "\n(Existing duplicate session record verified)" if res.is_duplicate else ""
+            ingest_msg = ""
+            if ingest_res and ingest_res.tools_detected:
+                ingest_msg = (
+                    f"\n\nScanner Ingestion Results:\n"
+                    f"• Detected Tool(s): {', '.join(ingest_res.tools_detected).upper()}\n"
+                    f"• Hosts Synced to Inventory: {ingest_res.hosts_synced}\n"
+                    f"• Open Ports / Services Identified: {ingest_res.ports_synced}\n"
+                    f"• Security Findings Persisted: {len(ingest_res.findings)}"
+                )
+            elif ingest_res and ingest_res.is_unparsed_evidence:
+                ingest_msg = (
+                    "\n\nNote: No recognized scanner output blocks (Nmap, Nikto, SQLMap, Gobuster, WAFW00F) "
+                    "were detected. Output safely vaulted as unparsed evidence."
+                )
+
+            QMessageBox.information(
+                self,
+                "Evidence Saved & Ingested",
+                f"Interactive PTY Terminal session successfully recorded as Evidence #{res.evidence.id}!\n\n"
+                f"Session ID: {res.session_record.session_id}\n"
+                f"Cryptographic SHA-256 Hash:\n{res.sha256_hash}\n\n"
+                f"Files Vaulted:\n- Raw ANSI: {Path(res.raw_path).name}\n- Plain Text: {Path(res.plain_path).name}{dup_msg}"
+                f"{ingest_msg}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save terminal session evidence: {e}")
+
+    @Slot()
+    def sync_terminal_output(self):
+        """Manually parse and synchronize recent terminal output into Master Grid and Network Map."""
+        if not self.active_project or not self.db:
+            QMessageBox.warning(
+                self,
+                "No Active Project",
+                "Please select an assessment project first in Projects & Scope.",
+            )
+            return
+
+        buffered_text = "".join(self._terminal_buffer).strip()
+        recorded_text = self.recorder.get_raw_content().strip()
+        raw_text = buffered_text if len(buffered_text) >= len(recorded_text) else recorded_text
+
+        if not raw_text.strip():
+            QMessageBox.warning(
+                self,
+                "No Output",
+                "No terminal output available to ingest. Run a scan command (e.g. Nmap) in the terminal first.",
+            )
+            return
+
+        # Ensure session is saved to evidence for audit trail
+        try:
+            if not self.recorder.events and not self.recorder.get_raw_content().strip():
+                self.recorder.start(project_id=self.active_project.id, cwd=self.cwd)
+                self.recorder.record_output(raw_text)
+                if self._recent_commands:
+                    for cmd in self._recent_commands[-10:]:
+                        self.recorder.record_command(cmd)
+                self.recorder.stop(exit_status=0)
+
+            res = self.recorder.save_session_as_evidence(db=self.db, project_id=self.active_project.id)
+            ev_id = res.evidence.id
+            exec_id = res.evidence.execution_id
+            plain_text = Path(res.plain_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            ev_id = None
+            exec_id = None
+            plain_text = strip_ansi(raw_text)
+
+        from terminal.ingest import TerminalIngestEngine
+        ingest_res = TerminalIngestEngine.ingest_session(
+            db=self.db,
+            project_id=self.active_project.id,
+            execution_id=exec_id,
+            output=plain_text,
+            evidence_id=ev_id,
+            tool_name="pty_terminal",
+            command="pty_session",
+        )
+
+        self.project_data_updated.emit()
+
+        if ingest_res.tools_detected:
+            msg = (
+                f"Terminal output successfully parsed and synchronized!\n\n"
+                f"• Detected Scanners: {', '.join(ingest_res.tools_detected).upper()}\n"
+                f"• Discovered Hosts Synced: {ingest_res.hosts_synced}\n"
+                f"• Open Ports / Services Identified: {ingest_res.ports_synced}\n"
+                f"• Security Findings Persisted: {len(ingest_res.findings)}\n\n"
+                f"The Master Discovered Assets grid and Network Map are now updated."
+            )
+            QMessageBox.information(self, "Terminal Ingestion Complete", msg)
+        else:
+            msg = (
+                "Terminal output was analyzed, but no supported scanner output blocks "
+                "(Nmap, Nikto, SQLMap, Gobuster, WAFW00F) were detected.\n\n"
+                "The output has been preserved as evidence without generating false-positive findings."
+            )
+            QMessageBox.information(self, "No Scanner Blocks Detected", msg)
+
+    def stop_pty(self):
+        """Stops the underlying PTY process and closes master file descriptor."""
+        self._closed = True
+        if self.process is not None:
+            try:
+                self.process.terminate()
+                self.process.kill()
+            except OSError:
+                pass
+            self.process = None
+
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
+        if hasattr(self, "_reader_thread") and self._reader_thread and self._reader_thread.is_alive():
+            try:
+                self._reader_thread.join(timeout=0.2)
+            except Exception:
+                pass
+
+    def write_to_pty(self, data: str):
+        """Writes input characters or commands directly to the PTY master fd."""
+        if self.master_fd is not None and not self._closed:
+            try:
+                os.write(self.master_fd, data.encode("utf-8"))
+            except Exception:
+                pass
+
+    def clear(self):
+        """Clears terminal buffer and sends Form Feed (Ctrl+L) to xterm.js."""
+        self._terminal_buffer.clear()
+        self.write_to_pty("\x0c")
+
+    def restart_shell(self):
+        """Terminates existing shell and spawns a fresh PTY session."""
+        self.stop_pty()
+        self._closed = False
+        self._init_pty()
+        if hasattr(self, "web_view") and self.web_view is not None:
+            self.web_view.reload()
+
+    def close_pty(self):
+        self.stop_pty()
+        if hasattr(self, "web_view") and self.web_view is not None:
+            try:
+                self.web_view.stop()
+                self.web_view.deleteLater()
+            except Exception:
+                pass
+            self.web_view = None
+
+    def closeEvent(self, event):
+        self.close_pty()
+        if hasattr(self, "server") and self.server:
+            try:
+                self.server.close()
+            except Exception:
+                pass
+            self.server = None
+        super().closeEvent(event)
