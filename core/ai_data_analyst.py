@@ -78,7 +78,7 @@ class AIDataAnalystEngine:
             target_findings = list(findings)
         elif self.db:
             db_findings = self.db.list_findings(project_id)
-            target_findings = [NormalizedFinding.from_finding(f) for f in db_findings]
+            target_findings = [NormalizedFinding.from_finding(f, db=self.db) for f in db_findings]
 
         # Calculate counts
         counts = {

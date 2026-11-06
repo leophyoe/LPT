@@ -8,6 +8,7 @@ Enforces strict evidence provenance, reproducibility, and auditability.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -127,7 +128,13 @@ class NormalizedFinding:
         )
 
     @classmethod
-    def from_finding(cls, finding: Finding, raw_evidence_hash: str = "") -> NormalizedFinding:
+    def from_finding(
+        cls,
+        finding: Finding,
+        raw_evidence_hash: str = "",
+        db: Optional[Any] = None,
+        evidence: Optional[Any] = None,
+    ) -> NormalizedFinding:
         """Constructs a NormalizedFinding from an existing storage Finding."""
         port = None
         protocol = "tcp"
@@ -137,6 +144,65 @@ class NormalizedFinding:
                 port = int(parts[0])
             if len(parts) > 1 and parts[1].isalpha():
                 protocol = parts[1].lower()
+
+        ev_id = None
+        ev_hash = ""
+
+        # Evidence identifiers and digests are trusted only when backed by a linked record.
+        if evidence is not None:
+            ev = evidence
+        elif db is not None:
+            ev = None
+            pid = finding.project_id
+            requested_ev_id = getattr(finding, "evidence_id", None)
+            if requested_ev_id and hasattr(db, "get_evidence"):
+                ev = db.get_evidence(requested_ev_id, project_id=pid)
+            if not ev and getattr(finding, "id", None) and hasattr(db, "get_evidence_for_finding"):
+                ev = db.get_evidence_for_finding(finding.id, project_id=pid)
+        else:
+            ev = None
+
+        evidence_id = getattr(ev, "id", None) if ev is not None else None
+        finding_id = getattr(finding, "id", None)
+        evidence_finding_id = getattr(ev, "finding_id", None) if ev is not None else None
+        evidence_execution_id = getattr(ev, "execution_id", None) if ev is not None else None
+        finding_execution_id = getattr(finding, "execution_id", None)
+        is_linked = (
+            (
+                finding_id is not None
+                and evidence_finding_id == finding_id
+            )
+            or getattr(finding, "evidence_id", None) == evidence_id
+            or (
+                finding_execution_id is not None
+                and evidence_execution_id == finding_execution_id
+            )
+        )
+        if (
+            ev is not None
+            and getattr(ev, "project_id", None) == finding.project_id
+            and type(evidence_id) is int
+            and evidence_id > 0
+            and is_linked
+            and (
+                evidence_finding_id is None
+                or evidence_finding_id == finding_id
+            )
+            and (
+                evidence_execution_id is None
+                or finding_execution_id is None
+                or evidence_execution_id == finding_execution_id
+            )
+        ):
+            ev_id = ev.id
+            candidate_hash = (
+                getattr(ev, "sha256_hash", "")
+                or getattr(ev, "file_hash", "")
+                or raw_evidence_hash
+                or ""
+            )
+            if isinstance(candidate_hash, str) and re.fullmatch(r"[0-9a-fA-F]{64}", candidate_hash):
+                ev_hash = candidate_hash.lower()
 
         return cls(
             title=finding.title,
@@ -150,9 +216,9 @@ class NormalizedFinding:
             description=finding.description,
             reproduction_steps=finding.reproduction_steps,
             remediation=finding.remediation,
-            evidence_id=getattr(finding, "evidence_id", None),
+            evidence_id=ev_id,
             execution_id=finding.execution_id,
-            raw_evidence_hash=raw_evidence_hash,
+            raw_evidence_hash=ev_hash,
             source_tool=finding.source_tool,
             confidence=finding.confidence,
             validation_status=finding.validation_status,
@@ -177,4 +243,3 @@ class NormalizedParserResult:
 
     def __iter__(self):
         return iter((self.findings, self.services))
-
