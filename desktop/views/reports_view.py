@@ -156,8 +156,14 @@ class ReportsView(QWidget):
         self.btn_json.clicked.connect(lambda: self._export_format("json"))
         actions_bar.addWidget(self.btn_json)
 
+        self.btn_cpent_methodology = QPushButton("📋 CPENT Methodology")
+        self.btn_cpent_methodology.setToolTip("Export an original methodology report from stored plans, executions, findings, and evidence")
+        self.btn_cpent_methodology.setProperty("class", "action-secondary")
+        self.btn_cpent_methodology.clicked.connect(self._export_cpent_methodology)
+        actions_bar.addWidget(self.btn_cpent_methodology)
+
         self.btn_pack = QPushButton("💼 CPENT Pack (ZIP)")
-        self.btn_pack.setToolTip("Generate complete 16-folder official CPENT Master Engagement Pack ZIP")
+        self.btn_pack.setToolTip("Generate an original CPENT-informed engagement workspace ZIP")
         self.btn_pack.setStyleSheet("""
             QPushButton {
                 background-color: #7c3aed;
@@ -581,12 +587,12 @@ class ReportsView(QWidget):
         layout.addWidget(roadmap_box)
 
         # CPENT Engagement Pack Structure Box
-        pack_box = QGroupBox("Official CPENT Master Engagement Pack (NIST SP 800-42 & EC-Council Compliant)")
+        pack_box = QGroupBox("CPENT-Informed Engagement Workspace")
         p_layout = QVBoxLayout(pack_box)
         p_layout.setContentsMargins(12, 10, 12, 10)
 
         pack_desc = QLabel(
-            "Compiles and cryptographically hashes the complete 16-folder penetration testing engagement structure:\n\n"
+            "Compiles an original engagement documentation structure with evidence references:\n\n"
             "📁 <strong>00_Administration/</strong>: Engagement Letter, Rules of Engagement (RoE), NDAs, Test Plans\n"
             "📁 <strong>01_SISGCA/</strong>: OSINT activity logs, scan outputs, and cryptographic evidence manifest (SHA-256)\n"
             "📁 <strong>02_SEVA_Tools/</strong>: Tool inventories, execution scripts, and automation recipes\n"
@@ -847,7 +853,7 @@ class ReportsView(QWidget):
 
         clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project.name.lower())
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save CPENT Master Engagement Pack", f"CPENT_PACK_{clean_name}.zip", "ZIP Archives (*.zip)"
+            self, "Save CPENT-Informed Engagement Workspace", f"CPENT_PACK_{clean_name}.zip", "ZIP Archives (*.zip)"
         )
         if not file_path:
             return
@@ -860,8 +866,49 @@ class ReportsView(QWidget):
             QMessageBox.information(
                 self,
                 "CPENT Pack Exported",
-                f"Successfully compiled official CPENT Master Engagement Pack:\n\n{out_zip.resolve()}\n\n"
-                f"Includes complete 16-folder tree, evidence manifest, and multi-format reports.",
+                f"Successfully compiled the CPENT-informed engagement workspace:\n\n{out_zip.resolve()}\n\n"
+                f"Includes engagement documents, evidence manifest, and multi-format reports.",
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Failed to compile CPENT engagement pack:\n{e}")
+
+    def _export_cpent_methodology(self):
+        if not self.active_project_id:
+            QMessageBox.warning(self, "Project Required", "Please select an active project first.")
+            return
+
+        project = self.db.get_project(self.active_project_id)
+        if not project:
+            QMessageBox.warning(self, "Project Unavailable", "The selected project could not be loaded.")
+            return
+
+        clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project.name.lower())
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export CPENT Methodology & Evidence Report",
+            f"{clean_name}_cpent_methodology.md",
+            "Markdown Files (*.md);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        destination = Path(file_path)
+        try:
+            self.report_builder.generate_cpent_methodology_markdown(
+                self.active_project_id,
+                output_path=destination,
+                assessment_id=self.combo_assessment.currentData(),
+            )
+            self.export_status_lbl.setText(f"✓ Exported CPENT methodology report: {destination.name}")
+            self.reports_generated.emit(str(destination))
+            QMessageBox.information(
+                self,
+                "Export Successful",
+                f"CPENT methodology and evidence report exported:\n\n{destination.resolve()}",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Export Failed",
+                f"Failed to generate CPENT methodology report:\n{error}",
+            )

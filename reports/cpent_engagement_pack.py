@@ -1,9 +1,7 @@
-"""CPENT Master Engagement Folder Pack Generator.
+"""CPENT-Informed Engagement Workspace Generator.
 
-Generates the standardized NIST SP 800-42 and EC-Council CPENT Master Engagement
-Folder hierarchy (00_Administration, 01_SISGCA, 02_SEVA_Tools) pre-populated
-with dynamic engagement letters, rules of engagement, technical authorizations (IAUTH/XAUTH),
-test plans, scope boundaries, and cryptographic evidence catalogs.
+Generates original engagement documents and evidence indexes using common
+assessment documentation practices and CPENT methodology concepts.
 """
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from storage.db import Database
 from storage.models import Project, TargetScope
+from terminal.recorder import redact_sensitive_text
 
 
 def _utc_now_str() -> str:
@@ -22,7 +21,7 @@ def _utc_now_str() -> str:
 
 
 class CPENTEngagementPackGenerator:
-    """Exports standardized CPENT engagement administrative workspaces."""
+    """Exports an original CPENT-informed assessment workspace."""
 
     def __init__(self, db: Database):
         self.db = db
@@ -80,54 +79,56 @@ class CPENTEngagementPackGenerator:
         # A. Engagement Letter
         el_file = admin_dir / "00A_EL" / "Engagement_Letter.md"
         el_content = self._render_engagement_letter(project)
-        el_file.write_text(el_content, encoding="utf-8")
+        el_file.write_text(redact_sensitive_text(el_content), encoding="utf-8")
         created_files["engagement_letter"] = el_file
 
         # B. Initial Client Worksheet (ICW)
         icw_file = admin_dir / "00C_Client_Info" / "Initial_Client_Worksheet.md"
         icw_content = self._render_client_worksheet(project)
-        icw_file.write_text(icw_content, encoding="utf-8")
+        icw_file.write_text(redact_sensitive_text(icw_content), encoding="utf-8")
         created_files["client_worksheet"] = icw_file
 
         # C. Non-Disclosure Agreement (NDA)
         nda_file = admin_dir / "00D_NDA" / "Non_Disclosure_Agreement.md"
         nda_content = self._render_nda(project)
-        nda_file.write_text(nda_content, encoding="utf-8")
+        nda_file.write_text(redact_sensitive_text(nda_content), encoding="utf-8")
         created_files["nda"] = nda_file
 
         # D. Rules of Engagement (RoE)
         roe_file = admin_dir / "00F__ROE" / "Rules_of_Engagement.md"
         roe_content = self._render_roe(project)
-        roe_file.write_text(roe_content, encoding="utf-8")
+        roe_file.write_text(redact_sensitive_text(roe_content), encoding="utf-8")
         created_files["roe"] = roe_file
 
         # E. Test Plan & Scope (TP)
         tp_file = admin_dir / "00G_TP" / "Test_Plan_and_Scope.md"
         tp_content = self._render_test_plan(project, scopes)
-        tp_file.write_text(tp_content, encoding="utf-8")
+        tp_file.write_text(redact_sensitive_text(tp_content), encoding="utf-8")
         created_files["test_plan"] = tp_file
 
         # F. Letter of Technical Authorization (LTA - IAUTH & XAUTH)
         lta_file = admin_dir / "00H_LTA" / "Letter_of_Technical_Authorization.md"
         lta_content = self._render_lta(project, scopes)
-        lta_file.write_text(lta_content, encoding="utf-8")
+        lta_file.write_text(redact_sensitive_text(lta_content), encoding="utf-8")
         created_files["lta"] = lta_file
 
         # G. Master Engagement Control List (ECL)
         ecl_file = admin_dir / "00L_ECL" / "Master_Engagement_Control_List.md"
         ecl_content = self._render_ecl(project, scopes, findings, executions)
-        ecl_file.write_text(ecl_content, encoding="utf-8")
+        ecl_file.write_text(redact_sensitive_text(ecl_content), encoding="utf-8")
         created_files["ecl"] = ecl_file
 
         # H. OSINT & Reconnaissance Activity Log
         osint_log = evidence_dir / "01A_OSIA" / "OSINT_Activity_Log.md"
         osint_log.write_text(
-            f"# OSINT & Attack Surface Activity Log\n\n"
-            f"**Project:** {project.name}\n"
-            f"**Generated:** {_utc_now_str()}\n\n"
-            f"| Timestamp | Tool | Target Domain / Asset | Action Description | Finding ID |\n"
-            f"| :--- | :--- | :--- | :--- | :---: |\n"
-            f"| {project.created_at[:19]} | Initialization | N/A | Engagement Created in CyberSecuritySuite | - |\n",
+            redact_sensitive_text(
+                f"# OSINT & Attack Surface Activity Log\n\n"
+                f"**Project:** {project.name}\n"
+                f"**Generated:** {_utc_now_str()}\n\n"
+                f"| Timestamp | Tool | Target Domain / Asset | Action Description | Finding ID |\n"
+                f"| :--- | :--- | :--- | :--- | :---: |\n"
+                f"| {project.created_at[:19]} | Initialization | N/A | Engagement Created in CyberSecuritySuite | - |\n"
+            ),
             encoding="utf-8",
         )
         created_files["osint_log"] = osint_log
@@ -151,22 +152,28 @@ class CPENTEngagementPackGenerator:
                 for ev in evidence
             ],
         }
-        ev_manifest.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+        ev_manifest.write_text(redact_sensitive_text(json.dumps(manifest_data, indent=2)), encoding="utf-8")
         created_files["evidence_manifest"] = ev_manifest
 
         # J. Tool Inventory
         tools_inventory = tools_dir / "Tool_Inventory.md"
         tools_inventory.write_text(
-            f"# Penetration Testing Tool Inventory & Execution History\n\n"
-            f"**Project:** {project.name}\n"
-            f"**Lead Tester:** {getattr(project, 'lead_tester', '') or 'N/A'}\n\n"
-            f"### Executed Tools\n"
-            + (
-                "\n".join([f"- **{ex.tool_name}**: `{ex.command}` (Exit Code: {ex.exit_code})" for ex in executions])
-                if executions
-                else "*No automated tool executions registered yet.*"
-            )
-            + "\n",
+            redact_sensitive_text(
+                f"# Penetration Testing Tool Inventory & Execution History\n\n"
+                f"**Project:** {project.name}\n"
+                f"**Lead Tester:** {getattr(project, 'lead_tester', '') or 'N/A'}\n\n"
+                f"### Executed Tools\n"
+                + (
+                    "\n".join(
+                        f"- **{execution.tool_name}**: `{execution.command}` "
+                        f"(Exit Code: {execution.exit_code})"
+                        for execution in executions
+                    )
+                    if executions
+                    else "*No automated tool executions registered yet.*"
+                )
+                + "\n"
+            ),
             encoding="utf-8",
         )
         created_files["tool_inventory"] = tools_inventory
@@ -174,17 +181,19 @@ class CPENTEngagementPackGenerator:
         # Root README
         readme_file = root / "README.md"
         readme_file.write_text(
-            f"# CPENT Master Engagement Workspace\n\n"
-            f"**Client Organization:** {project.client_name or 'N/A'}  \n"
-            f"**Engagement ID:** {project.engagement_id or 'N/A'}  \n"
-            f"**Lead Tester:** {getattr(project, 'lead_tester', '') or 'N/A'}  \n"
-            f"**Operational Window:** {getattr(project, 'start_date', '') or 'N/A'} to {getattr(project, 'end_date', '') or 'N/A'}  \n"
-            f"**Generated:** {_utc_now_str()}  \n\n"
-            f"### Workspace Organization (NIST SP 800-42 & EC-Council CPENT Standards)\n"
-            f"- **`00_Administration/`**: Legal authorization, RoE, NDAs, test plans, and client worksheets.\n"
-            f"- **`01_SISGCA/`**: Security information, scans, OSINT logs, and cryptographic evidence vaults.\n"
-            f"- **`02_SEVA_Tools/`**: Tool configurations, scripts, and execution records.\n"
-            f"- **`03_Final_Reports/`**: Multi-format executive & technical penetration testing reports (PDF, HTML, MD, JSON, CSV).\n",
+            redact_sensitive_text(
+                f"# CPENT-Informed Engagement Workspace\n\n"
+                f"**Client Organization:** {project.client_name or 'N/A'}  \n"
+                f"**Engagement ID:** {project.engagement_id or 'N/A'}  \n"
+                f"**Lead Tester:** {getattr(project, 'lead_tester', '') or 'N/A'}  \n"
+                f"**Operational Window:** {getattr(project, 'start_date', '') or 'N/A'} to {getattr(project, 'end_date', '') or 'N/A'}  \n"
+                f"**Generated:** {_utc_now_str()}  \n\n"
+                f"### Workspace Organization (Original structure informed by common assessment practices)\n"
+                f"- **`00_Administration/`**: Legal authorization, RoE, NDAs, test plans, and client worksheets.\n"
+                f"- **`01_SISGCA/`**: Security information, scans, OSINT logs, and cryptographic evidence vaults.\n"
+                f"- **`02_SEVA_Tools/`**: Tool configurations, scripts, and execution records.\n"
+                f"- **`03_Final_Reports/`**: Multi-format executive, technical, and original methodology reports (PDF, HTML, MD, JSON, CSV).\n"
+            ),
             encoding="utf-8",
         )
         created_files["root_readme"] = readme_file
@@ -193,18 +202,21 @@ class CPENTEngagementPackGenerator:
         from reports.builder import ReportBuilder
         reports_dir = root / "03_Final_Reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            report_builder = ReportBuilder(self.db)
-            rpt_paths = report_builder.generate_all(project_id, reports_dir, stable_names=True)
-            for k, p in rpt_paths.items():
-                created_files[f"report_{k}"] = p
-        except Exception:
-            pass
+        report_builder = ReportBuilder(self.db)
+        report_paths = report_builder.generate_all(project_id, reports_dir, stable_names=True)
+        for key, path in report_paths.items():
+            created_files[f"report_{key}"] = path
+        methodology_markdown = reports_dir / "cpent_methodology_report.md"
+        report_builder.generate_cpent_methodology_markdown(project_id, output_path=methodology_markdown)
+        created_files["report_cpent_methodology_markdown"] = methodology_markdown
+        methodology_json = reports_dir / "cpent_methodology_report.json"
+        report_builder.generate_cpent_methodology_json(project_id, output_path=methodology_json)
+        created_files["report_cpent_methodology_json"] = methodology_json
 
         return created_files
 
     def generate_pack_zip(self, project_id: int, zip_path: Path) -> Path:
-        """Generates the full CPENT Master Engagement Pack and archives it into a zip file."""
+        """Generates the CPENT-informed workspace and archives it into a zip file."""
         import tempfile
         import zipfile
 
@@ -400,4 +412,3 @@ Date: {_utc_now_str()[:10]}
 - [ ] Post-Testing Cleanup Verified
 - [ ] Final CPENT Report Delivered
 """
-

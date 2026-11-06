@@ -93,3 +93,5 @@ Every test in the CPENT methodology mandates strict documentation:
 7. **Actionable Remediation Guidance**
 
 This structure is directly baked into our `storage/models.py` and `reports/` engine.
+
+The reporting engine can export an original methodology-and-evidence report from stored assessment plans, exact target-scope records, linked tool executions, findings, and evidence. It does not copy proprietary course templates. A CPENT Test ID is reported as not recorded when the application has no such value; a local plan ID is never presented as a CPENT Test ID. Missing linked findings are not presented as evidence that a target is secure. Command and finding text is redacted in exported reports, while original database records and evidence remain unchanged.

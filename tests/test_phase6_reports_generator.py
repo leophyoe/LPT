@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -256,6 +257,7 @@ def test_reports_view_tabs_and_structure(qtbot, db: Database):
     assert view.btn_csv is not None
     assert view.btn_md is not None
     assert view.btn_json is not None
+    assert view.btn_cpent_methodology is not None
     assert view.btn_pack is not None
 
 
@@ -386,12 +388,38 @@ def test_reports_view_export_actions(qtbot, db: Database, sample_cpent_project: 
     assert json_out.exists()
     assert "✓ Exported JSON report" in view.export_status_lbl.text()
 
+    # Test dedicated CPENT methodology report export
+    methodology_out = tmp_path / "gui_cpent_methodology.md"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(methodology_out), "MD"))
+    view._export_cpent_methodology()
+    assert methodology_out.exists()
+    assert "# CPENT Methodology & Evidence Report" in methodology_out.read_text(encoding="utf-8")
+    assert "✓ Exported CPENT methodology report" in view.export_status_lbl.text()
+
     # Test CPENT Pack Export
+    db.create_execution(
+        ToolExecution(
+            project_id=sample_cpent_project,
+            tool_name="scanner",
+            command="scanner --password pack-secret-123",
+            status=ExecutionStatus.COMPLETED,
+            exit_code=0,
+        )
+    )
     zip_out = tmp_path / "gui_cpent_pack.zip"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(zip_out), "ZIP"))
     view._export_cpent_pack()
     assert zip_out.exists()
     assert "✓ Exported CPENT Engagement Pack" in view.export_status_lbl.text()
+    with zipfile.ZipFile(zip_out) as archive:
+        archive_names = archive.namelist()
+    assert any(name.endswith("/cpent_methodology_report.md") for name in archive_names)
+    assert any(name.endswith("/cpent_methodology_report.json") for name in archive_names)
+    with zipfile.ZipFile(zip_out) as archive:
+        inventory_name = next(name for name in archive_names if name.endswith("/Tool_Inventory.md"))
+        inventory = archive.read(inventory_name).decode("utf-8")
+    assert "pack-secret-123" not in inventory
+    assert "[REDACTED_PASSWORD]" in inventory
 
 
 def test_reports_view_live_preview(qtbot, db: Database, sample_cpent_project: int):

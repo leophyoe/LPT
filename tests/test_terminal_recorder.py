@@ -53,6 +53,25 @@ def test_redact_sensitive_text():
     assert "MIIEowIBAAKCAQEA0" not in redacted_key
     assert "[REDACTED_PRIVATE_KEY]" in redacted_key
 
+    sample_credentials = (
+        "https://alice:url-password-123@example.test "
+        "Authorization: Basic dXNlcjpzZWNyZXQ= "
+        "Cookie: session=web-session-secret-123 "
+        "Authorization: Token auth-token-secret-123 "
+        "client_secret=client-secret-123 "
+        "github_token=github-secret-123"
+    )
+    redacted_credentials = redact_sensitive_text(sample_credentials)
+    for secret in (
+        "url-password-123",
+        "dXNlcjpzZWNyZXQ=",
+        "web-session-secret-123",
+        "auth-token-secret-123",
+        "client-secret-123",
+        "github-secret-123",
+    ):
+        assert secret not in redacted_credentials
+
 
 def test_terminal_session_recorder_lifecycle_and_evidence(tmp_path: Path):
     db = Database(str(tmp_path / "test_recorder.db"))

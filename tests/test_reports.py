@@ -13,6 +13,8 @@ import pytest
 from reports.builder import AssessmentReportData, ReportBuilder
 from storage.db import Database
 from storage.models import (
+    AssessmentPlan,
+    AssessmentStatus,
     Evidence,
     ExecutionStatus,
     Finding,
@@ -20,6 +22,7 @@ from storage.models import (
     Project,
     TargetScope,
     TargetType,
+    TestCategory,
     TerminalSessionRecord,
     ToolExecution,
     ValidationStatus,
@@ -243,6 +246,127 @@ def test_report_builder_with_populated_project(db: Database, populated_project: 
     assert "@media print" in html_str
     assert "2</strong> vulnerabilities were confirmed with evidence" in html_str
     assert "1</strong> observations remain unverified" in html_str
+
+
+def test_report_exports_redact_sensitive_assessment_text(db: Database, tmp_path: Path):
+    project = db.create_project(Project(name="Redaction Assessment"))
+    execution = db.create_execution(
+        ToolExecution(
+            project_id=project.id,
+            tool_name="scanner",
+            command="scanner --password command-secret-123 api_key=command-api-secret-123",
+            status=ExecutionStatus.COMPLETED,
+            exit_code=0,
+        )
+    )
+    db.create_finding(
+        Finding(
+            project_id=project.id,
+            title="Credential exposure",
+            description="api_key=finding-api-secret-123",
+            reproduction_steps="Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            remediation="Set client_secret=remediation-secret-123",
+            execution_id=execution.id,
+        )
+    )
+    builder = ReportBuilder(db)
+
+    exports = {
+        "json": builder.generate_json(project.id),
+        "markdown": builder.generate_markdown(project.id),
+        "html": builder.generate_html(project.id),
+        "csv": builder.generate_csv(project.id, output_path=tmp_path / "findings.csv").read_text(encoding="utf-8"),
+    }
+    for report_format, contents in exports.items():
+        assert "command-secret-123" not in contents, report_format
+        assert "command-api-secret-123" not in contents, report_format
+        assert "finding-api-secret-123" not in contents, report_format
+        assert "dXNlcjpwYXNzd29yZA==" not in contents, report_format
+        assert "remediation-secret-123" not in contents, report_format
+        assert "[REDACTED" in contents, report_format
+
+
+def test_cpent_methodology_report_uses_linked_records_and_is_read_only(db: Database, tmp_path: Path):
+    project = db.create_project(Project(name="Methodology Assessment"))
+    db.add_scope(
+        TargetScope(
+            project_id=project.id,
+            target="192.0.2.10",
+            target_type=TargetType.IP_ADDRESS,
+            is_authorized=True,
+        )
+    )
+    execution = db.create_execution(
+        ToolExecution(
+            project_id=project.id,
+            tool_name="inventory-tool",
+            command="inventory-tool --password report-secret-123 192.0.2.10",
+            status=ExecutionStatus.COMPLETED,
+            exit_code=0,
+            raw_output_path="/tmp/inventory-output.xml",
+        )
+    )
+    plan = db.create_assessment_plan(
+        AssessmentPlan(
+            project_id=project.id,
+            title="Host inventory review",
+            target="192.0.2.10",
+            test_category=TestCategory.NETWORK_DISCOVERY,
+            description="Document the observed host inventory.",
+            acceptance_criteria="Record only verified observations.",
+            status=AssessmentStatus.COMPLETED,
+            execution_id=execution.id,
+        )
+    )
+    finding = db.create_finding(
+        Finding(
+            project_id=project.id,
+            title="Service configuration observation",
+            severity=FindingSeverity.MEDIUM,
+            validation_status=ValidationStatus.OBSERVED,
+            remediation="Review the service configuration.",
+            execution_id=execution.id,
+        )
+    )
+    artifact = tmp_path / "evidence.xml"
+    artifact.write_text("<evidence/>", encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    evidence = db.add_evidence(
+        Evidence(
+            project_id=project.id,
+            file_path=str(artifact),
+            sha256_hash=digest,
+            finding_id=finding.id,
+            execution_id=execution.id,
+            description="Observed service output",
+        )
+    )
+    before_status = db.get_assessment_plan(plan.id).status
+    builder = ReportBuilder(db)
+
+    json_text = builder.generate_cpent_methodology_json(project.id)
+    report = json.loads(json_text)
+    assert report["report_type"] == "original_cpent_methodology_and_evidence"
+    test_record = report["tests"][0]
+    assert test_record["test_id"] == "not_recorded"
+    assert test_record["plan_id"] == plan.id
+    assert test_record["scope_match"] == "exact_match"
+    assert test_record["execution"]["tool"] == "inventory-tool"
+    assert test_record["execution"]["command"].endswith("[REDACTED_PASSWORD] 192.0.2.10")
+    assert test_record["results_analysis"][0]["finding_id"] == finding.id
+    assert test_record["evidence"][0]["id"] == evidence.id
+    assert test_record["evidence"][0]["sha256"] == digest
+    assert "report-secret-123" not in json_text
+
+    markdown_path = tmp_path / "cpent-methodology.md"
+    markdown = builder.generate_cpent_methodology_markdown(project.id, output_path=markdown_path)
+    assert markdown_path.read_text(encoding="utf-8") == markdown
+    assert "# CPENT Methodology & Evidence Report" in markdown
+    assert "CPENT Test ID:** not_recorded" in markdown
+    assert "Scope Match:** exact_match" in markdown
+    assert "SHA-256" in markdown
+    assert "report-secret-123" not in markdown
+    assert db.get_assessment_plan(plan.id).status == before_status
 
 
 def test_reports_verify_evidence_integrity(db: Database, tmp_path: Path):

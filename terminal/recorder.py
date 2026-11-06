@@ -46,11 +46,16 @@ REDACTION_PATTERNS = [
     (re.compile(r"(-p|--password)[\s=]+([^\s\"'\n]+)", re.IGNORECASE), r"\1 [REDACTED_PASSWORD]"),
     (re.compile(r"(-u|--user)[\s=]+([A-Za-z0-9_.\-]+):([^\s\"'\n]+)", re.IGNORECASE), r"\1 \2:[REDACTED_PASSWORD]"),
     (re.compile(r"(password|passwd|pwd)[\s:=]+([^\s,;&\"'\n]+)", re.IGNORECASE), r"\1=[REDACTED_PASSWORD]"),
+    (re.compile(r"(\bhttps?://[^:/@\s]+:)[^/@\s]+(@)", re.IGNORECASE), r"\1[REDACTED_PASSWORD]\2"),
     # Bearer and Auth tokens
     (re.compile(r"(Bearer\s+)([A-Za-z0-9_\-\.]{10,})", re.IGNORECASE), r"\1[REDACTED_TOKEN]"),
-    (re.compile(r"(api[_-]?key|secret[_-]?key|auth[_-]?token)[\s:=]+([A-Za-z0-9_\-]{12,})", re.IGNORECASE), r"\1=[REDACTED_KEY]"),
+    (re.compile(r"(Authorization\s*:\s*Basic\s+)[A-Za-z0-9+/=]+", re.IGNORECASE), r"\1[REDACTED_CREDENTIAL]"),
+    (re.compile(r"(Authorization\s*:\s*(?:Token|Digest)\s+)[^\s,;]+", re.IGNORECASE), r"\1[REDACTED_CREDENTIAL]"),
+    (re.compile(r"((?:Set-)?Cookie\s*:\s*)[^\r\n]+", re.IGNORECASE), r"\1[REDACTED_CREDENTIAL]"),
+    (re.compile(r"((?:api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|github[_-]?token)\s*[:=]\s*)(['\"]?)[^\s,;&\"']+", re.IGNORECASE), r"\1\2[REDACTED_CREDENTIAL]"),
     # AWS Access Keys
     (re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), r"[REDACTED_AWS_KEY]"),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"), r"[REDACTED_TOKEN]"),
     # Private Keys
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), r"[REDACTED_PRIVATE_KEY]"),
 ]

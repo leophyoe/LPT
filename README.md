@@ -19,7 +19,7 @@ This project is built from the source-code level up—not as a simple dashboard 
 - **Target Scope & Authorization Enforcement**: Strict pre-execution scope validation ensuring only authorized targets and networks can be scanned or tested.
 - **AI Security Assistant**: Contextual interpretation of scan outputs, false-positive triage, correlation of findings, and remediation suggestions without sending unredacted credentials or executing unauthorized actions.
 - **Structured Findings & Evidence Management**: Standardized findings schema (CVSS-compatible) paired with cryptographic evidence hashing, reproduction steps, and audit logs.
-- **Multi-Format Professional Reporting**: Generation of Executive and Technical security assessment reports in self-contained HTML (with print-to-PDF stylesheet support), Markdown, and structured JSON formats.
+- **Multi-Format Professional Reporting**: Executive and Technical assessment reports in HTML, PDF, Markdown, JSON, and CSV, plus an original CPENT methodology-and-evidence report generated from persisted assessment records.
 - **Original CPENT Learning Platform**: Original, authorized curriculum modules, intentional local lab environments (Docker/Podman), progress tracking, and AI tutoring for CPENT exam preparation.
 
 ---
